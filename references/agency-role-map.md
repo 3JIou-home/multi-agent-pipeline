@@ -2,7 +2,7 @@
 
 Use this file only when selecting roles for the current task. Prefer the smallest set that gives genuine solution diversity.
 
-If a local `agency-agents` checkout is available, use it as the role catalog. Prefer `AGENCY_AGENTS_DIR=/path/to/agency-agents` when the repo is not in a standard location. If no checkout is available, keep the role names and adapt them to the local agent library.
+If a local checkout of `https://github.com/msitarzewski/agency-agents` is available, use it as the role catalog. Prefer `AGENCY_AGENTS_DIR=/path/to/agency-agents` when the repo is not in a standard location. If no checkout is available, keep the role names and adapt them to the local agent library.
 
 ## Level 1 Roles
 

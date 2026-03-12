@@ -15,11 +15,19 @@ mkdir -p ~/.codex/skills
 cp -R multi-agent-pipeline ~/.codex/skills/
 ```
 
-If you keep a local checkout of `agency-agents`, point the skill at it with:
+If you want the pipeline to use the `agency-agents` role catalog, clone:
+
+```bash
+git clone https://github.com/msitarzewski/agency-agents.git
+```
+
+Then point the skill at that checkout:
 
 ```bash
 export AGENCY_AGENTS_DIR=/path/to/agency-agents
 ```
+
+The pipeline works without `agency-agents`, but when it is available it can reuse the role library from `msitarzewski/agency-agents` for intake, solver selection, and review guidance.
 
 ## Create A Run
 
