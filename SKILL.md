@@ -1,6 +1,6 @@
 ---
 name: multi-agent-pipeline
-description: "Build and run a three-level agent pipeline for a single user task: (1) intake/prompt-builder, (2) one to three independent solver agents, and (3) a censor/reviewer that compares outputs, runs targeted validation, and writes short summaries. Use when a task benefits from role specialization, multiple candidate solutions, explicit handoffs, or evidence-based review. Especially useful for coding, architecture, infra, research, documentation, and Codex skill/prompt orchestration work."
+description: "Build and run a four-stage agent pipeline for a single user task: (1) intake/prompt-builder, (2) one to three independent solver agents, (3) a censor/reviewer that compares outputs, runs targeted validation, and writes short summaries, and (4) an execution stage that implements the recommended winner or hybrid. Use when a task benefits from role specialization, multiple candidate solutions, explicit handoffs, evidence-based review, and a final implementation pass."
 ---
 
 # Multi Agent Pipeline
@@ -110,11 +110,28 @@ The reviewer must:
 - run the cheapest relevant validation when code or config changed
 - mark evidence gaps when tests could not run
 - produce a short summary for each solution
+- write a short user-facing review summary in the selected language, default `ru`
 - recommend one winner, one backup, or a compatible hybrid
 
 Treat "good architecture only" as insufficient when the user asked for a working service or runnable MVP. A scaffold can be part of the recommendation, but only as an intermediate step or partial solution unless the brief explicitly narrows the deliverable.
 
 Adopt the skeptical stance from `agency-agents/testing/testing-reality-checker.md` when the local `agency-agents` repo exists. Use the concise reporting style from `agency-agents/support/support-executive-summary-generator.md` for the final summary.
+
+Pause after review when human input is needed. The user-facing summary exists so a human can accept the winner, request corrections, or adjust the brief before execution continues.
+
+### 4. Execution Stage
+
+Run execution only after review is complete.
+
+The execution stage must:
+
+- read the review verdict before changing the workspace
+- implement the recommended winner or explicit hybrid in the primary workspace
+- prefer the cheapest working slice that still preserves the top-level goal
+- run targeted validation after edits
+- write an execution report with changed files, validation, blockers, and next steps
+
+If local constraints force a deviation from the review winner, state the reason directly in the execution report.
 
 ## Operating Rules
 
@@ -125,6 +142,7 @@ Adopt the skeptical stance from `agency-agents/testing/testing-reality-checker.m
 - Run targeted validation before broad or expensive test suites.
 - If tests cannot run, say exactly why and treat that as a review penalty.
 - Keep the final reviewer summary short and decision-oriented.
+- Keep the user-facing review summary concise and in the language requested by `plan.json`.
 
 ## Artifacts
 
@@ -148,9 +166,12 @@ agent-runs/<timestamp>-<slug>/
   review/
     report.md
     scorecard.json
+    user-summary.md
+  execution/
+    report.md
 ```
 
-Read `plan.json` first. It contains the normalized metadata, role assignments, stack signals, and suggested validation commands.
+Read `plan.json` first. It contains the normalized metadata, role assignments, stack signals, summary language, and suggested validation commands.
 
 ## Resources
 
@@ -160,7 +181,7 @@ Generate a reusable run directory with prompts, role assignments, and review hin
 
 ### `scripts/run_stage.py`
 
-Inspect run status, compile stage prompts with absolute references, copy prompts to the clipboard, and launch `codex exec` for a chosen stage.
+Inspect run status, print the localized review summary, compile stage prompts with absolute references, copy prompts to the clipboard, and launch `codex exec` for a chosen stage.
 
 ### `references/agency-role-map.md`
 

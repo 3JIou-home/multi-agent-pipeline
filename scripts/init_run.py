@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scaffold a three-level multi-agent pipeline run directory."""
+"""Scaffold a four-level multi-agent pipeline run directory."""
 
 from __future__ import annotations
 
@@ -118,6 +118,11 @@ def parse_args() -> argparse.Namespace:
         choices=["markdown", "compact"],
         default="markdown",
         help="Prompt packet format to generate",
+    )
+    parser.add_argument(
+        "--summary-language",
+        default="ru",
+        help="Language for the user-facing review summary, default: ru",
     )
     return parser.parse_args()
 
@@ -565,6 +570,7 @@ def render_request(
     solver_count: int,
     execution_mode: str,
     workstream_hints: list[dict[str, str]],
+    summary_language: str,
 ) -> str:
     workspace_note = "present" if workspace_exists else "missing"
     warnings = ""
@@ -586,6 +592,7 @@ def render_request(
 - Complexity guess: `{complexity}`
 - Execution mode guess: `{execution_mode}`
 - Suggested solver count: `{solver_count}`
+- User summary language: `{summary_language}`
 
 ## Workstream Hints
 
@@ -603,6 +610,7 @@ def render_intake_prompt(
     workstream_hints: list[dict[str, str]],
     validation_commands: list[str],
     prompt_format: str,
+    summary_language: str,
 ) -> str:
     if prompt_format == "compact":
         return compact_lines(
@@ -626,6 +634,7 @@ def render_intake_prompt(
                     "complexity": complexity,
                     "execution_mode": execution_mode,
                     "solver_count": solver_count,
+                    "summary_language": summary_language,
                     "validation_commands": compact_list(validation_commands),
                     "workstream_hints": workstream_hints,
                 },
@@ -680,6 +689,7 @@ Current defaults:
 - complexity: `{complexity}`
 - execution mode: `{execution_mode}`
 - solver count: `{solver_count}`
+- user summary language: `{summary_language}`
 - suggested validation:
 {bullet_list(validation_commands)}
 
@@ -773,6 +783,7 @@ def render_review_prompt(
     validation_commands: list[str],
     reviewers: list[str],
     prompt_format: str,
+    summary_language: str,
 ) -> str:
     solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
     solution_lines = "\n".join(f"- `{path}`" for path in solution_files)
@@ -791,14 +802,17 @@ def render_review_prompt(
                 "write": [
                     str(run_dir / "review" / "report.md"),
                     str(run_dir / "review" / "scorecard.json"),
+                    str(run_dir / "review" / "user-summary.md"),
                 ],
                 "reviewer_stack": reviewers,
+                "user_summary_language": summary_language,
                 "validation_hints": compact_list(validation_commands),
                 "rules": [
                     "compare every solution against the brief, not against style preference",
                     "penalize silent scope reduction",
                     "architecture-only or scaffold-only output is insufficient when the brief still targets a working MVP",
                     "treat missing evidence as a penalty",
+                    "write a short user-facing summary in the requested language",
                     "recommend a hybrid only when the parts are clearly compatible",
                 ],
                 "required_output": {
@@ -810,6 +824,13 @@ def render_review_prompt(
                         "validation evidence used",
                     ],
                     "scorecard": "numeric per-solver scores using the review rubric",
+                    "user_summary_sections": [
+                        "winner and why",
+                        "backup option",
+                        "main risks",
+                        "what the user may want to correct before execution",
+                        "recommended next action",
+                    ],
                 },
             }
         )
@@ -835,13 +856,88 @@ Deliver:
 
 - `review/report.md` with a short summary for each solver and a final recommendation
 - `review/scorecard.json` with numeric scores per solver
+- `review/user-summary.md` as a short user-facing summary in `{summary_language}`
 
 Rules:
 
 - compare every solution against the brief, not against style preferences
 - run the cheapest relevant validation first when code or config changed
 - treat missing evidence as a penalty
+- write the user-facing summary for a human decision-maker who may want to adjust the plan before execution
 - recommend a hybrid only when the parts are clearly compatible
+"""
+
+
+def render_execution_prompt(
+    run_dir: Path,
+    validation_commands: list[str],
+    prompt_format: str,
+) -> str:
+    solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
+    solution_lines = "\n".join(f"- `{path}`" for path in solution_files) or "- none"
+    execution_report = run_dir / "execution" / "report.md"
+    if prompt_format == "compact":
+        return compact_lines(
+            {
+                "stage": "execution",
+                "mode": "implement",
+                "read": [
+                    str(run_dir / "request.md"),
+                    str(run_dir / "brief.md"),
+                    str(run_dir / "plan.json"),
+                    str(run_dir / "review" / "report.md"),
+                    str(run_dir / "review" / "scorecard.json"),
+                    str(run_dir / "review" / "user-summary.md"),
+                    *[str(path) for path in solution_files],
+                ],
+                "write": [str(execution_report)],
+                "rules": [
+                    "implement the winner or explicitly justified hybrid in the primary workspace",
+                    "treat workspace changes as the main deliverable and execution/report.md as the audit trail",
+                    "follow the review recommendation unless local validation forces a narrower implementation",
+                    "run the cheapest relevant validation after edits and record exact commands and outcomes",
+                    "if blocked, implement the highest-value slice and state the blocker precisely",
+                ],
+                "deliverables": [
+                    "actual workspace changes",
+                    "execution summary",
+                    "changed files",
+                    "validation performed",
+                    "remaining blockers and next steps",
+                ],
+                "validation_hints": compact_list(validation_commands),
+            }
+        )
+
+    return f"""# Level 4: Execution
+
+Read:
+
+- `{run_dir / 'request.md'}`
+- `{run_dir / 'brief.md'}`
+- `{run_dir / 'plan.json'}`
+- `{run_dir / 'review' / 'report.md'}`
+- `{run_dir / 'review' / 'scorecard.json'}`
+- `{run_dir / 'review' / 'user-summary.md'}` if it exists
+- relevant solver outputs:
+{solution_lines}
+
+Your job is to implement the recommended winner or compatible hybrid in the primary workspace.
+
+Deliver:
+
+- actual code or configuration changes in the workspace
+- `execution/report.md` with implementation summary, changed files, validation performed, blockers, and next steps
+
+Validation hints:
+{bullet_list(validation_commands)}
+
+Rules:
+
+- treat workspace changes as the primary deliverable
+- follow the review recommendation unless local validation forces an explicit deviation
+- run the cheapest relevant validation after edits
+- if full implementation is blocked, complete the highest-value slice and record the exact blocker
 """
 
 
@@ -866,6 +962,7 @@ def main() -> None:
     (run_dir / "prompts").mkdir()
     (run_dir / "solutions").mkdir()
     (run_dir / "review").mkdir()
+    (run_dir / "execution").mkdir()
 
     plan = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -876,6 +973,7 @@ def main() -> None:
         "complexity": complexity,
         "execution_mode": execution_mode,
         "prompt_format": args.prompt_format,
+        "summary_language": args.summary_language,
         "solver_count": solver_count,
         "solver_roles": roles,
         "workstream_hints": workstream_hints,
@@ -884,6 +982,7 @@ def main() -> None:
         "validation_commands": validation_commands,
         "references": {
             "role_map": "references/agency-role-map.md",
+            "decomposition_rules": "references/decomposition-rules.md",
             "review_rubric": "references/review-rubric.md",
         },
     }
@@ -899,6 +998,7 @@ def main() -> None:
             solver_count,
             execution_mode,
             workstream_hints,
+            args.summary_language,
         ),
     )
     write_text(run_dir / "brief.md", "# Brief\n\nPending intake stage.\n")
@@ -915,6 +1015,7 @@ def main() -> None:
             workstream_hints,
             validation_commands,
             args.prompt_format,
+            args.summary_language,
         ),
     )
 
@@ -938,10 +1039,22 @@ def main() -> None:
 
     write_text(
         run_dir / "prompts" / "level3-review.md",
-        render_review_prompt(run_dir, validation_commands, REVIEWER_STACK, args.prompt_format),
+        render_review_prompt(
+            run_dir,
+            validation_commands,
+            REVIEWER_STACK,
+            args.prompt_format,
+            args.summary_language,
+        ),
     )
     write_text(run_dir / "review" / "report.md", "# Review Report\n\nPending review stage.\n")
     write_text(run_dir / "review" / "scorecard.json", "{}\n")
+    write_text(run_dir / "review" / "user-summary.md", "# User Summary\n\nPending localized review summary.\n")
+    write_text(
+        run_dir / "prompts" / "level4-execution.md",
+        render_execution_prompt(run_dir, validation_commands, args.prompt_format),
+    )
+    write_text(run_dir / "execution" / "report.md", "# Execution Report\n\nPending execution stage.\n")
 
     print(run_dir)
 

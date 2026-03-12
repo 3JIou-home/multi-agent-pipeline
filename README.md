@@ -5,6 +5,7 @@
 1. Intake and prompt builder
 2. One to three independent solver stages
 3. A final reviewer that compares solutions and writes a verdict
+4. An execution stage that implements the selected winner or hybrid
 
 The intake stage is expected to preserve the user's requested outcome and decompose compound requests into workstreams. It should not silently replace "build the service" with "make a scaffold" unless that is recorded as an explicit interim milestone.
 
@@ -50,6 +51,16 @@ python3 scripts/init_run.py \
   --prompt-format compact
 ```
 
+Choose the language for the user-facing review summary:
+
+```bash
+python3 scripts/init_run.py \
+  --task 'Build a staged pipeline for this request' \
+  --workspace /path/to/workspace \
+  --output-dir /path/to/agent-runs \
+  --summary-language ru
+```
+
 This creates a run directory with:
 
 - `request.md`
@@ -58,6 +69,7 @@ This creates a run directory with:
 - `prompts/`
 - `solutions/`
 - `review/`
+- `execution/`
 
 ## Run Stages
 
@@ -66,6 +78,7 @@ Check progress:
 ```bash
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> status
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> next
+python3 scripts/run_stage.py /path/to/agent-runs/<run-id> summary
 ```
 
 Run the next stage:
@@ -80,6 +93,7 @@ Run a specific stage:
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start intake
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start solver-a
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start review
+python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start execution
 ```
 
 Inspect or copy a prompt without running it:
@@ -94,6 +108,9 @@ python3 scripts/run_stage.py /path/to/agent-runs/<run-id> copy solver-a
 - Intake preserves the original requested outcome and records any phase-1 scaffold only as an interim milestone.
 - Compact mode emits JSON-like stage packets to reduce prompt overhead.
 - Solver stages are intended to stay independent until review.
+- Review writes both a machine-oriented verdict and `review/user-summary.md` in the selected language. The default is Russian via `--summary-language ru`.
+- Inspect the localized review summary before running execution if you want to adjust the plan or ask for corrections.
 - The launcher uses `codex exec` under the hood.
 - The launcher syncs missing solver artifacts if intake changes solver count or roles in `plan.json`.
+- The launcher also syncs execution artifacts and can print the localized summary with `run_stage.py <run_dir> summary`.
 - The skill can update downstream prompts and solver count after intake if the brief changes.

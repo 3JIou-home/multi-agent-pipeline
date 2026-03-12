@@ -61,6 +61,7 @@ After the per-solution summaries, write:
 - the backup option if the winner is blocked
 - a hybrid recommendation only if the parts are clearly compatible
 - the exact validation evidence used
+- a separate user-facing summary in the language requested by `plan.json`, default `ru`
 
 ## Decision Rules
 

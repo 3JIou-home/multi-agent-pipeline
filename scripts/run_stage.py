@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from init_run import render_review_prompt, render_solver_prompt
+from init_run import render_execution_prompt, render_review_prompt, render_solver_prompt
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -20,6 +20,8 @@ REVIEW_RUBRIC = SKILL_DIR / "references" / "review-rubric.md"
 BRIEF_PLACEHOLDER = "Pending intake stage."
 RESULT_PLACEHOLDER = "Fill this file with the solver output."
 REVIEW_PLACEHOLDER = "Pending review stage."
+USER_SUMMARY_PLACEHOLDER = "Pending localized review summary."
+EXECUTION_PLACEHOLDER = "Pending execution stage."
 PLACEHOLDER_PREFIXES = (
     "pending ",
     "fill this file ",
@@ -36,17 +38,18 @@ def parse_args() -> argparse.Namespace:
 
     subparsers.add_parser("status", help="Show stage completion status")
     subparsers.add_parser("next", help="Print the next stage id")
+    subparsers.add_parser("summary", help="Print the localized user-facing review summary")
 
     show = subparsers.add_parser("show", help="Print the compiled prompt for a stage")
-    show.add_argument("stage", help="Stage id such as intake, solver-a, or review")
+    show.add_argument("stage", help="Stage id such as intake, solver-a, review, or execution")
     show.add_argument("--raw", action="store_true", help="Show the raw stage prompt file")
 
     copy = subparsers.add_parser("copy", help="Copy the compiled prompt for a stage to the clipboard")
-    copy.add_argument("stage", help="Stage id such as intake, solver-a, or review")
+    copy.add_argument("stage", help="Stage id such as intake, solver-a, review, or execution")
     copy.add_argument("--raw", action="store_true", help="Copy the raw stage prompt file")
 
     start = subparsers.add_parser("start", help="Launch codex exec for a stage")
-    start.add_argument("stage", help="Stage id such as intake, solver-a, or review")
+    start.add_argument("stage", help="Stage id such as intake, solver-a, review, or execution")
     start.add_argument("--dry-run", action="store_true", help="Print the command and prompt, do not execute")
     start.add_argument("--model", help="Pass --model to codex exec")
     start.add_argument("--profile", help="Pass --profile to codex exec")
@@ -115,6 +118,8 @@ def stage_prompt_path(run_dir: Path, stage: str) -> Path:
         return run_dir / "prompts" / "level1-intake.md"
     if stage == "review":
         return run_dir / "prompts" / "level3-review.md"
+    if stage == "execution":
+        return run_dir / "prompts" / "level4-execution.md"
     if stage.startswith("solver-"):
         return run_dir / "prompts" / f"level2-{stage}.md"
     raise SystemExit(f"Unknown stage: {stage}")
@@ -124,7 +129,13 @@ def stage_output_paths(run_dir: Path, stage: str) -> list[Path]:
     if stage == "intake":
         return [run_dir / "brief.md"]
     if stage == "review":
-        return [run_dir / "review" / "report.md", run_dir / "review" / "scorecard.json"]
+        return [
+            run_dir / "review" / "report.md",
+            run_dir / "review" / "scorecard.json",
+            run_dir / "review" / "user-summary.md",
+        ]
+    if stage == "execution":
+        return [run_dir / "execution" / "report.md"]
     if stage.startswith("solver-"):
         return [run_dir / "solutions" / stage / "RESULT.md"]
     raise SystemExit(f"Unknown stage: {stage}")
@@ -150,6 +161,8 @@ def output_looks_placeholder(stage: str, text: str) -> bool:
         BRIEF_PLACEHOLDER.lower(),
         RESULT_PLACEHOLDER.lower(),
         REVIEW_PLACEHOLDER.lower(),
+        USER_SUMMARY_PLACEHOLDER.lower(),
+        EXECUTION_PLACEHOLDER.lower(),
         f"pending {stage.lower()} stage.",
         f"pending {stage.lower()} stage",
     }
@@ -169,18 +182,32 @@ def review_scorecard_complete(path: Path) -> bool:
     return bool(payload)
 
 
+def review_complete_without_summary(run_dir: Path) -> bool:
+    report_path = run_dir / "review" / "report.md"
+    scorecard_path = run_dir / "review" / "scorecard.json"
+    if not report_path.exists() or not scorecard_path.exists():
+        return False
+    if output_looks_placeholder("review", read_text(report_path)):
+        return False
+    return review_scorecard_complete(scorecard_path)
+
+
 def is_stage_complete(run_dir: Path, stage: str) -> bool:
     outputs = stage_output_paths(run_dir, stage)
+    if stage == "review":
+        report, scorecard, summary = outputs
+        if not report.exists() or not scorecard.exists():
+            return False
+        if output_looks_placeholder(stage, read_text(report)):
+            return False
+        if not review_scorecard_complete(scorecard):
+            return False
+        if summary.exists() and output_looks_placeholder("review-summary", read_text(summary)):
+            return False
+        return True
     for output in outputs:
         if not output.exists():
             return False
-    if stage == "review":
-        report = outputs[0]
-        if output_looks_placeholder(stage, read_text(report)):
-            return False
-        if not review_scorecard_complete(outputs[1]):
-            return False
-        return True
     return all(not output_looks_placeholder(stage, read_text(output)) for output in outputs)
 
 
@@ -188,6 +215,7 @@ def available_stages(run_dir: Path) -> list[str]:
     stages = ["intake"]
     stages.extend(solver_ids(run_dir))
     stages.append("review")
+    stages.append("execution")
     return stages
 
 
@@ -205,6 +233,7 @@ def sync_run_artifacts(run_dir: Path) -> None:
     plan = load_plan(run_dir)
     validation_commands = plan.get("validation_commands", [])
     prompt_format = plan.get("prompt_format", "markdown")
+    summary_language = plan.get("summary_language", "ru")
 
     for role_data in plan.get("solver_roles", []):
         solver_id = role_data["solver_id"]
@@ -235,8 +264,24 @@ def sync_run_artifacts(run_dir: Path) -> None:
                 validation_commands,
                 plan.get("reviewer_stack", []),
                 prompt_format,
+                summary_language,
             ),
         )
+
+    review_summary_path = run_dir / "review" / "user-summary.md"
+    if not review_summary_path.exists() and not review_complete_without_summary(run_dir):
+        write_text(review_summary_path, "# User Summary\n\nPending localized review summary.\n")
+
+    execution_prompt_path = run_dir / "prompts" / "level4-execution.md"
+    if not execution_prompt_path.exists():
+        write_text(
+            execution_prompt_path,
+            render_execution_prompt(run_dir, validation_commands, prompt_format),
+        )
+
+    execution_report_path = run_dir / "execution" / "report.md"
+    if not execution_report_path.exists():
+        write_text(execution_report_path, "# Execution Report\n\nPending execution stage.\n")
 
 
 def next_stage(run_dir: Path) -> str | None:
@@ -297,6 +342,22 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
         if solver_outputs:
             dynamic_context.append("Current solver outputs from plan:")
             dynamic_context.extend(f"- `{path}`" for path in solver_outputs)
+    if stage == "execution":
+        scorecard_path = run_dir / "review" / "scorecard.json"
+        if scorecard_path.exists() and review_scorecard_complete(scorecard_path):
+            scorecard = json.loads(read_text(scorecard_path))
+            winner = scorecard.get("winner")
+            backup = scorecard.get("backup")
+            if winner:
+                dynamic_context.append(f"- Review winner from scorecard: `{winner}`")
+            if backup:
+                dynamic_context.append(f"- Review backup from scorecard: `{backup}`")
+        dynamic_context.extend(
+            [
+                f"- Review report: `{run_dir / 'review' / 'report.md'}`",
+                f"- User-facing summary: `{run_dir / 'review' / 'user-summary.md'}`",
+            ]
+        )
 
     return (
         f"You are executing stage `{stage}` of a multi-agent pipeline.\n\n"
@@ -337,6 +398,8 @@ def require_valid_order(run_dir: Path, stage: str, force: bool) -> None:
         if pending_solvers:
             pending_text = ", ".join(pending_solvers)
             raise SystemExit(f"Solver stages still pending: {pending_text}. Run them first or pass --force.")
+    if stage == "execution" and not is_stage_complete(run_dir, "review"):
+        raise SystemExit("Review stage is still pending. Run review first or pass --force.")
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -416,6 +479,21 @@ def resolve_stage(run_dir: Path, stage: str) -> str:
     return stage
 
 
+def print_user_summary(run_dir: Path) -> int:
+    summary_path = run_dir / "review" / "user-summary.md"
+    if summary_path.exists() and not output_looks_placeholder("review-summary", read_text(summary_path)):
+        print(read_text(summary_path).rstrip())
+        return 0
+
+    report_path = run_dir / "review" / "report.md"
+    if review_complete_without_summary(run_dir):
+        print("Localized user summary is not available for this older run. Review report:\n")
+        print(read_text(report_path).rstrip())
+        return 0
+
+    raise SystemExit("Localized user summary is not ready yet. Run the review stage first.")
+
+
 def main() -> int:
     args = parse_args()
     run_dir = Path(args.run_dir).expanduser().resolve()
@@ -432,6 +510,9 @@ def main() -> int:
     if args.command == "next":
         print(next_stage(run_dir) or "none")
         return 0
+
+    if args.command == "summary":
+        return print_user_summary(run_dir)
 
     if args.command in {"show", "copy", "start"}:
         stage = resolve_stage(run_dir, args.stage)
