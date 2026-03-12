@@ -10,18 +10,26 @@ import subprocess
 import sys
 from pathlib import Path
 
-from init_run import render_execution_prompt, render_review_prompt, render_solver_prompt
+from init_run import (
+    render_execution_prompt,
+    render_review_prompt,
+    render_solver_prompt,
+    render_verification_prompt,
+)
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 ROLE_MAP = SKILL_DIR / "references" / "agency-role-map.md"
 REVIEW_RUBRIC = SKILL_DIR / "references" / "review-rubric.md"
+VERIFICATION_RUBRIC = SKILL_DIR / "references" / "verification-rubric.md"
 
 BRIEF_PLACEHOLDER = "Pending intake stage."
 RESULT_PLACEHOLDER = "Fill this file with the solver output."
 REVIEW_PLACEHOLDER = "Pending review stage."
 USER_SUMMARY_PLACEHOLDER = "Pending localized review summary."
 EXECUTION_PLACEHOLDER = "Pending execution stage."
+VERIFICATION_PLACEHOLDER = "Pending verification stage."
+VERIFICATION_SUMMARY_PLACEHOLDER = "Pending localized verification summary."
 PLACEHOLDER_PREFIXES = (
     "pending ",
     "fill this file ",
@@ -39,6 +47,14 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser("status", help="Show stage completion status")
     subparsers.add_parser("next", help="Print the next stage id")
     subparsers.add_parser("summary", help="Print the localized user-facing review summary")
+    subparsers.add_parser("findings", help="Print verification findings")
+    rerun = subparsers.add_parser(
+        "rerun",
+        help="Create a follow-up run from verification/improvement-request.md",
+    )
+    rerun.add_argument("--dry-run", action="store_true", help="Print the init_run.py command, do not execute")
+    rerun.add_argument("--title", help="Optional title for the follow-up run")
+    rerun.add_argument("--output-dir", help="Override output directory for the follow-up run")
 
     show = subparsers.add_parser("show", help="Print the compiled prompt for a stage")
     show.add_argument("stage", help="Stage id such as intake, solver-a, review, or execution")
@@ -120,6 +136,8 @@ def stage_prompt_path(run_dir: Path, stage: str) -> Path:
         return run_dir / "prompts" / "level3-review.md"
     if stage == "execution":
         return run_dir / "prompts" / "level4-execution.md"
+    if stage == "verification":
+        return run_dir / "prompts" / "level5-verification.md"
     if stage.startswith("solver-"):
         return run_dir / "prompts" / f"level2-{stage}.md"
     raise SystemExit(f"Unknown stage: {stage}")
@@ -136,6 +154,12 @@ def stage_output_paths(run_dir: Path, stage: str) -> list[Path]:
         ]
     if stage == "execution":
         return [run_dir / "execution" / "report.md"]
+    if stage == "verification":
+        return [
+            run_dir / "verification" / "findings.md",
+            run_dir / "verification" / "user-summary.md",
+            run_dir / "verification" / "improvement-request.md",
+        ]
     if stage.startswith("solver-"):
         return [run_dir / "solutions" / stage / "RESULT.md"]
     raise SystemExit(f"Unknown stage: {stage}")
@@ -163,6 +187,8 @@ def output_looks_placeholder(stage: str, text: str) -> bool:
         REVIEW_PLACEHOLDER.lower(),
         USER_SUMMARY_PLACEHOLDER.lower(),
         EXECUTION_PLACEHOLDER.lower(),
+        VERIFICATION_PLACEHOLDER.lower(),
+        VERIFICATION_SUMMARY_PLACEHOLDER.lower(),
         f"pending {stage.lower()} stage.",
         f"pending {stage.lower()} stage",
     }
@@ -205,6 +231,17 @@ def is_stage_complete(run_dir: Path, stage: str) -> bool:
         if summary.exists() and output_looks_placeholder("review-summary", read_text(summary)):
             return False
         return True
+    if stage == "verification":
+        findings, summary, improvement_request = outputs
+        if not findings.exists() or not summary.exists() or not improvement_request.exists():
+            return False
+        if output_looks_placeholder(stage, read_text(findings)):
+            return False
+        if output_looks_placeholder("verification-summary", read_text(summary)):
+            return False
+        if output_looks_placeholder("improvement-request", read_text(improvement_request)):
+            return False
+        return True
     for output in outputs:
         if not output.exists():
             return False
@@ -216,6 +253,7 @@ def available_stages(run_dir: Path) -> list[str]:
     stages.extend(solver_ids(run_dir))
     stages.append("review")
     stages.append("execution")
+    stages.append("verification")
     return stages
 
 
@@ -283,6 +321,36 @@ def sync_run_artifacts(run_dir: Path) -> None:
     if not execution_report_path.exists():
         write_text(execution_report_path, "# Execution Report\n\nPending execution stage.\n")
 
+    verification_prompt_path = run_dir / "prompts" / "level5-verification.md"
+    if not verification_prompt_path.exists():
+        write_text(
+            verification_prompt_path,
+            render_verification_prompt(
+                run_dir,
+                validation_commands,
+                prompt_format,
+                summary_language,
+            ),
+        )
+
+    verification_findings_path = run_dir / "verification" / "findings.md"
+    if not verification_findings_path.exists():
+        write_text(verification_findings_path, "# Findings\n\nPending verification stage.\n")
+
+    verification_summary_path = run_dir / "verification" / "user-summary.md"
+    if not verification_summary_path.exists():
+        write_text(
+            verification_summary_path,
+            "# Verification Summary\n\nPending localized verification summary.\n",
+        )
+
+    verification_improvement_path = run_dir / "verification" / "improvement-request.md"
+    if not verification_improvement_path.exists():
+        write_text(
+            verification_improvement_path,
+            "# Improvement Request\n\nPending verification stage.\n",
+        )
+
 
 def next_stage(run_dir: Path) -> str | None:
     for stage in available_stages(run_dir):
@@ -312,6 +380,7 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
         f"- Prompt format: `{prompt_format}`",
         f"- Role map reference: `{ROLE_MAP}`",
         f"- Review rubric reference: `{REVIEW_RUBRIC}`",
+        f"- Verification rubric reference: `{VERIFICATION_RUBRIC}`",
     ]
     if agency_agents_dir is not None:
         guidance.append(f"- Agency role catalog: `{agency_agents_dir}`")
@@ -358,6 +427,14 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
                 f"- User-facing summary: `{run_dir / 'review' / 'user-summary.md'}`",
             ]
         )
+    if stage == "verification":
+        dynamic_context.extend(
+            [
+                f"- Execution report: `{run_dir / 'execution' / 'report.md'}`",
+                f"- Verification findings output: `{run_dir / 'verification' / 'findings.md'}`",
+                f"- Improvement request output: `{run_dir / 'verification' / 'improvement-request.md'}`",
+            ]
+        )
 
     return (
         f"You are executing stage `{stage}` of a multi-agent pipeline.\n\n"
@@ -400,6 +477,8 @@ def require_valid_order(run_dir: Path, stage: str, force: bool) -> None:
             raise SystemExit(f"Solver stages still pending: {pending_text}. Run them first or pass --force.")
     if stage == "execution" and not is_stage_complete(run_dir, "review"):
         raise SystemExit("Review stage is still pending. Run review first or pass --force.")
+    if stage == "verification" and not is_stage_complete(run_dir, "execution"):
+        raise SystemExit("Execution stage is still pending. Run execution first or pass --force.")
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -494,6 +573,54 @@ def print_user_summary(run_dir: Path) -> int:
     raise SystemExit("Localized user summary is not ready yet. Run the review stage first.")
 
 
+def print_findings(run_dir: Path) -> int:
+    findings_path = run_dir / "verification" / "findings.md"
+    if findings_path.exists() and not output_looks_placeholder("verification", read_text(findings_path)):
+        print(read_text(findings_path).rstrip())
+        return 0
+    raise SystemExit("Verification findings are not ready yet. Run the verification stage first.")
+
+
+def create_follow_up_run(run_dir: Path, args: argparse.Namespace) -> int:
+    if not is_stage_complete(run_dir, "verification"):
+        raise SystemExit("Verification stage is still pending. Run verification first.")
+
+    plan = load_plan(run_dir)
+    improvement_request = run_dir / "verification" / "improvement-request.md"
+    if not improvement_request.exists():
+        raise SystemExit(f"Missing improvement request: {improvement_request}")
+
+    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir.parent
+    title = args.title or f"{run_dir.name}-improve"
+    command = [
+        sys.executable,
+        str(SKILL_DIR / "scripts" / "init_run.py"),
+        "--task-file",
+        str(improvement_request),
+        "--workspace",
+        str(Path(plan.get("workspace", ".")).expanduser()),
+        "--output-dir",
+        str(output_dir),
+        "--title",
+        title,
+        "--prompt-format",
+        str(plan.get("prompt_format", "markdown")),
+        "--summary-language",
+        str(plan.get("summary_language", "ru")),
+    ]
+
+    if args.dry_run:
+        print("Command:")
+        print(" ".join(shell_quote(part) for part in command))
+        return 0
+
+    process = subprocess.run(command, text=True, capture_output=True)
+    if process.returncode != 0:
+        raise SystemExit(process.stderr.strip() or process.stdout.strip() or "Failed to create follow-up run.")
+    print(process.stdout.strip())
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     run_dir = Path(args.run_dir).expanduser().resolve()
@@ -513,6 +640,12 @@ def main() -> int:
 
     if args.command == "summary":
         return print_user_summary(run_dir)
+
+    if args.command == "findings":
+        return print_findings(run_dir)
+
+    if args.command == "rerun":
+        return create_follow_up_run(run_dir, args)
 
     if args.command in {"show", "copy", "start"}:
         stage = resolve_stage(run_dir, args.stage)

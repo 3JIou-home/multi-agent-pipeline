@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scaffold a four-level multi-agent pipeline run directory."""
+"""Scaffold a five-level multi-agent pipeline run directory."""
 
 from __future__ import annotations
 
@@ -941,6 +941,102 @@ Rules:
 """
 
 
+def render_verification_prompt(
+    run_dir: Path,
+    validation_commands: list[str],
+    prompt_format: str,
+    summary_language: str,
+) -> str:
+    solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
+    solution_lines = "\n".join(f"- `{path}`" for path in solution_files) or "- none"
+    findings_file = run_dir / "verification" / "findings.md"
+    user_summary_file = run_dir / "verification" / "user-summary.md"
+    improvement_request_file = run_dir / "verification" / "improvement-request.md"
+
+    if prompt_format == "compact":
+        return compact_lines(
+            {
+                "stage": "verification",
+                "mode": "audit",
+                "read": [
+                    str(run_dir / "request.md"),
+                    str(run_dir / "brief.md"),
+                    str(run_dir / "plan.json"),
+                    str(run_dir / "review" / "report.md"),
+                    str(run_dir / "review" / "scorecard.json"),
+                    str(run_dir / "review" / "user-summary.md"),
+                    str(run_dir / "execution" / "report.md"),
+                    "references/verification-rubric.md",
+                    *[str(path) for path in solution_files],
+                ],
+                "write": [
+                    str(findings_file),
+                    str(user_summary_file),
+                    str(improvement_request_file),
+                ],
+                "validation_hints": compact_list(validation_commands),
+                "user_summary_language": summary_language,
+                "rules": [
+                    "review the actual workspace implementation, not only the plans",
+                    "act in code-review mode: prioritize bugs, regressions, unsafe behavior, and missing validation",
+                    "run the cheapest relevant checks first and record exact evidence or blockers",
+                    "write findings ordered by severity with file references when possible",
+                    "if there are no meaningful findings, say so explicitly",
+                    "generate an improvement request that can seed a follow-up pipeline run against the existing codebase",
+                ],
+                "required_output": {
+                    "findings_sections": [
+                        "findings",
+                        "open questions or assumptions",
+                        "change summary or residual risks",
+                    ],
+                    "user_summary_sections": [
+                        "overall result",
+                        "top issues",
+                        "whether a rerun is recommended",
+                        "recommended next action",
+                    ],
+                    "improvement_request": "a concise task statement for the next run that preserves the original goal and targets the verified defects",
+                },
+            }
+        )
+
+    return f"""# Level 5: Verification And Improvement Seed
+
+Read:
+
+- `{run_dir / 'request.md'}`
+- `{run_dir / 'brief.md'}`
+- `{run_dir / 'plan.json'}`
+- `{run_dir / 'review' / 'report.md'}`
+- `{run_dir / 'review' / 'scorecard.json'}`
+- `{run_dir / 'review' / 'user-summary.md'}`
+- `{run_dir / 'execution' / 'report.md'}`
+- `references/verification-rubric.md`
+- solver outputs for context:
+{solution_lines}
+
+Your job is to review the actual implementation in the workspace after execution, produce findings, and seed the next improvement run if needed.
+
+Deliver:
+
+- `verification/findings.md` with ordered findings, file references, evidence, and residual risks
+- `verification/user-summary.md` as a short user-facing summary in `{summary_language}`
+- `verification/improvement-request.md` with a concise follow-up task for the next pipeline run against the existing codebase
+
+Validation hints:
+{bullet_list(validation_commands)}
+
+Rules:
+
+- inspect the actual workspace, not just the proposed plans
+- default to code-review mindset: list findings first, ordered by severity
+- run the cheapest relevant validation first
+- if there are no meaningful findings, say that explicitly
+- keep the improvement request actionable and tightly scoped to verified defects
+"""
+
+
 def main() -> None:
     args = parse_args()
     task = read_task(args)
@@ -963,6 +1059,7 @@ def main() -> None:
     (run_dir / "solutions").mkdir()
     (run_dir / "review").mkdir()
     (run_dir / "execution").mkdir()
+    (run_dir / "verification").mkdir()
 
     plan = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -984,6 +1081,7 @@ def main() -> None:
             "role_map": "references/agency-role-map.md",
             "decomposition_rules": "references/decomposition-rules.md",
             "review_rubric": "references/review-rubric.md",
+            "verification_rubric": "references/verification-rubric.md",
         },
     }
 
@@ -1055,6 +1153,24 @@ def main() -> None:
         render_execution_prompt(run_dir, validation_commands, args.prompt_format),
     )
     write_text(run_dir / "execution" / "report.md", "# Execution Report\n\nPending execution stage.\n")
+    write_text(
+        run_dir / "prompts" / "level5-verification.md",
+        render_verification_prompt(
+            run_dir,
+            validation_commands,
+            args.prompt_format,
+            args.summary_language,
+        ),
+    )
+    write_text(run_dir / "verification" / "findings.md", "# Findings\n\nPending verification stage.\n")
+    write_text(
+        run_dir / "verification" / "user-summary.md",
+        "# Verification Summary\n\nPending localized verification summary.\n",
+    )
+    write_text(
+        run_dir / "verification" / "improvement-request.md",
+        "# Improvement Request\n\nPending verification stage.\n",
+    )
 
     print(run_dir)
 

@@ -6,6 +6,7 @@
 2. One to three independent solver stages
 3. A final reviewer that compares solutions and writes a verdict
 4. An execution stage that implements the selected winner or hybrid
+5. A verification stage that audits the implementation and seeds the next improvement run
 
 The intake stage is expected to preserve the user's requested outcome and decompose compound requests into workstreams. It should not silently replace "build the service" with "make a scaffold" unless that is recorded as an explicit interim milestone.
 
@@ -79,6 +80,7 @@ Check progress:
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> status
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> next
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> summary
+python3 scripts/run_stage.py /path/to/agent-runs/<run-id> findings
 ```
 
 Run the next stage:
@@ -94,6 +96,13 @@ python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start intake
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start solver-a
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start review
 python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start execution
+python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start verification
+```
+
+Create the next improvement run from verification findings:
+
+```bash
+python3 scripts/run_stage.py /path/to/agent-runs/<run-id> rerun
 ```
 
 Inspect or copy a prompt without running it:
@@ -110,7 +119,9 @@ python3 scripts/run_stage.py /path/to/agent-runs/<run-id> copy solver-a
 - Solver stages are intended to stay independent until review.
 - Review writes both a machine-oriented verdict and `review/user-summary.md` in the selected language. The default is Russian via `--summary-language ru`.
 - Inspect the localized review summary before running execution if you want to adjust the plan or ask for corrections.
+- Verification audits the actual implementation, writes `verification/findings.md`, and generates `verification/improvement-request.md` for the next run.
 - The launcher uses `codex exec` under the hood.
 - The launcher syncs missing solver artifacts if intake changes solver count or roles in `plan.json`.
-- The launcher also syncs execution artifacts and can print the localized summary with `run_stage.py <run_dir> summary`.
+- The launcher also syncs execution and verification artifacts, can print the localized review summary with `run_stage.py <run_dir> summary`, and can print post-execution findings with `run_stage.py <run_dir> findings`.
+- `run_stage.py <run_dir> rerun` creates a follow-up run from `verification/improvement-request.md` against the same workspace.
 - The skill can update downstream prompts and solver count after intake if the brief changes.

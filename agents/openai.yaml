@@ -1,4 +1,4 @@
 interface:
   display_name: "Multi-Agent Pipeline"
-  short_description: "Four-stage task orchestration"
-  default_prompt: "Use $multi-agent-pipeline to turn a task into an intake, solver, review, and execution workflow."
+  short_description: "Five-stage task orchestration"
+  default_prompt: "Use $multi-agent-pipeline to turn a task into an intake, solver, review, execution, and verification workflow."

@@ -1,6 +1,6 @@
 ---
 name: multi-agent-pipeline
-description: "Build and run a four-stage agent pipeline for a single user task: (1) intake/prompt-builder, (2) one to three independent solver agents, (3) a censor/reviewer that compares outputs, runs targeted validation, and writes short summaries, and (4) an execution stage that implements the recommended winner or hybrid. Use when a task benefits from role specialization, multiple candidate solutions, explicit handoffs, evidence-based review, and a final implementation pass."
+description: "Build and run a five-stage agent pipeline for a single user task: (1) intake/prompt-builder, (2) one to three independent solver agents, (3) a censor/reviewer that compares outputs and writes user-facing summaries, (4) an execution stage that implements the recommended winner or hybrid, and (5) a verification stage that audits the resulting code, writes findings, and seeds the next improvement run."
 ---
 
 # Multi Agent Pipeline
@@ -133,6 +133,20 @@ The execution stage must:
 
 If local constraints force a deviation from the review winner, state the reason directly in the execution report.
 
+### 5. Verification And Improvement Seed
+
+Run verification only after execution is complete.
+
+The verification stage must:
+
+- inspect the actual workspace implementation
+- review it in code-review mode, with findings ordered by severity
+- run the cheapest relevant validation it can
+- write a localized verification summary for the user
+- generate an improvement request that can seed the next run against the existing codebase
+
+Use `references/verification-rubric.md` for the findings format and improvement-request rules.
+
 ## Operating Rules
 
 - Keep every stage file-based so the pipeline can be resumed or audited later.
@@ -143,6 +157,7 @@ If local constraints force a deviation from the review winner, state the reason 
 - If tests cannot run, say exactly why and treat that as a review penalty.
 - Keep the final reviewer summary short and decision-oriented.
 - Keep the user-facing review summary concise and in the language requested by `plan.json`.
+- Keep verification findings evidence-based and scoped to actual implemented code.
 
 ## Artifacts
 
@@ -169,6 +184,10 @@ agent-runs/<timestamp>-<slug>/
     user-summary.md
   execution/
     report.md
+  verification/
+    findings.md
+    user-summary.md
+    improvement-request.md
 ```
 
 Read `plan.json` first. It contains the normalized metadata, role assignments, stack signals, summary language, and suggested validation commands.
@@ -194,3 +213,7 @@ Guide intake to preserve the requested outcome while splitting multi-part tasks 
 ### `references/review-rubric.md`
 
 Define the reviewer scorecard, summary format, and validation heuristics.
+
+### `references/verification-rubric.md`
+
+Define the post-execution audit format, findings expectations, localized verification summary, and the follow-up improvement request.
