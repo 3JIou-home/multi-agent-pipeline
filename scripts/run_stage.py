@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from init_run import render_solver_prompt
+from init_run import render_review_prompt, render_solver_prompt
 
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
@@ -20,6 +20,12 @@ REVIEW_RUBRIC = SKILL_DIR / "references" / "review-rubric.md"
 BRIEF_PLACEHOLDER = "Pending intake stage."
 RESULT_PLACEHOLDER = "Fill this file with the solver output."
 REVIEW_PLACEHOLDER = "Pending review stage."
+PLACEHOLDER_PREFIXES = (
+    "pending ",
+    "fill this file ",
+    "todo",
+    "tbd",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,14 +130,43 @@ def stage_output_paths(run_dir: Path, stage: str) -> list[Path]:
     raise SystemExit(f"Unknown stage: {stage}")
 
 
-def stage_placeholder(stage: str) -> str | None:
-    if stage == "intake":
-        return BRIEF_PLACEHOLDER
-    if stage == "review":
-        return REVIEW_PLACEHOLDER
-    if stage.startswith("solver-"):
-        return RESULT_PLACEHOLDER
-    return None
+def first_substantive_line(text: str) -> str:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        return line
+    return ""
+
+
+def output_looks_placeholder(stage: str, text: str) -> bool:
+    normalized = first_substantive_line(text).lower()
+    if not normalized:
+        return True
+
+    exact_markers = {
+        BRIEF_PLACEHOLDER.lower(),
+        RESULT_PLACEHOLDER.lower(),
+        REVIEW_PLACEHOLDER.lower(),
+        f"pending {stage.lower()} stage.",
+        f"pending {stage.lower()} stage",
+    }
+    if normalized in exact_markers:
+        return True
+
+    return any(normalized.startswith(prefix) for prefix in PLACEHOLDER_PREFIXES)
+
+
+def review_scorecard_complete(path: Path) -> bool:
+    try:
+        payload = json.loads(read_text(path))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload)
 
 
 def is_stage_complete(run_dir: Path, stage: str) -> bool:
@@ -139,19 +174,14 @@ def is_stage_complete(run_dir: Path, stage: str) -> bool:
     for output in outputs:
         if not output.exists():
             return False
-    placeholder = stage_placeholder(stage)
     if stage == "review":
         report = outputs[0]
-        if REVIEW_PLACEHOLDER in read_text(report):
+        if output_looks_placeholder(stage, read_text(report)):
             return False
-        try:
-            json.loads(read_text(outputs[1]))
-        except json.JSONDecodeError:
+        if not review_scorecard_complete(outputs[1]):
             return False
         return True
-    if placeholder is None:
-        return all(output.exists() for output in outputs)
-    return all(placeholder not in read_text(output) for output in outputs)
+    return all(not output_looks_placeholder(stage, read_text(output)) for output in outputs)
 
 
 def available_stages(run_dir: Path) -> list[str]:
@@ -174,6 +204,7 @@ def write_text(path: Path, content: str) -> None:
 def sync_run_artifacts(run_dir: Path) -> None:
     plan = load_plan(run_dir)
     validation_commands = plan.get("validation_commands", [])
+    prompt_format = plan.get("prompt_format", "markdown")
 
     for role_data in plan.get("solver_roles", []):
         solver_id = role_data["solver_id"]
@@ -189,10 +220,23 @@ def sync_run_artifacts(run_dir: Path) -> None:
                     role=role_data["role"],
                     angle=role_data["angle"],
                     validation_commands=validation_commands,
+                    prompt_format=prompt_format,
                 ),
             )
         if not result_path.exists():
             write_text(result_path, "# Result\n\nFill this file with the solver output.\n")
+
+    review_prompt_path = run_dir / "prompts" / "level3-review.md"
+    if not review_prompt_path.exists():
+        write_text(
+            review_prompt_path,
+            render_review_prompt(
+                run_dir,
+                validation_commands,
+                plan.get("reviewer_stack", []),
+                prompt_format,
+            ),
+        )
 
 
 def next_stage(run_dir: Path) -> str | None:
@@ -212,6 +256,7 @@ def working_root(plan: dict, run_dir: Path) -> Path:
 def compile_prompt(run_dir: Path, stage: str) -> str:
     plan = load_plan(run_dir)
     workspace = Path(plan.get("workspace", ".")).expanduser()
+    prompt_format = plan.get("prompt_format", "markdown")
     prompt_body = read_text(stage_prompt_path(run_dir, stage)).rstrip()
     outputs = "\n".join(f"- `{path}`" for path in stage_output_paths(run_dir, stage))
     agency_agents_dir = discover_agency_agents_dir()
@@ -219,6 +264,7 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
     guidance = [
         f"- Run directory: `{run_dir}`",
         f"- Primary workspace: `{workspace}`",
+        f"- Prompt format: `{prompt_format}`",
         f"- Role map reference: `{ROLE_MAP}`",
         f"- Review rubric reference: `{REVIEW_RUBRIC}`",
     ]
@@ -301,6 +347,7 @@ def build_codex_command(run_dir: Path, stage: str, args: argparse.Namespace) -> 
     plan = load_plan(run_dir)
     root = working_root(plan, run_dir)
     prompt = compile_prompt(run_dir, stage)
+    color = args.color or "never"
 
     command = [
         "codex",
@@ -308,7 +355,7 @@ def build_codex_command(run_dir: Path, stage: str, args: argparse.Namespace) -> 
         "--full-auto",
         "--skip-git-repo-check",
         "--color",
-        args.color or "never",
+        color,
         "-C",
         str(root),
         "--add-dir",
@@ -323,8 +370,6 @@ def build_codex_command(run_dir: Path, stage: str, args: argparse.Namespace) -> 
         command[2:2] = ["--profile", args.profile]
     if args.oss:
         command.insert(2, "--oss")
-    if args.color:
-        command[2:2] = ["--color", args.color]
     return command, prompt
 
 

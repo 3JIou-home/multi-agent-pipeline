@@ -6,6 +6,8 @@
 2. One to three independent solver stages
 3. A final reviewer that compares solutions and writes a verdict
 
+The intake stage is expected to preserve the user's requested outcome and decompose compound requests into workstreams. It should not silently replace "build the service" with "make a scaffold" unless that is recorded as an explicit interim milestone.
+
 ## Install
 
 Clone or copy this directory into your Codex skills directory:
@@ -36,6 +38,16 @@ python3 scripts/init_run.py \
   --task 'Build a staged pipeline for this request' \
   --workspace /path/to/workspace \
   --output-dir /path/to/agent-runs
+```
+
+Compact packet mode:
+
+```bash
+python3 scripts/init_run.py \
+  --task 'Build a staged pipeline for this request' \
+  --workspace /path/to/workspace \
+  --output-dir /path/to/agent-runs \
+  --prompt-format compact
 ```
 
 This creates a run directory with:
@@ -79,6 +91,9 @@ python3 scripts/run_stage.py /path/to/agent-runs/<run-id> copy solver-a
 
 ## Notes
 
+- Intake preserves the original requested outcome and records any phase-1 scaffold only as an interim milestone.
+- Compact mode emits JSON-like stage packets to reduce prompt overhead.
 - Solver stages are intended to stay independent until review.
 - The launcher uses `codex exec` under the hood.
+- The launcher syncs missing solver artifacts if intake changes solver count or roles in `plan.json`.
 - The skill can update downstream prompts and solver count after intake if the brief changes.

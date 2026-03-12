@@ -10,9 +10,12 @@ Turn a raw user request into a staged, file-based workflow with explicit handoff
 - launches truly separate agents when the runtime supports it, or
 - simulates separation by generating prompt packets and keeping solver outputs isolated until review.
 
+Default principle: preserve the user's requested outcome. Intake may decompose, sequence, and clarify the work, but it must not silently downgrade a request for a working system into "architecture only" or "scaffold only" unless the brief records that as an explicit constraint or interim milestone.
+
 ## Quick Start
 
 1. Run `python3 scripts/init_run.py --task "<user request>" --workspace <repo-or-dir>`.
+   Optional: use `--prompt-format compact` to generate JSON-like stage packets with lower prompt overhead.
 2. Open the generated run directory and read `plan.json`.
 3. Use the launcher:
    - `python3 scripts/run_stage.py <run_dir> status`
@@ -32,16 +35,20 @@ Use the first-level agent to normalize the request before any solving begins.
 
 Do all of the following:
 
+- Preserve the original requested outcome as the top-level objective.
 - Rewrite the raw task into a precise execution brief.
 - Verify the workspace path. If it is missing, either correct it or explicitly treat the run as greenfield planning.
 - Confirm or correct task kind, complexity, and solver count from `plan.json`.
+- Decompose compound requests into concrete workstreams instead of replacing the goal with a smaller safe deliverable.
 - Choose the minimal additional skills needed for downstream work.
 - Finalize the stage prompts without solving the task itself.
 
 The intake brief must contain:
 
+- original requested outcome
 - objective
 - deliverable
+- workstream decomposition
 - scope boundaries
 - repo or workspace path
 - constraints
@@ -50,6 +57,16 @@ The intake brief must contain:
 - open questions that can be answered from local context
 
 Use `references/agency-role-map.md` only for the relevant task kind. If the task is about Codex skills, use `skill-creator`. If the task is about listing or installing skills, use `skill-installer`.
+
+If the task contains several subsystems, produce named workstreams such as:
+
+- API and ingress
+- model or LLM stage
+- renderer or executor
+- persistence
+- evaluation and safety
+
+If you introduce milestones such as "phase 1" or "first iteration", state them as an execution plan under the preserved top-level goal. Do not let the milestone become the new goal unless the user explicitly asked for that reduction.
 
 ### 2. Independent Solver Stage
 
@@ -94,6 +111,8 @@ The reviewer must:
 - mark evidence gaps when tests could not run
 - produce a short summary for each solution
 - recommend one winner, one backup, or a compatible hybrid
+
+Treat "good architecture only" as insufficient when the user asked for a working service or runnable MVP. A scaffold can be part of the recommendation, but only as an intermediate step or partial solution unless the brief explicitly narrows the deliverable.
 
 Adopt the skeptical stance from `agency-agents/testing/testing-reality-checker.md` when the local `agency-agents` repo exists. Use the concise reporting style from `agency-agents/support/support-executive-summary-generator.md` for the final summary.
 
@@ -146,6 +165,10 @@ Inspect run status, compile stage prompts with absolute references, copy prompts
 ### `references/agency-role-map.md`
 
 Map task kinds to recommended roles from the local `agency-agents` catalog and Codex skills.
+
+### `references/decomposition-rules.md`
+
+Guide intake to preserve the requested outcome while splitting multi-part tasks into workstreams and milestones.
 
 ### `references/review-rubric.md`
 

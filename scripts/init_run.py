@@ -113,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         choices=[1, 2, 3],
         help="Explicit solver count override",
     )
+    parser.add_argument(
+        "--prompt-format",
+        choices=["markdown", "compact"],
+        default="markdown",
+        help="Prompt packet format to generate",
+    )
     return parser.parse_args()
 
 
@@ -325,6 +331,108 @@ def solver_count_for(complexity: str) -> int:
     return {"low": 1, "medium": 2, "high": 3}[complexity]
 
 
+def infer_execution_mode(task_kind: str, complexity: str, task: str) -> str:
+    text = task.lower()
+    compound_signals = [
+        "telegram",
+        "freecad",
+        "api",
+        "bot",
+        "service",
+        "worker",
+        "pipeline",
+        "workflow",
+        "telegram",
+        "телеграм",
+        "сервис",
+        "бот",
+        "пайплайн",
+        "конвейер",
+    ]
+    if task_kind in {"ai", "fullstack", "backend"} and complexity != "low":
+        return "decomposed"
+    if sum(signal in text for signal in compound_signals) >= 3:
+        return "decomposed"
+    return "alternatives"
+
+
+def workstream_hints_for(task_kind: str, task: str) -> list[dict[str, str]]:
+    text = task.lower()
+    if task_kind == "ai" and any(word in text for word in ["telegram", "freecad", "телеграм", "freecad"]):
+        return [
+            {
+                "name": "telegram-ingress",
+                "goal": "accept photo, dimensions, and follow-up answers from Telegram",
+                "suggested_role": "engineering/engineering-backend-architect.md",
+            },
+            {
+                "name": "vision-or-analysis",
+                "goal": "turn image input into grounded geometry observations",
+                "suggested_role": "engineering/engineering-ai-engineer.md",
+            },
+            {
+                "name": "cad-planning",
+                "goal": "convert observations plus dimensions into a constrained CAD plan",
+                "suggested_role": "engineering/engineering-ai-engineer.md",
+            },
+            {
+                "name": "freecad-rendering",
+                "goal": "translate the constrained plan into deterministic FreeCAD Python",
+                "suggested_role": "engineering/engineering-rapid-prototyper.md",
+            },
+            {
+                "name": "safety-and-evaluation",
+                "goal": "validate supported shapes, unsafe plans, and whether fine-tuning is justified",
+                "suggested_role": "testing/testing-reality-checker.md",
+            },
+        ]
+
+    default_map = {
+        "frontend": [
+            {
+                "name": "ui-implementation",
+                "goal": "build the requested frontend surface",
+                "suggested_role": "engineering/engineering-frontend-developer.md",
+            },
+            {
+                "name": "ux-and-validation",
+                "goal": "validate usability, accessibility, and interface constraints",
+                "suggested_role": "design/design-ux-architect.md",
+            },
+        ],
+        "backend": [
+            {
+                "name": "service-layer",
+                "goal": "build the core service or API behavior",
+                "suggested_role": "engineering/engineering-backend-architect.md",
+            },
+            {
+                "name": "persistence-and-ops",
+                "goal": "define storage, jobs, and operational boundaries",
+                "suggested_role": "engineering/engineering-devops-automator.md",
+            },
+        ],
+        "fullstack": [
+            {
+                "name": "entry-surface",
+                "goal": "build the user-facing or API-facing entrypoint",
+                "suggested_role": "engineering/engineering-frontend-developer.md",
+            },
+            {
+                "name": "core-service",
+                "goal": "build the core domain behavior and data flow",
+                "suggested_role": "engineering/engineering-backend-architect.md",
+            },
+            {
+                "name": "safety-and-review",
+                "goal": "validate correctness, evidence, and operational risk",
+                "suggested_role": "testing/testing-reality-checker.md",
+            },
+        ],
+    }
+    return default_map.get(task_kind, [])
+
+
 def detect_stack(workspace: Path) -> StackSignals:
     signals = StackSignals()
     if not workspace.exists():
@@ -440,6 +548,14 @@ def bullet_list(values: Iterable[str]) -> str:
     return "\n".join(f"- {value}" for value in items)
 
 
+def compact_list(values: Iterable[str]) -> list[str]:
+    return list(values)
+
+
+def compact_lines(packet: dict) -> str:
+    return json.dumps(packet, ensure_ascii=False, indent=2) + "\n"
+
+
 def render_request(
     task: str,
     workspace: Path,
@@ -447,11 +563,17 @@ def render_request(
     task_kind: str,
     complexity: str,
     solver_count: int,
+    execution_mode: str,
+    workstream_hints: list[dict[str, str]],
 ) -> str:
     workspace_note = "present" if workspace_exists else "missing"
     warnings = ""
     if not workspace_exists:
         warnings = "\n## Warning\n\n- Workspace path does not exist. Treat this run as greenfield planning until the path is corrected.\n"
+    workstream_lines = "\n".join(
+        f"- `{item['name']}`: {item['goal']} (role: `{item['suggested_role']}`)"
+        for item in workstream_hints
+    ) or "- none"
     return f"""# Raw Request
 
 {task}
@@ -462,7 +584,12 @@ def render_request(
 - Workspace status: `{workspace_note}`
 - Task kind guess: `{task_kind}`
 - Complexity guess: `{complexity}`
+- Execution mode guess: `{execution_mode}`
 - Suggested solver count: `{solver_count}`
+
+## Workstream Hints
+
+{workstream_lines}
 {warnings}"""
 
 
@@ -472,11 +599,64 @@ def render_intake_prompt(
     task_kind: str,
     complexity: str,
     solver_count: int,
+    execution_mode: str,
+    workstream_hints: list[dict[str, str]],
     validation_commands: list[str],
+    prompt_format: str,
 ) -> str:
+    if prompt_format == "compact":
+        return compact_lines(
+            {
+                "stage": "intake",
+                "mode": "prepare",
+                "read": [
+                    str(run_dir / "request.md"),
+                    str(run_dir / "plan.json"),
+                    "references/agency-role-map.md",
+                    "references/decomposition-rules.md",
+                ],
+                "write": [
+                    str(run_dir / "brief.md"),
+                    str(run_dir / "plan.json"),
+                    str(run_dir / "prompts"),
+                ],
+                "defaults": {
+                    "workspace_exists": workspace_exists,
+                    "task_kind": task_kind,
+                    "complexity": complexity,
+                    "execution_mode": execution_mode,
+                    "solver_count": solver_count,
+                    "validation_commands": compact_list(validation_commands),
+                    "workstream_hints": workstream_hints,
+                },
+                "rules": [
+                    "preserve the original requested outcome as the top-level goal",
+                    "decompose compound tasks into workstreams instead of silently shrinking the deliverable",
+                    "if you introduce an MVP or phase-1 scaffold, keep it as an interim milestone rather than the new goal",
+                    "do not implement the solution in this stage",
+                ],
+                "required_brief_sections": [
+                    "original requested outcome",
+                    "objective",
+                    "deliverable",
+                    "workstream decomposition",
+                    "scope",
+                    "constraints",
+                    "interim milestone if needed",
+                    "definition of done",
+                    "validation expectations",
+                    "open questions answerable from local context",
+                ],
+            }
+        )
+
     workspace_warning = ""
     if not workspace_exists:
         workspace_warning = "\n- workspace is missing; correct the path or explicitly treat this as a greenfield planning run\n"
+    workstream_lines = "\n".join(
+        f"- `{item['name']}`: {item['goal']} (suggested role: `{item['suggested_role']}`)"
+        for item in workstream_hints
+    ) or "- none"
     return f"""# Level 1: Intake And Prompt Builder
 
 Read:
@@ -489,8 +669,8 @@ Your job is to prepare the pipeline, not solve the task.
 
 Produce or update these artifacts:
 
-- `brief.md` in the run directory with objective, deliverable, scope, constraints, definition of done, and validation expectations
-- `plan.json` if task kind, complexity, solver count, or roles need adjustment
+- `brief.md` in the run directory with original requested outcome, objective, deliverable, workstream decomposition, scope, constraints, definition of done, and validation expectations
+- `plan.json` if task kind, complexity, solver count, roles, execution mode, or workstreams need adjustment
 - prompt packets in `prompts/` if the downstream prompts need refinement
 
 Current defaults:
@@ -498,16 +678,23 @@ Current defaults:
 - workspace exists: `{str(workspace_exists).lower()}`
 - task kind: `{task_kind}`
 - complexity: `{complexity}`
+- execution mode: `{execution_mode}`
 - solver count: `{solver_count}`
 - suggested validation:
 {bullet_list(validation_commands)}
 
+Suggested workstream hints:
+{workstream_lines}
+
 Rules:
 
+- preserve the user's requested outcome as the top-level goal
 - keep the brief precise and execution-ready
+- decompose compound tasks into workstreams instead of silently shrinking the requested deliverable
 - add only the minimal extra skills the downstream stages need
 - do not implement the solution in this stage
 - if the task is about Codex skills, prefer `skill-creator` or `skill-installer` over ad hoc instructions
+- if you propose a phase-1 scaffold, record it as an interim milestone and keep the original requested system as the preserved goal
 {workspace_warning}"""
 
 
@@ -517,8 +704,40 @@ def render_solver_prompt(
     role: str,
     angle: str,
     validation_commands: list[str],
+    prompt_format: str,
 ) -> str:
     result_file = run_dir / "solutions" / solver_id / "RESULT.md"
+    if prompt_format == "compact":
+        return compact_lines(
+            {
+                "stage": solver_id,
+                "mode": "solve",
+                "role": role,
+                "angle": angle,
+                "read": [
+                    str(run_dir / "request.md"),
+                    str(run_dir / "brief.md"),
+                    str(run_dir / "plan.json"),
+                ],
+                "write": [str(result_file)],
+                "rules": [
+                    "do not read sibling solver outputs",
+                    "preserve the full requested system as the top-level goal",
+                    "if you narrow scope, record it as phase 1 while keeping the preserved goal explicit",
+                    "state validation performed or the exact blocker",
+                ],
+                "deliverables": [
+                    "assumptions",
+                    "approach",
+                    "implementation summary or exact file plan",
+                    "workstream coverage",
+                    "validation performed",
+                    "unresolved risks",
+                ],
+                "validation_hints": compact_list(validation_commands),
+            }
+        )
+
     return f"""# Level 2: {solver_id}
 
 Assigned role: `{role}`
@@ -549,9 +768,52 @@ Rules:
 """
 
 
-def render_review_prompt(run_dir: Path, validation_commands: list[str], reviewers: list[str]) -> str:
+def render_review_prompt(
+    run_dir: Path,
+    validation_commands: list[str],
+    reviewers: list[str],
+    prompt_format: str,
+) -> str:
     solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
     solution_lines = "\n".join(f"- `{path}`" for path in solution_files)
+    if prompt_format == "compact":
+        return compact_lines(
+            {
+                "stage": "review",
+                "mode": "compare",
+                "read": [
+                    str(run_dir / "request.md"),
+                    str(run_dir / "brief.md"),
+                    str(run_dir / "plan.json"),
+                    "references/review-rubric.md",
+                    *[str(path) for path in solution_files],
+                ],
+                "write": [
+                    str(run_dir / "review" / "report.md"),
+                    str(run_dir / "review" / "scorecard.json"),
+                ],
+                "reviewer_stack": reviewers,
+                "validation_hints": compact_list(validation_commands),
+                "rules": [
+                    "compare every solution against the brief, not against style preference",
+                    "penalize silent scope reduction",
+                    "architecture-only or scaffold-only output is insufficient when the brief still targets a working MVP",
+                    "treat missing evidence as a penalty",
+                    "recommend a hybrid only when the parts are clearly compatible",
+                ],
+                "required_output": {
+                    "report_sections": [
+                        "per-solver summary",
+                        "winner",
+                        "backup",
+                        "hybrid if compatible",
+                        "validation evidence used",
+                    ],
+                    "scorecard": "numeric per-solver scores using the review rubric",
+                },
+            }
+        )
+
     return f"""# Level 3: Censor And Reviewer
 
 Read:
@@ -592,6 +854,8 @@ def main() -> None:
     task_kind = infer_task_kind(task) if args.task_kind == "auto" else args.task_kind
     complexity = infer_complexity(task) if args.complexity == "auto" else args.complexity
     solver_count = args.solver_count or solver_count_for(complexity)
+    execution_mode = infer_execution_mode(task_kind, complexity, task)
+    workstream_hints = workstream_hints_for(task_kind, task)
     signals = detect_stack(workspace)
     validation_commands = build_validation_commands(workspace, signals)
     roles = choose_roles(task_kind, solver_count)
@@ -607,10 +871,14 @@ def main() -> None:
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "workspace": str(workspace),
         "workspace_exists": workspace_exists,
+        "original_task": task,
         "task_kind": task_kind,
         "complexity": complexity,
+        "execution_mode": execution_mode,
+        "prompt_format": args.prompt_format,
         "solver_count": solver_count,
         "solver_roles": roles,
+        "workstream_hints": workstream_hints,
         "reviewer_stack": REVIEWER_STACK,
         "stack_signals": asdict(signals),
         "validation_commands": validation_commands,
@@ -622,27 +890,47 @@ def main() -> None:
 
     write_text(
         run_dir / "request.md",
-        render_request(task, workspace, workspace_exists, task_kind, complexity, solver_count),
+        render_request(
+            task,
+            workspace,
+            workspace_exists,
+            task_kind,
+            complexity,
+            solver_count,
+            execution_mode,
+            workstream_hints,
+        ),
     )
     write_text(run_dir / "brief.md", "# Brief\n\nPending intake stage.\n")
     write_text(run_dir / "plan.json", json.dumps(plan, indent=2))
     write_text(
         run_dir / "prompts" / "level1-intake.md",
-        render_intake_prompt(run_dir, workspace_exists, task_kind, complexity, solver_count, validation_commands),
+        render_intake_prompt(
+            run_dir,
+            workspace_exists,
+            task_kind,
+            complexity,
+            solver_count,
+            execution_mode,
+            workstream_hints,
+            validation_commands,
+            args.prompt_format,
+        ),
     )
 
     for role_data in roles:
         solver_id = role_data["solver_id"]
         write_text(
             run_dir / "prompts" / f"level2-{solver_id}.md",
-            render_solver_prompt(
-                run_dir,
-                solver_id=solver_id,
-                role=role_data["role"],
-                angle=role_data["angle"],
-                validation_commands=validation_commands,
-            ),
-        )
+                render_solver_prompt(
+                    run_dir,
+                    solver_id=solver_id,
+                    role=role_data["role"],
+                    angle=role_data["angle"],
+                    validation_commands=validation_commands,
+                    prompt_format=args.prompt_format,
+                ),
+            )
         write_text(
             run_dir / "solutions" / solver_id / "RESULT.md",
             "# Result\n\nFill this file with the solver output.\n",
@@ -650,7 +938,7 @@ def main() -> None:
 
     write_text(
         run_dir / "prompts" / "level3-review.md",
-        render_review_prompt(run_dir, validation_commands, REVIEWER_STACK),
+        render_review_prompt(run_dir, validation_commands, REVIEWER_STACK, args.prompt_format),
     )
     write_text(run_dir / "review" / "report.md", "# Review Report\n\nPending review stage.\n")
     write_text(run_dir / "review" / "scorecard.json", "{}\n")

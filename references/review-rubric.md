@@ -15,6 +15,8 @@ Score each solution from `0` to `5` on every dimension:
 
 Use short written justification for every score below `4`.
 
+When the original brief targets a working service, runnable MVP, or end-to-end implementation, architecture-only or scaffold-only outputs should lose points on `task_fit` unless the brief explicitly narrowed the deliverable to that milestone.
+
 ## Validation Rules
 
 Run the cheapest relevant validation first. Prefer narrow checks before full suites.
@@ -65,5 +67,6 @@ After the per-solution summaries, write:
 - Prefer the solution with the best evidence, not the most ambitious design.
 - Penalize claims that were not validated.
 - Penalize broad changes when a narrower fix satisfies the brief.
+- Penalize silent scope reduction. If the user asked for an implemented system, a solver must not win purely by producing architecture or a scaffold unless the brief explicitly made that the target milestone.
 - If two solutions are close, prefer the one with lower merge risk.
 - If all solutions have evidence gaps, say so directly instead of forcing approval.
