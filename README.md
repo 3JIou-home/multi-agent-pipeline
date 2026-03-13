@@ -233,6 +233,12 @@ TUI hotkeys:
 - `q`: quit
 - `j` / `k`: move between runs
 - `g`: refresh the run list
+- `o` or `Enter`: open the current artifact in a fullscreen reader
+- `1`: `Summary`
+- `2`: `Findings`
+- `3`: `Augmented`
+- `4`: `Execution`
+- `5`: `Brief`
 - `s`: run the selected run's `safe-next-action`
 - `n`: `start-next`
 - `r`: autopilot resume until verification
@@ -244,6 +250,13 @@ TUI hotkeys:
 - `u`: refresh all prompts
 - `b`: `step-back review`
 - `v`: `recheck verification`
+
+TUI behavior notes:
+
+- `resume`, `safe-next`, `rerun`, `amend`, and similar actions now run in the background, so the interface stays responsive while logs update.
+- After `amend`, the usual next move is `r` to continue the run or `s` to execute just the next safe action.
+- In fullscreen artifact view, use `j` / `k` or `PgUp` / `PgDn` to scroll, `[` / `]` or `1..5` to switch artifacts, `Esc` to close the view, and `q` to quit the whole application.
+- Delete and prune now use button-based confirmation popups. Use `Left` / `Right` or `Tab` to select a button and `Enter` to confirm.
 
 Stage0 interview only:
 
