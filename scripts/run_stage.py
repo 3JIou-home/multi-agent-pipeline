@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from init_run import (
@@ -73,6 +74,17 @@ def parse_args() -> argparse.Namespace:
     start.add_argument("--color", choices=["always", "never", "auto"], help="Pass --color to codex exec")
     start.add_argument("--force", action="store_true", help="Allow running a stage even if ordering checks fail")
 
+    start_solvers = subparsers.add_parser(
+        "start-solvers",
+        help="Launch all pending solver stages in parallel",
+    )
+    start_solvers.add_argument("--dry-run", action="store_true", help="Print the commands and prompts, do not execute")
+    start_solvers.add_argument("--model", help="Pass --model to codex exec")
+    start_solvers.add_argument("--profile", help="Pass --profile to codex exec")
+    start_solvers.add_argument("--oss", action="store_true", help="Pass --oss to codex exec")
+    start_solvers.add_argument("--color", choices=["always", "never", "auto"], help="Pass --color to codex exec")
+    start_solvers.add_argument("--force", action="store_true", help="Allow running solver stages even if ordering checks fail")
+
     start_next = subparsers.add_parser("start-next", help="Launch codex exec for the next incomplete stage")
     start_next.add_argument("--dry-run", action="store_true", help="Print the command and prompt, do not execute")
     start_next.add_argument("--model", help="Pass --model to codex exec")
@@ -118,6 +130,35 @@ def load_plan(run_dir: Path) -> dict:
     return json.loads(read_text(run_dir / "plan.json"))
 
 
+def cache_config(plan: dict) -> dict[str, object]:
+    cache = plan.get("cache")
+    if isinstance(cache, dict) and cache:
+        return cache
+    root = str((Path.home() / ".cache" / "multi-agent-pipeline").resolve())
+    return {
+        "enabled": False,
+        "root": root,
+        "policy": "off",
+        "paths": {
+            "research": str(Path(root) / "research"),
+            "downloads": str(Path(root) / "downloads"),
+            "wheelhouse": str(Path(root) / "wheelhouse"),
+            "models": str(Path(root) / "models"),
+            "verification": str(Path(root) / "verification"),
+        },
+    }
+
+
+def ensure_cache_dirs_from_plan(plan: dict) -> None:
+    cache = cache_config(plan)
+    if not cache.get("enabled"):
+        return
+    root = Path(str(cache["root"]))
+    root.mkdir(parents=True, exist_ok=True)
+    for path in cache.get("paths", {}).values():
+        Path(str(path)).mkdir(parents=True, exist_ok=True)
+
+
 def solver_ids(run_dir: Path) -> list[str]:
     plan = load_plan(run_dir)
     solver_roles = plan.get("solver_roles", [])
@@ -155,11 +196,14 @@ def stage_output_paths(run_dir: Path, stage: str) -> list[Path]:
     if stage == "execution":
         return [run_dir / "execution" / "report.md"]
     if stage == "verification":
-        return [
+        outputs = [
             run_dir / "verification" / "findings.md",
             run_dir / "verification" / "user-summary.md",
             run_dir / "verification" / "improvement-request.md",
         ]
+        if goal_gate_enabled(run_dir):
+            outputs.append(goal_status_path(run_dir))
+        return outputs
     if stage.startswith("solver-"):
         return [run_dir / "solutions" / stage / "RESULT.md"]
     raise SystemExit(f"Unknown stage: {stage}")
@@ -218,6 +262,42 @@ def review_complete_without_summary(run_dir: Path) -> bool:
     return review_scorecard_complete(scorecard_path)
 
 
+def goal_status_path(run_dir: Path) -> Path:
+    return run_dir / "verification" / "goal-status.json"
+
+
+def goal_gate_enabled(run_dir: Path) -> bool:
+    plan = load_plan(run_dir)
+    return bool(plan.get("goal_gate_enabled"))
+
+
+def goal_status_complete(path: Path) -> bool:
+    try:
+        payload = json.loads(read_text(path))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or not payload:
+        return False
+    if not isinstance(payload.get("goal_complete"), bool):
+        return False
+    if payload.get("goal_verdict") not in {"complete", "partial", "blocked"}:
+        return False
+    if not isinstance(payload.get("rerun_recommended"), bool):
+        return False
+    if not isinstance(payload.get("recommended_next_action"), str):
+        return False
+    return True
+
+
+def load_goal_status(run_dir: Path) -> dict | None:
+    path = goal_status_path(run_dir)
+    if not path.exists():
+        return None
+    if not goal_status_complete(path):
+        return None
+    return json.loads(read_text(path))
+
+
 def is_stage_complete(run_dir: Path, stage: str) -> bool:
     outputs = stage_output_paths(run_dir, stage)
     if stage == "review":
@@ -232,7 +312,7 @@ def is_stage_complete(run_dir: Path, stage: str) -> bool:
             return False
         return True
     if stage == "verification":
-        findings, summary, improvement_request = outputs
+        findings, summary, improvement_request, *_rest = outputs
         if not findings.exists() or not summary.exists() or not improvement_request.exists():
             return False
         if output_looks_placeholder(stage, read_text(findings)):
@@ -241,6 +321,10 @@ def is_stage_complete(run_dir: Path, stage: str) -> bool:
             return False
         if output_looks_placeholder("improvement-request", read_text(improvement_request)):
             return False
+        if goal_gate_enabled(run_dir):
+            goal_status = goal_status_path(run_dir)
+            if not goal_status.exists() or not goal_status_complete(goal_status):
+                return False
         return True
     for output in outputs:
         if not output.exists():
@@ -269,9 +353,12 @@ def write_text(path: Path, content: str) -> None:
 
 def sync_run_artifacts(run_dir: Path) -> None:
     plan = load_plan(run_dir)
+    ensure_cache_dirs_from_plan(plan)
     validation_commands = plan.get("validation_commands", [])
     prompt_format = plan.get("prompt_format", "markdown")
     summary_language = plan.get("summary_language", "ru")
+    execution_network_mode = plan.get("execution_network_mode", "fetch-if-needed")
+    cache = cache_config(plan)
 
     for role_data in plan.get("solver_roles", []):
         solver_id = role_data["solver_id"]
@@ -314,7 +401,13 @@ def sync_run_artifacts(run_dir: Path) -> None:
     if not execution_prompt_path.exists():
         write_text(
             execution_prompt_path,
-            render_execution_prompt(run_dir, validation_commands, prompt_format),
+            render_execution_prompt(
+                run_dir,
+                validation_commands,
+                prompt_format,
+                execution_network_mode,
+                cache,
+            ),
         )
 
     execution_report_path = run_dir / "execution" / "report.md"
@@ -344,6 +437,10 @@ def sync_run_artifacts(run_dir: Path) -> None:
             "# Verification Summary\n\nPending localized verification summary.\n",
         )
 
+    verification_goal_status_path = goal_status_path(run_dir)
+    if plan.get("goal_gate_enabled") and not verification_goal_status_path.exists():
+        write_text(verification_goal_status_path, "{}\n")
+
     verification_improvement_path = run_dir / "verification" / "improvement-request.md"
     if not verification_improvement_path.exists():
         write_text(
@@ -356,6 +453,9 @@ def next_stage(run_dir: Path) -> str | None:
     for stage in available_stages(run_dir):
         if not is_stage_complete(run_dir, stage):
             return stage
+    goal_status = load_goal_status(run_dir)
+    if goal_status and not goal_status.get("goal_complete", False):
+        return "rerun"
     return None
 
 
@@ -378,6 +478,10 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
         f"- Run directory: `{run_dir}`",
         f"- Primary workspace: `{workspace}`",
         f"- Prompt format: `{prompt_format}`",
+        f"- Intake research mode: `{plan.get('intake_research_mode', 'research-first')}`",
+        f"- Execution network mode: `{plan.get('execution_network_mode', 'fetch-if-needed')}`",
+        f"- Cache policy: `{cache_config(plan).get('policy', 'off')}`",
+        f"- Cache root: `{cache_config(plan).get('root')}`",
         f"- Role map reference: `{ROLE_MAP}`",
         f"- Review rubric reference: `{REVIEW_RUBRIC}`",
         f"- Verification rubric reference: `{VERIFICATION_RUBRIC}`",
@@ -394,6 +498,19 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
         extra_rules.append("- Do not read sibling solver outputs.")
 
     dynamic_context = []
+    goal_checks = plan.get("goal_checks", [])
+    if goal_checks:
+        dynamic_context.append("Goal checks from current plan:")
+        for item in goal_checks:
+            criticality = "critical" if item.get("critical", True) else "supporting"
+            dynamic_context.append(
+                f"- `{criticality}` `{item.get('id', 'unknown')}`: {item.get('requirement', '')}"
+            )
+    cache = cache_config(plan)
+    if cache.get("enabled"):
+        dynamic_context.append("Shared cache paths:")
+        for name, path in cache.get("paths", {}).items():
+            dynamic_context.append(f"- `{name}`: `{path}`")
     if stage.startswith("solver-"):
         role_data = solver_role_map(run_dir).get(stage)
         if role_data:
@@ -432,6 +549,7 @@ def compile_prompt(run_dir: Path, stage: str) -> str:
             [
                 f"- Execution report: `{run_dir / 'execution' / 'report.md'}`",
                 f"- Verification findings output: `{run_dir / 'verification' / 'findings.md'}`",
+                f"- Goal status output: `{goal_status_path(run_dir)}`",
                 f"- Improvement request output: `{run_dir / 'verification' / 'improvement-request.md'}`",
             ]
         )
@@ -460,6 +578,12 @@ def print_status(run_dir: Path) -> int:
     for stage in available_stages(run_dir):
         status = "done" if is_stage_complete(run_dir, stage) else "pending"
         print(f"{stage}: {status}")
+    goal_status = load_goal_status(run_dir)
+    if goal_status is not None:
+        goal_state = "complete" if goal_status.get("goal_complete") else goal_status.get("goal_verdict", "partial")
+        print(f"goal: {goal_state}")
+    elif goal_gate_enabled(run_dir):
+        print("goal: pending-verification")
     pending = next_stage(run_dir)
     print(f"next: {pending or 'none'}")
     return 0
@@ -490,6 +614,7 @@ def build_codex_command(run_dir: Path, stage: str, args: argparse.Namespace) -> 
     root = working_root(plan, run_dir)
     prompt = compile_prompt(run_dir, stage)
     color = args.color or "never"
+    cache = cache_config(plan)
 
     command = [
         "codex",
@@ -506,6 +631,8 @@ def build_codex_command(run_dir: Path, stage: str, args: argparse.Namespace) -> 
         str(SKILL_DIR),
         "-",
     ]
+    if cache.get("enabled"):
+        command[-1:-1] = ["--add-dir", str(cache["root"])]
     if args.model:
         command[2:2] = ["--model", args.model]
     if args.profile:
@@ -515,23 +642,32 @@ def build_codex_command(run_dir: Path, stage: str, args: argparse.Namespace) -> 
     return command, prompt
 
 
-def start_stage(run_dir: Path, stage: str, args: argparse.Namespace) -> int:
-    require_valid_order(run_dir, stage, args.force)
+def prepare_stage_command(run_dir: Path, stage: str, args: argparse.Namespace) -> tuple[list[str], str, Path, Path]:
     command, prompt = build_codex_command(run_dir, stage, args)
-
     logs_dir = run_dir / "logs"
     logs_dir.mkdir(exist_ok=True)
     prompt_path = logs_dir / f"{stage}.prompt.md"
     last_message_path = logs_dir / f"{stage}.last.md"
     prompt_path.write_text(prompt, encoding="utf-8")
-
     command = command[:-1] + ["--output-last-message", str(last_message_path), "-"]
+    return command, prompt, prompt_path, last_message_path
+
+
+def print_status_after_action(run_dir: Path) -> None:
+    print("\nStatus:\n")
+    print_status(run_dir)
+
+
+def start_stage(run_dir: Path, stage: str, args: argparse.Namespace) -> int:
+    require_valid_order(run_dir, stage, args.force)
+    command, prompt, _prompt_path, _last_message_path = prepare_stage_command(run_dir, stage, args)
 
     if args.dry_run:
         print("Command:")
         print(" ".join(shell_quote(part) for part in command))
         print("\nPrompt:\n")
         print(prompt)
+        print_status_after_action(run_dir)
         return 0
 
     env = dict(os.environ)
@@ -539,7 +675,79 @@ def start_stage(run_dir: Path, stage: str, args: argparse.Namespace) -> int:
     env.setdefault("TERM", "dumb")
 
     process = subprocess.run(command, input=prompt, text=True, env=env)
+    sync_run_artifacts(run_dir)
+    print_status_after_action(run_dir)
     return process.returncode
+
+
+def pending_solver_stages(run_dir: Path) -> list[str]:
+    return [stage for stage in solver_ids(run_dir) if not is_stage_complete(run_dir, stage)]
+
+
+def start_solver_batch(run_dir: Path, stages: list[str], args: argparse.Namespace) -> int:
+    if not stages:
+        print("No pending solver stages.")
+        print_status_after_action(run_dir)
+        return 0
+    for stage in stages:
+        require_valid_order(run_dir, stage, args.force)
+
+    prepared: list[tuple[str, list[str], str, Path]] = []
+    for stage in stages:
+        command, prompt, _prompt_path, _last_message_path = prepare_stage_command(run_dir, stage, args)
+        log_path = run_dir / "logs" / f"{stage}.stdout.log"
+        prepared.append((stage, command, prompt, log_path))
+
+    if args.dry_run:
+        for stage, command, prompt, _log_path in prepared:
+            print(f"Stage: {stage}")
+            print("Command:")
+            print(" ".join(shell_quote(part) for part in command))
+            print("\nPrompt:\n")
+            print(prompt)
+            print("\n---\n")
+        print_status_after_action(run_dir)
+        return 0
+
+    env = dict(os.environ)
+    env.setdefault("NO_COLOR", "1")
+    env.setdefault("TERM", "dumb")
+
+    running: dict[str, tuple[subprocess.Popen, Path, object]] = {}
+    for stage, command, prompt, log_path in prepared:
+        log_handle = log_path.open("w", encoding="utf-8")
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+        )
+        assert process.stdin is not None
+        process.stdin.write(prompt)
+        process.stdin.close()
+        running[stage] = (process, log_path, log_handle)
+        print(f"Started {stage}. Log: {log_path}")
+
+    exit_code = 0
+    remaining = set(running)
+    while remaining:
+        for stage in list(remaining):
+            process, log_path, log_handle = running[stage]
+            result = process.poll()
+            if result is None:
+                continue
+            log_handle.close()
+            remaining.remove(stage)
+            if result != 0:
+                exit_code = result if exit_code == 0 else exit_code
+            sync_run_artifacts(run_dir)
+            print(f"\nCompleted {stage} with exit code {result}. Log: {log_path}")
+            print_status_after_action(run_dir)
+        if remaining:
+            time.sleep(0.5)
+    return exit_code
 
 
 def shell_quote(value: str) -> str:
@@ -617,7 +825,13 @@ def create_follow_up_run(run_dir: Path, args: argparse.Namespace) -> int:
     process = subprocess.run(command, text=True, capture_output=True)
     if process.returncode != 0:
         raise SystemExit(process.stderr.strip() or process.stdout.strip() or "Failed to create follow-up run.")
-    print(process.stdout.strip())
+    new_run = process.stdout.strip()
+    print(new_run)
+    new_run_dir = Path(new_run).expanduser()
+    if new_run_dir.exists():
+        sync_run_artifacts(new_run_dir)
+        print("\nNew run status:\n")
+        print_status(new_run_dir)
     return 0
 
 
@@ -664,11 +878,19 @@ def main() -> int:
     if args.command == "start":
         return start_stage(run_dir, stage, args)
 
+    if args.command == "start-solvers":
+        return start_solver_batch(run_dir, pending_solver_stages(run_dir), args)
+
     if args.command == "start-next":
         stage = next_stage(run_dir)
         if stage is None:
             print("Pipeline is complete.")
             return 0
+        if stage == "rerun":
+            rerun_args = argparse.Namespace(dry_run=args.dry_run, title=None, output_dir=None)
+            return create_follow_up_run(run_dir, rerun_args)
+        if stage.startswith("solver-"):
+            return start_solver_batch(run_dir, pending_solver_stages(run_dir), args)
         return start_stage(run_dir, stage, args)
 
     raise SystemExit(f"Unsupported command: {args.command}")

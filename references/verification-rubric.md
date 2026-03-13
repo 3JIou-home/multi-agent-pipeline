@@ -7,6 +7,7 @@ Use this rubric in the post-execution verification stage. This stage reviews the
 Answer these questions:
 
 - did execution implement a meaningful slice of the requested system
+- did execution cover the critical `goal_checks` recorded in `plan.json`
 - what verified defects or regressions remain
 - is a follow-up improvement run justified
 
@@ -48,6 +49,32 @@ After findings, include:
 
 - open questions or assumptions
 - short change summary or residual risks
+
+## Goal Status
+
+Generate `verification/goal-status.json`.
+
+It should be machine-readable and must answer whether the original goal is actually complete, not just whether all stages ran.
+
+Required keys:
+
+```json
+{
+  "goal_complete": false,
+  "goal_verdict": "partial",
+  "covered_checks": ["example_check"],
+  "missing_checks": ["critical_missing_check"],
+  "rerun_recommended": true,
+  "recommended_next_action": "rerun",
+  "reason": "Critical photo-aware analysis is still missing."
+}
+```
+
+Rules:
+
+- set `goal_complete` to `false` when any critical `goal_checks` item remains missing, unverified, mocked, or replaced by a placeholder flow
+- use `goal_verdict=complete` only when the critical user-visible goal is actually implemented and verified to the level allowed by the environment
+- if the stage sequence finished but the product goal is still incomplete, the verdict should still be `partial` or `blocked`
 
 ## User Summary
 

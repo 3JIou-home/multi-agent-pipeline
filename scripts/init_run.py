@@ -124,6 +124,29 @@ def parse_args() -> argparse.Namespace:
         default="ru",
         help="Language for the user-facing review summary, default: ru",
     )
+    parser.add_argument(
+        "--intake-research",
+        choices=["research-first", "local-first", "local-only"],
+        default="research-first",
+        help="How intake should gather context before finalizing the brief",
+    )
+    parser.add_argument(
+        "--execution-network",
+        choices=["fetch-if-needed", "local-only"],
+        default="fetch-if-needed",
+        help="Whether execution may download/install missing dependencies or artifacts",
+    )
+    parser.add_argument(
+        "--cache-root",
+        default="~/.cache/multi-agent-pipeline",
+        help="Shared cache root for research notes, downloads, wheels, models, and verification artifacts",
+    )
+    parser.add_argument(
+        "--cache-policy",
+        choices=["reuse", "refresh", "off"],
+        default="reuse",
+        help="Whether stages should reuse shared cache, ignore it, or disable it",
+    )
     return parser.parse_args()
 
 
@@ -561,6 +584,116 @@ def compact_lines(packet: dict) -> str:
     return json.dumps(packet, ensure_ascii=False, indent=2) + "\n"
 
 
+def build_cache_config(cache_root: Path, cache_policy: str) -> dict[str, object]:
+    expanded_root = cache_root.expanduser().resolve()
+    enabled = cache_policy != "off"
+    paths = {
+        "research": str(expanded_root / "research"),
+        "downloads": str(expanded_root / "downloads"),
+        "wheelhouse": str(expanded_root / "wheelhouse"),
+        "models": str(expanded_root / "models"),
+        "verification": str(expanded_root / "verification"),
+    }
+    return {
+        "enabled": enabled,
+        "root": str(expanded_root),
+        "policy": cache_policy,
+        "paths": paths,
+    }
+
+
+def ensure_cache_dirs(cache_config: dict[str, object]) -> None:
+    if not cache_config.get("enabled"):
+        return
+    root = Path(str(cache_config["root"]))
+    root.mkdir(parents=True, exist_ok=True)
+    for path in cache_config.get("paths", {}).values():
+        Path(str(path)).mkdir(parents=True, exist_ok=True)
+
+
+def infer_goal_checks(
+    task: str,
+    task_kind: str,
+    workstream_hints: list[dict[str, str]],
+) -> list[dict[str, object]]:
+    text = task.lower()
+    checks: list[dict[str, object]] = []
+    seen: set[str] = set()
+
+    def add_check(check_id: str, requirement: str, critical: bool = True) -> None:
+        if check_id in seen:
+            return
+        seen.add(check_id)
+        checks.append(
+            {
+                "id": check_id,
+                "requirement": requirement,
+                "critical": critical,
+            }
+        )
+
+    if "telegram" in text or "телеграм" in text:
+        add_check(
+            "telegram_ingress",
+            "accept task input through Telegram or a clearly equivalent transport path",
+        )
+    if any(word in text for word in ["photo", "image", "photo", "фото", "изображ"]):
+        add_check(
+            "photo_used_as_input",
+            "use the provided photo as a real analysis input, not only as a presence check",
+        )
+    if any(word in text for word in ["dimension", "dimensions", "size", "sizes", "размер", "габарит"]):
+        add_check(
+            "dimension_capture",
+            "capture and apply the provided dimensions in the generated plan or model",
+        )
+    if any(
+        word in text
+        for word in [
+            "llm",
+            "llama",
+            "lama",
+            "model",
+            "vision",
+            "analysis",
+            "нейросет",
+            "модель",
+            "дообуч",
+            "обуч",
+        ]
+    ):
+        add_check(
+            "analysis_adapter",
+            "implement or preserve an analysis path that turns the requested inputs into grounded observations or bounded classifications",
+        )
+    if "freecad" in text:
+        add_check(
+            "freecad_output",
+            "produce deterministic FreeCAD output from the structured plan",
+        )
+    if task_kind in {"ai", "backend", "fullstack"} or any(
+        word in text for word in ["service", "bot", "api", "сервис", "бот", "entrypoint"]
+    ):
+        add_check(
+            "runnable_entrypoint",
+            "provide a runnable local entrypoint or service path for the implemented slice",
+        )
+
+    if not checks:
+        for hint in workstream_hints[:5]:
+            add_check(
+                slugify(hint["name"]).replace("-", "_"),
+                hint["goal"],
+            )
+
+    add_check(
+        "validation_and_docs",
+        "document and validate the implemented path so a human can run it and assess residual gaps",
+        critical=False,
+    )
+    return checks
+
+
 def render_request(
     task: str,
     workspace: Path,
@@ -571,6 +704,10 @@ def render_request(
     execution_mode: str,
     workstream_hints: list[dict[str, str]],
     summary_language: str,
+    goal_checks: list[dict[str, object]],
+    intake_research_mode: str,
+    execution_network_mode: str,
+    cache_config: dict[str, object],
 ) -> str:
     workspace_note = "present" if workspace_exists else "missing"
     warnings = ""
@@ -579,6 +716,10 @@ def render_request(
     workstream_lines = "\n".join(
         f"- `{item['name']}`: {item['goal']} (role: `{item['suggested_role']}`)"
         for item in workstream_hints
+    ) or "- none"
+    goal_check_lines = "\n".join(
+        f"- `{'critical' if item.get('critical', True) else 'supporting'}` `{item['id']}`: {item['requirement']}"
+        for item in goal_checks
     ) or "- none"
     return f"""# Raw Request
 
@@ -593,10 +734,18 @@ def render_request(
 - Execution mode guess: `{execution_mode}`
 - Suggested solver count: `{solver_count}`
 - User summary language: `{summary_language}`
+- Intake research mode: `{intake_research_mode}`
+- Execution network mode: `{execution_network_mode}`
+- Cache policy: `{cache_config['policy']}`
+- Cache root: `{cache_config['root']}`
 
 ## Workstream Hints
 
 {workstream_lines}
+
+## Initial Goal Checks
+
+{goal_check_lines}
 {warnings}"""
 
 
@@ -611,6 +760,10 @@ def render_intake_prompt(
     validation_commands: list[str],
     prompt_format: str,
     summary_language: str,
+    goal_checks: list[dict[str, object]],
+    intake_research_mode: str,
+    execution_network_mode: str,
+    cache_config: dict[str, object],
 ) -> str:
     if prompt_format == "compact":
         return compact_lines(
@@ -635,12 +788,19 @@ def render_intake_prompt(
                     "execution_mode": execution_mode,
                     "solver_count": solver_count,
                     "summary_language": summary_language,
+                    "intake_research_mode": intake_research_mode,
+                    "execution_network_mode": execution_network_mode,
+                    "cache": cache_config,
                     "validation_commands": compact_list(validation_commands),
                     "workstream_hints": workstream_hints,
+                    "goal_checks": goal_checks,
                 },
                 "rules": [
                     "preserve the original requested outcome as the top-level goal",
                     "decompose compound tasks into workstreams instead of silently shrinking the deliverable",
+                    "refine the goal_checks list so it captures the critical user-visible capabilities that must be implemented before the run can be called complete",
+                    "follow intake_research_mode when deciding whether to browse the web before finalizing the brief",
+                    "if cache.policy is reuse, consult and update the research cache before duplicating external research",
                     "if you introduce an MVP or phase-1 scaffold, keep it as an interim milestone rather than the new goal",
                     "do not implement the solution in this stage",
                 ],
@@ -648,6 +808,7 @@ def render_intake_prompt(
                     "original requested outcome",
                     "objective",
                     "deliverable",
+                    "goal coverage matrix",
                     "workstream decomposition",
                     "scope",
                     "constraints",
@@ -666,6 +827,10 @@ def render_intake_prompt(
         f"- `{item['name']}`: {item['goal']} (suggested role: `{item['suggested_role']}`)"
         for item in workstream_hints
     ) or "- none"
+    goal_check_items = [
+        f"{'critical' if item.get('critical', True) else 'supporting'} {item['id']}: {item['requirement']}"
+        for item in goal_checks
+    ]
     return f"""# Level 1: Intake And Prompt Builder
 
 Read:
@@ -690,8 +855,15 @@ Current defaults:
 - execution mode: `{execution_mode}`
 - solver count: `{solver_count}`
 - user summary language: `{summary_language}`
+- intake research mode: `{intake_research_mode}`
+- execution network mode: `{execution_network_mode}`
+- cache policy: `{cache_config['policy']}`
+- cache root: `{cache_config['root']}`
 - suggested validation:
 {bullet_list(validation_commands)}
+
+Initial goal checks to refine in `plan.json`:
+{bullet_list(goal_check_items)}
 
 Suggested workstream hints:
 {workstream_lines}
@@ -701,6 +873,11 @@ Rules:
 - preserve the user's requested outcome as the top-level goal
 - keep the brief precise and execution-ready
 - decompose compound tasks into workstreams instead of silently shrinking the requested deliverable
+- update `plan.json` goal checks when the current list misses a critical user-visible capability
+- if intake research mode is `research-first`, browse the web for solution patterns, current tool options, and likely implementation constraints before finalizing stages
+- if intake research mode is `local-first`, inspect the workspace first and browse only when local context is insufficient
+- if intake research mode is `local-only`, do not browse unless the user explicitly asks
+- if cache policy is `reuse`, consult and update the shared research cache before duplicating external research
 - add only the minimal extra skills the downstream stages need
 - do not implement the solution in this stage
 - if the task is about Codex skills, prefer `skill-creator` or `skill-installer` over ad hoc instructions
@@ -740,6 +917,7 @@ def render_solver_prompt(
                     "assumptions",
                     "approach",
                     "implementation summary or exact file plan",
+                    "goal check coverage",
                     "workstream coverage",
                     "validation performed",
                     "unresolved risks",
@@ -764,7 +942,7 @@ Do not read sibling solution files.
 Deliver:
 
 - write your solution summary to `{result_file}`
-- include assumptions, approach, implementation or patch summary, validation performed, and unresolved risks
+- include assumptions, approach, implementation or patch summary, goal check coverage, validation performed, and unresolved risks
 
 Validation hints:
 {bullet_list(validation_commands)}
@@ -809,6 +987,7 @@ def render_review_prompt(
                 "validation_hints": compact_list(validation_commands),
                 "rules": [
                     "compare every solution against the brief, not against style preference",
+                    "compare every solution against the plan goal_checks and call out uncovered critical checks",
                     "penalize silent scope reduction",
                     "architecture-only or scaffold-only output is insufficient when the brief still targets a working MVP",
                     "treat missing evidence as a penalty",
@@ -861,6 +1040,7 @@ Deliver:
 Rules:
 
 - compare every solution against the brief, not against style preferences
+- compare every solution against the plan goal checks and penalize uncovered critical capabilities
 - run the cheapest relevant validation first when code or config changed
 - treat missing evidence as a penalty
 - write the user-facing summary for a human decision-maker who may want to adjust the plan before execution
@@ -872,6 +1052,8 @@ def render_execution_prompt(
     run_dir: Path,
     validation_commands: list[str],
     prompt_format: str,
+    execution_network_mode: str,
+    cache_config: dict[str, object],
 ) -> str:
     solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
     solution_lines = "\n".join(f"- `{path}`" for path in solution_files) or "- none"
@@ -895,6 +1077,12 @@ def render_execution_prompt(
                     "implement the winner or explicitly justified hybrid in the primary workspace",
                     "treat workspace changes as the main deliverable and execution/report.md as the audit trail",
                     "follow the review recommendation unless local validation forces a narrower implementation",
+                    "if execution_network_mode is fetch-if-needed, install or download missing dependencies, weights, adapters, repos, or tools when they are genuinely required to implement the chosen slice",
+                    "if cache.policy is reuse, prefer cached downloads, wheels, models, and repos before fetching again",
+                    "store newly fetched reusable artifacts in cache.paths.downloads, cache.paths.wheelhouse, or cache.paths.models when applicable",
+                    "record exact install/download commands, sources, versions, and what was fetched",
+                    "prefer primary or official sources for code, packages, models, and datasets",
+                    "treat uncovered critical goal checks as blockers or explicitly deferred work, not as silent completion",
                     "run the cheapest relevant validation after edits and record exact commands and outcomes",
                     "if blocked, implement the highest-value slice and state the blocker precisely",
                 ],
@@ -924,6 +1112,15 @@ Read:
 
 Your job is to implement the recommended winner or compatible hybrid in the primary workspace.
 
+Execution network mode:
+
+- `{execution_network_mode}`
+
+Cache:
+
+- policy: `{cache_config['policy']}`
+- root: `{cache_config['root']}`
+
 Deliver:
 
 - actual code or configuration changes in the workspace
@@ -936,6 +1133,12 @@ Rules:
 
 - treat workspace changes as the primary deliverable
 - follow the review recommendation unless local validation forces an explicit deviation
+- if execution network mode is `fetch-if-needed`, you may install or download genuinely required dependencies, model artifacts, or tools
+- if cache policy is `reuse`, prefer cached wheels, models, repos, and downloads before fetching again
+- store newly fetched reusable artifacts in the shared cache when practical
+- record exact install/download commands, sources, versions, and fetched artifacts in `execution/report.md`
+- prefer official or primary sources when fetching dependencies or model artifacts
+- treat remaining uncovered critical goal checks as blockers or explicit partial-completion notes
 - run the cheapest relevant validation after edits
 - if full implementation is blocked, complete the highest-value slice and record the exact blocker
 """
@@ -952,6 +1155,7 @@ def render_verification_prompt(
     findings_file = run_dir / "verification" / "findings.md"
     user_summary_file = run_dir / "verification" / "user-summary.md"
     improvement_request_file = run_dir / "verification" / "improvement-request.md"
+    goal_status_file = run_dir / "verification" / "goal-status.json"
 
     if prompt_format == "compact":
         return compact_lines(
@@ -973,6 +1177,7 @@ def render_verification_prompt(
                     str(findings_file),
                     str(user_summary_file),
                     str(improvement_request_file),
+                    str(goal_status_file),
                 ],
                 "validation_hints": compact_list(validation_commands),
                 "user_summary_language": summary_language,
@@ -981,6 +1186,7 @@ def render_verification_prompt(
                     "act in code-review mode: prioritize bugs, regressions, unsafe behavior, and missing validation",
                     "run the cheapest relevant checks first and record exact evidence or blockers",
                     "write findings ordered by severity with file references when possible",
+                    "set goal_complete=false when any critical plan goal check remains missing, unverified, or replaced by a placeholder implementation",
                     "if there are no meaningful findings, say so explicitly",
                     "generate an improvement request that can seed a follow-up pipeline run against the existing codebase",
                 ],
@@ -996,6 +1202,15 @@ def render_verification_prompt(
                         "whether a rerun is recommended",
                         "recommended next action",
                     ],
+                    "goal_status": {
+                        "goal_complete": "boolean",
+                        "goal_verdict": "complete | partial | blocked",
+                        "covered_checks": "list of covered goal_check ids",
+                        "missing_checks": "list of missing or unverified critical goal_check ids",
+                        "rerun_recommended": "boolean",
+                        "recommended_next_action": "stop | rerun | manual-review",
+                        "reason": "short explanation",
+                    },
                     "improvement_request": "a concise task statement for the next run that preserves the original goal and targets the verified defects",
                 },
             }
@@ -1022,6 +1237,7 @@ Deliver:
 
 - `verification/findings.md` with ordered findings, file references, evidence, and residual risks
 - `verification/user-summary.md` as a short user-facing summary in `{summary_language}`
+- `verification/goal-status.json` with machine-readable goal completion status against `plan.json` goal checks
 - `verification/improvement-request.md` with a concise follow-up task for the next pipeline run against the existing codebase
 
 Validation hints:
@@ -1032,6 +1248,7 @@ Rules:
 - inspect the actual workspace, not just the proposed plans
 - default to code-review mindset: list findings first, ordered by severity
 - run the cheapest relevant validation first
+- set `goal_complete=false` when any critical goal check remains missing, unverified, or only partially mocked
 - if there are no meaningful findings, say that explicitly
 - keep the improvement request actionable and tightly scoped to verified defects
 """
@@ -1042,12 +1259,15 @@ def main() -> None:
     task = read_task(args)
     workspace = Path(args.workspace).resolve()
     workspace_exists = workspace.exists()
+    cache_config = build_cache_config(Path(args.cache_root), args.cache_policy)
+    ensure_cache_dirs(cache_config)
     title = args.title or " ".join(task.split()[:8])
     task_kind = infer_task_kind(task) if args.task_kind == "auto" else args.task_kind
     complexity = infer_complexity(task) if args.complexity == "auto" else args.complexity
     solver_count = args.solver_count or solver_count_for(complexity)
     execution_mode = infer_execution_mode(task_kind, complexity, task)
     workstream_hints = workstream_hints_for(task_kind, task)
+    goal_checks = infer_goal_checks(task, task_kind, workstream_hints)
     signals = detect_stack(workspace)
     validation_commands = build_validation_commands(workspace, signals)
     roles = choose_roles(task_kind, solver_count)
@@ -1071,9 +1291,14 @@ def main() -> None:
         "execution_mode": execution_mode,
         "prompt_format": args.prompt_format,
         "summary_language": args.summary_language,
+        "intake_research_mode": args.intake_research,
+        "execution_network_mode": args.execution_network,
+        "cache": cache_config,
         "solver_count": solver_count,
         "solver_roles": roles,
         "workstream_hints": workstream_hints,
+        "goal_gate_enabled": True,
+        "goal_checks": goal_checks,
         "reviewer_stack": REVIEWER_STACK,
         "stack_signals": asdict(signals),
         "validation_commands": validation_commands,
@@ -1097,6 +1322,10 @@ def main() -> None:
             execution_mode,
             workstream_hints,
             args.summary_language,
+            goal_checks,
+            args.intake_research,
+            args.execution_network,
+            cache_config,
         ),
     )
     write_text(run_dir / "brief.md", "# Brief\n\nPending intake stage.\n")
@@ -1114,6 +1343,10 @@ def main() -> None:
             validation_commands,
             args.prompt_format,
             args.summary_language,
+            goal_checks,
+            args.intake_research,
+            args.execution_network,
+            cache_config,
         ),
     )
 
@@ -1150,7 +1383,13 @@ def main() -> None:
     write_text(run_dir / "review" / "user-summary.md", "# User Summary\n\nPending localized review summary.\n")
     write_text(
         run_dir / "prompts" / "level4-execution.md",
-        render_execution_prompt(run_dir, validation_commands, args.prompt_format),
+        render_execution_prompt(
+            run_dir,
+            validation_commands,
+            args.prompt_format,
+            args.execution_network,
+            cache_config,
+        ),
     )
     write_text(run_dir / "execution" / "report.md", "# Execution Report\n\nPending execution stage.\n")
     write_text(
@@ -1167,6 +1406,7 @@ def main() -> None:
         run_dir / "verification" / "user-summary.md",
         "# Verification Summary\n\nPending localized verification summary.\n",
     )
+    write_text(run_dir / "verification" / "goal-status.json", "{}\n")
     write_text(
         run_dir / "verification" / "improvement-request.md",
         "# Improvement Request\n\nPending verification stage.\n",
