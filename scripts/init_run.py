@@ -4,12 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import platform
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
+
+from cache_utils import ensure_cache_layout, refresh_cache_index
 
 
 ROLE_MATRIX = {
@@ -84,6 +88,20 @@ class StackSignals:
     terraform: bool = False
 
 
+@dataclass
+class HostFacts:
+    source: str
+    captured_at: str
+    platform: str
+    machine: str
+    apple_silicon: bool
+    torch_installed: bool
+    cuda_available: bool | None
+    mps_built: bool | None
+    mps_available: bool | None
+    preferred_torch_device: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", help="Raw user request text")
@@ -135,6 +153,12 @@ def parse_args() -> argparse.Namespace:
         choices=["fetch-if-needed", "local-only"],
         default="fetch-if-needed",
         help="Whether execution may download/install missing dependencies or artifacts",
+    )
+    parser.add_argument(
+        "--stage-research",
+        choices=["research-first", "local-first", "local-only"],
+        default="local-first",
+        help="How solver, review, execution, and verification stages may use web research during implementation and validation",
     )
     parser.add_argument(
         "--cache-root",
@@ -550,6 +574,54 @@ def build_validation_commands(workspace: Path, signals: StackSignals) -> list[st
     return deduped
 
 
+def detect_host_facts() -> HostFacts:
+    system = platform.system().lower() or "unknown"
+    machine = platform.machine().lower() or "unknown"
+    apple_silicon = system == "darwin" and machine in {"arm64", "aarch64"}
+    facts = HostFacts(
+        source="init_run_local_python",
+        captured_at=datetime.now().isoformat(timespec="seconds"),
+        platform=system,
+        machine=machine,
+        apple_silicon=apple_silicon,
+        torch_installed=False,
+        cuda_available=None,
+        mps_built=None,
+        mps_available=None,
+        preferred_torch_device="cpu",
+    )
+
+    if importlib.util.find_spec("torch") is None:
+        return facts
+
+    facts.torch_installed = True
+    try:
+        import torch
+    except Exception:
+        return facts
+
+    cuda_available = bool(getattr(torch, "cuda", None) and torch.cuda.is_available())
+    mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
+    mps_built = None
+    mps_available = None
+    if mps_backend is not None:
+        if hasattr(mps_backend, "is_built"):
+            mps_built = bool(mps_backend.is_built())
+        if hasattr(mps_backend, "is_available"):
+            mps_available = bool(mps_backend.is_available())
+
+    facts.cuda_available = cuda_available
+    facts.mps_built = mps_built
+    facts.mps_available = mps_available
+    if cuda_available:
+        facts.preferred_torch_device = "cuda"
+    elif mps_available:
+        facts.preferred_torch_device = "mps"
+    else:
+        facts.preferred_torch_device = "cpu"
+    return facts
+
+
 def choose_roles(task_kind: str, solver_count: int) -> list[dict[str, str]]:
     roles = ROLE_MATRIX[task_kind][:solver_count]
     selected = []
@@ -587,6 +659,7 @@ def compact_lines(packet: dict) -> str:
 def build_cache_config(cache_root: Path, cache_policy: str) -> dict[str, object]:
     expanded_root = cache_root.expanduser().resolve()
     enabled = cache_policy != "off"
+    meta_root = expanded_root / ".meta"
     paths = {
         "research": str(expanded_root / "research"),
         "downloads": str(expanded_root / "downloads"),
@@ -599,16 +672,16 @@ def build_cache_config(cache_root: Path, cache_policy: str) -> dict[str, object]
         "root": str(expanded_root),
         "policy": cache_policy,
         "paths": paths,
+        "meta": {
+            "root": str(meta_root),
+            "index": str(meta_root / "index.json"),
+            "locks": str(meta_root / "locks"),
+        },
     }
 
 
 def ensure_cache_dirs(cache_config: dict[str, object]) -> None:
-    if not cache_config.get("enabled"):
-        return
-    root = Path(str(cache_config["root"]))
-    root.mkdir(parents=True, exist_ok=True)
-    for path in cache_config.get("paths", {}).values():
-        Path(str(path)).mkdir(parents=True, exist_ok=True)
+    ensure_cache_layout(cache_config)
 
 
 def infer_goal_checks(
@@ -706,8 +779,10 @@ def render_request(
     summary_language: str,
     goal_checks: list[dict[str, object]],
     intake_research_mode: str,
+    stage_research_mode: str,
     execution_network_mode: str,
     cache_config: dict[str, object],
+    host_facts: HostFacts,
 ) -> str:
     workspace_note = "present" if workspace_exists else "missing"
     warnings = ""
@@ -735,9 +810,20 @@ def render_request(
 - Suggested solver count: `{solver_count}`
 - User summary language: `{summary_language}`
 - Intake research mode: `{intake_research_mode}`
+- Stage research mode: `{stage_research_mode}`
 - Execution network mode: `{execution_network_mode}`
 - Cache policy: `{cache_config['policy']}`
 - Cache root: `{cache_config['root']}`
+- Host facts source: `{host_facts.source}`
+- Host facts captured at: `{host_facts.captured_at}`
+- Host platform: `{host_facts.platform}`
+- Host machine: `{host_facts.machine}`
+- Apple Silicon: `{str(host_facts.apple_silicon).lower()}`
+- Torch installed: `{str(host_facts.torch_installed).lower()}`
+- CUDA available: `{host_facts.cuda_available}`
+- MPS built: `{host_facts.mps_built}`
+- MPS available: `{host_facts.mps_available}`
+- Preferred torch device: `{host_facts.preferred_torch_device}`
 
 ## Workstream Hints
 
@@ -762,8 +848,10 @@ def render_intake_prompt(
     summary_language: str,
     goal_checks: list[dict[str, object]],
     intake_research_mode: str,
+    stage_research_mode: str,
     execution_network_mode: str,
     cache_config: dict[str, object],
+    host_facts: HostFacts,
 ) -> str:
     if prompt_format == "compact":
         return compact_lines(
@@ -789,8 +877,10 @@ def render_intake_prompt(
                     "solver_count": solver_count,
                     "summary_language": summary_language,
                     "intake_research_mode": intake_research_mode,
+                    "stage_research_mode": stage_research_mode,
                     "execution_network_mode": execution_network_mode,
                     "cache": cache_config,
+                    "host_facts": asdict(host_facts),
                     "validation_commands": compact_list(validation_commands),
                     "workstream_hints": workstream_hints,
                     "goal_checks": goal_checks,
@@ -800,6 +890,7 @@ def render_intake_prompt(
                     "decompose compound tasks into workstreams instead of silently shrinking the deliverable",
                     "refine the goal_checks list so it captures the critical user-visible capabilities that must be implemented before the run can be called complete",
                     "follow intake_research_mode when deciding whether to browse the web before finalizing the brief",
+                    "treat host_facts from plan.json as authoritative local execution facts; do not silently override device availability with ad hoc assumptions",
                     "if cache.policy is reuse, consult and update the research cache before duplicating external research",
                     "if you introduce an MVP or phase-1 scaffold, keep it as an interim milestone rather than the new goal",
                     "do not implement the solution in this stage",
@@ -856,9 +947,20 @@ Current defaults:
 - solver count: `{solver_count}`
 - user summary language: `{summary_language}`
 - intake research mode: `{intake_research_mode}`
+- stage research mode: `{stage_research_mode}`
 - execution network mode: `{execution_network_mode}`
 - cache policy: `{cache_config['policy']}`
 - cache root: `{cache_config['root']}`
+- host facts source: `{host_facts.source}`
+- host facts captured at: `{host_facts.captured_at}`
+- host platform: `{host_facts.platform}`
+- host machine: `{host_facts.machine}`
+- apple silicon: `{str(host_facts.apple_silicon).lower()}`
+- torch installed: `{str(host_facts.torch_installed).lower()}`
+- cuda available: `{host_facts.cuda_available}`
+- mps built: `{host_facts.mps_built}`
+- mps available: `{host_facts.mps_available}`
+- preferred torch device: `{host_facts.preferred_torch_device}`
 - suggested validation:
 {bullet_list(validation_commands)}
 
@@ -874,6 +976,7 @@ Rules:
 - keep the brief precise and execution-ready
 - decompose compound tasks into workstreams instead of silently shrinking the requested deliverable
 - update `plan.json` goal checks when the current list misses a critical user-visible capability
+- treat `host_facts` in `plan.json` as authoritative local execution facts; do not downgrade `mps` or other device availability based only on intuition
 - if intake research mode is `research-first`, browse the web for solution patterns, current tool options, and likely implementation constraints before finalizing stages
 - if intake research mode is `local-first`, inspect the workspace first and browse only when local context is insufficient
 - if intake research mode is `local-only`, do not browse unless the user explicitly asks
@@ -892,6 +995,7 @@ def render_solver_prompt(
     angle: str,
     validation_commands: list[str],
     prompt_format: str,
+    stage_research_mode: str,
 ) -> str:
     result_file = run_dir / "solutions" / solver_id / "RESULT.md"
     if prompt_format == "compact":
@@ -907,10 +1011,12 @@ def render_solver_prompt(
                     str(run_dir / "plan.json"),
                 ],
                 "write": [str(result_file)],
+                "stage_research_mode": stage_research_mode,
                 "rules": [
                     "do not read sibling solver outputs",
                     "preserve the full requested system as the top-level goal",
                     "if you narrow scope, record it as phase 1 while keeping the preserved goal explicit",
+                    "follow stage_research_mode when deciding whether to use web research during problem solving",
                     "state validation performed or the exact blocker",
                 ],
                 "deliverables": [
@@ -947,10 +1053,17 @@ Deliver:
 Validation hints:
 {bullet_list(validation_commands)}
 
+Stage research mode:
+
+- `{stage_research_mode}`
+
 Rules:
 
 - solve the task from your assigned angle
 - keep the output self-contained
+- if stage research mode is `research-first`, browse early for current solution patterns, official docs, and implementation examples when that changes the approach
+- if stage research mode is `local-first`, inspect the workspace first and browse only when local context is insufficient or external guidance would materially improve the solution
+- if stage research mode is `local-only`, stay local unless the user explicitly asked for web research
 - if you changed code, say exactly what you validated
 - if you could not validate, say exactly why
 """
@@ -962,6 +1075,7 @@ def render_review_prompt(
     reviewers: list[str],
     prompt_format: str,
     summary_language: str,
+    stage_research_mode: str,
 ) -> str:
     solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
     solution_lines = "\n".join(f"- `{path}`" for path in solution_files)
@@ -984,10 +1098,12 @@ def render_review_prompt(
                 ],
                 "reviewer_stack": reviewers,
                 "user_summary_language": summary_language,
+                "stage_research_mode": stage_research_mode,
                 "validation_hints": compact_list(validation_commands),
                 "rules": [
                     "compare every solution against the brief, not against style preference",
                     "compare every solution against the plan goal_checks and call out uncovered critical checks",
+                    "follow stage_research_mode when deciding whether to use web research during comparative review or fact-checking",
                     "penalize silent scope reduction",
                     "architecture-only or scaffold-only output is insufficient when the brief still targets a working MVP",
                     "treat missing evidence as a penalty",
@@ -1028,6 +1144,10 @@ Read:
 Reviewer stack:
 {bullet_list(reviewers)}
 
+Stage research mode:
+
+- `{stage_research_mode}`
+
 Validation suggestions:
 {bullet_list(validation_commands)}
 
@@ -1041,6 +1161,9 @@ Rules:
 
 - compare every solution against the brief, not against style preferences
 - compare every solution against the plan goal checks and penalize uncovered critical capabilities
+- if stage research mode is `research-first`, you may browse early to fact-check disputed claims or compare solution patterns against current official guidance
+- if stage research mode is `local-first`, inspect local evidence first and browse only when local artifacts are insufficient to resolve a meaningful question
+- if stage research mode is `local-only`, stay local unless the user explicitly asked for web research
 - run the cheapest relevant validation first when code or config changed
 - treat missing evidence as a penalty
 - write the user-facing summary for a human decision-maker who may want to adjust the plan before execution
@@ -1052,8 +1175,10 @@ def render_execution_prompt(
     run_dir: Path,
     validation_commands: list[str],
     prompt_format: str,
+    stage_research_mode: str,
     execution_network_mode: str,
     cache_config: dict[str, object],
+    host_facts: HostFacts,
 ) -> str:
     solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
     solution_lines = "\n".join(f"- `{path}`" for path in solution_files) or "- none"
@@ -1063,6 +1188,7 @@ def render_execution_prompt(
             {
                 "stage": "execution",
                 "mode": "implement",
+                "stage_research_mode": stage_research_mode,
                 "read": [
                     str(run_dir / "request.md"),
                     str(run_dir / "brief.md"),
@@ -1077,11 +1203,13 @@ def render_execution_prompt(
                     "implement the winner or explicitly justified hybrid in the primary workspace",
                     "treat workspace changes as the main deliverable and execution/report.md as the audit trail",
                     "follow the review recommendation unless local validation forces a narrower implementation",
+                    "follow stage_research_mode when deciding whether to use web research during implementation, debugging, and validation",
                     "if execution_network_mode is fetch-if-needed, install or download missing dependencies, weights, adapters, repos, or tools when they are genuinely required to implement the chosen slice",
                     "if cache.policy is reuse, prefer cached downloads, wheels, models, and repos before fetching again",
                     "store newly fetched reusable artifacts in cache.paths.downloads, cache.paths.wheelhouse, or cache.paths.models when applicable",
                     "record exact install/download commands, sources, versions, and what was fetched",
                     "prefer primary or official sources for code, packages, models, and datasets",
+                    "respect host_facts.preferred_torch_device from plan.json when running torch-based training or inference commands; if you must deviate, record the exact reason",
                     "treat uncovered critical goal checks as blockers or explicitly deferred work, not as silent completion",
                     "run the cheapest relevant validation after edits and record exact commands and outcomes",
                     "if blocked, implement the highest-value slice and state the blocker precisely",
@@ -1116,6 +1244,10 @@ Execution network mode:
 
 - `{execution_network_mode}`
 
+Stage research mode:
+
+- `{stage_research_mode}`
+
 Cache:
 
 - policy: `{cache_config['policy']}`
@@ -1133,11 +1265,15 @@ Rules:
 
 - treat workspace changes as the primary deliverable
 - follow the review recommendation unless local validation forces an explicit deviation
+- if stage research mode is `research-first`, you may browse early for current official docs, issue threads, implementation examples, and similar solutions when they materially affect implementation or validation
+- if stage research mode is `local-first`, inspect local code and evidence first and browse only when external guidance is needed to unblock implementation or improve correctness
+- if stage research mode is `local-only`, stay local unless the user explicitly asked for web research
 - if execution network mode is `fetch-if-needed`, you may install or download genuinely required dependencies, model artifacts, or tools
 - if cache policy is `reuse`, prefer cached wheels, models, repos, and downloads before fetching again
 - store newly fetched reusable artifacts in the shared cache when practical
 - record exact install/download commands, sources, versions, and fetched artifacts in `execution/report.md`
 - prefer official or primary sources when fetching dependencies or model artifacts
+- respect `host_facts.preferred_torch_device` from `plan.json` when running torch-based training or inference; if you deviate, record the exact reason
 - treat remaining uncovered critical goal checks as blockers or explicit partial-completion notes
 - run the cheapest relevant validation after edits
 - if full implementation is blocked, complete the highest-value slice and record the exact blocker
@@ -1149,12 +1285,15 @@ def render_verification_prompt(
     validation_commands: list[str],
     prompt_format: str,
     summary_language: str,
+    stage_research_mode: str,
+    host_facts: HostFacts,
 ) -> str:
     solution_files = sorted((run_dir / "solutions").glob("*/RESULT.md"))
     solution_lines = "\n".join(f"- `{path}`" for path in solution_files) or "- none"
     findings_file = run_dir / "verification" / "findings.md"
     user_summary_file = run_dir / "verification" / "user-summary.md"
     improvement_request_file = run_dir / "verification" / "improvement-request.md"
+    augmented_task_file = run_dir / "verification" / "augmented-task.md"
     goal_status_file = run_dir / "verification" / "goal-status.json"
 
     if prompt_format == "compact":
@@ -1171,21 +1310,28 @@ def render_verification_prompt(
                     str(run_dir / "review" / "user-summary.md"),
                     str(run_dir / "execution" / "report.md"),
                     "references/verification-rubric.md",
-                    *[str(path) for path in solution_files],
                 ],
                 "write": [
                     str(findings_file),
                     str(user_summary_file),
                     str(improvement_request_file),
+                    str(augmented_task_file),
                     str(goal_status_file),
                 ],
                 "validation_hints": compact_list(validation_commands),
                 "user_summary_language": summary_language,
+                "stage_research_mode": stage_research_mode,
                 "rules": [
                     "review the actual workspace implementation, not only the plans",
                     "act in code-review mode: prioritize bugs, regressions, unsafe behavior, and missing validation",
+                    "start from execution/report.md and the review verdict; use them to narrow the inspection scope before opening more files",
+                    "prefer changed files, files explicitly named in execution/report.md, and files directly implicated by failing validation before scanning unrelated parts of the repo",
+                    "follow stage_research_mode when deciding whether to use web research for fact-checking or external validation guidance",
+                    "do not read solver stdout logs unless execution/report.md or direct evidence makes them necessary",
+                    "do not read raw solver RESULT.md files unless the review artifacts are insufficient to explain the chosen implementation",
                     "run the cheapest relevant checks first and record exact evidence or blockers",
                     "write findings ordered by severity with file references when possible",
+                    "verify device choice against host_facts from plan.json when the implementation uses torch-based training or inference",
                     "set goal_complete=false when any critical plan goal check remains missing, unverified, or replaced by a placeholder implementation",
                     "if there are no meaningful findings, say so explicitly",
                     "generate an improvement request that can seed a follow-up pipeline run against the existing codebase",
@@ -1212,6 +1358,7 @@ def render_verification_prompt(
                         "reason": "short explanation",
                     },
                     "improvement_request": "a concise task statement for the next run that preserves the original goal and targets the verified defects",
+                    "augmented_task": "a full follow-up task prompt that preserves the original goal, records verified progress, names verified blockers, lists do-not-regress constraints, and defines the next done state",
                 },
             }
         )
@@ -1228,8 +1375,6 @@ Read:
 - `{run_dir / 'review' / 'user-summary.md'}`
 - `{run_dir / 'execution' / 'report.md'}`
 - `references/verification-rubric.md`
-- solver outputs for context:
-{solution_lines}
 
 Your job is to review the actual implementation in the workspace after execution, produce findings, and seed the next improvement run if needed.
 
@@ -1239,6 +1384,11 @@ Deliver:
 - `verification/user-summary.md` as a short user-facing summary in `{summary_language}`
 - `verification/goal-status.json` with machine-readable goal completion status against `plan.json` goal checks
 - `verification/improvement-request.md` with a concise follow-up task for the next pipeline run against the existing codebase
+- `verification/augmented-task.md` with a full follow-up task prompt that preserves the original goal and carries forward verified progress, blockers, and do-not-regress constraints
+
+Stage research mode:
+
+- `{stage_research_mode}`
 
 Validation hints:
 {bullet_list(validation_commands)}
@@ -1247,10 +1397,19 @@ Rules:
 
 - inspect the actual workspace, not just the proposed plans
 - default to code-review mindset: list findings first, ordered by severity
+- start from `execution/report.md` and the review verdict to narrow scope before opening more files
+- prefer files explicitly named in `execution/report.md`, files implicated by failing validation, and direct runtime evidence before scanning the wider repo
+- if stage research mode is `research-first`, you may browse official docs or primary sources early when they materially affect a blocker analysis or external validation claim
+- if stage research mode is `local-first`, inspect local evidence first and browse only when external guidance is needed to interpret or validate a finding
+- if stage research mode is `local-only`, stay local unless the user explicitly asked for web research
+- do not read solver stdout logs unless direct evidence makes them necessary
+- do not reopen raw solver outputs unless the review artifacts are insufficient to explain the chosen implementation
 - run the cheapest relevant validation first
+- verify torch device choice against `host_facts` in `plan.json` when relevant
 - set `goal_complete=false` when any critical goal check remains missing, unverified, or only partially mocked
 - if there are no meaningful findings, say that explicitly
 - keep the improvement request actionable and tightly scoped to verified defects
+- keep the augmented follow-up task concise but complete enough to seed the next run without manual prompt reconstruction
 """
 
 
@@ -1261,6 +1420,7 @@ def main() -> None:
     workspace_exists = workspace.exists()
     cache_config = build_cache_config(Path(args.cache_root), args.cache_policy)
     ensure_cache_dirs(cache_config)
+    refresh_cache_index(cache_config)
     title = args.title or " ".join(task.split()[:8])
     task_kind = infer_task_kind(task) if args.task_kind == "auto" else args.task_kind
     complexity = infer_complexity(task) if args.complexity == "auto" else args.complexity
@@ -1269,6 +1429,7 @@ def main() -> None:
     workstream_hints = workstream_hints_for(task_kind, task)
     goal_checks = infer_goal_checks(task, task_kind, workstream_hints)
     signals = detect_stack(workspace)
+    host_facts = detect_host_facts()
     validation_commands = build_validation_commands(workspace, signals)
     roles = choose_roles(task_kind, solver_count)
 
@@ -1292,12 +1453,15 @@ def main() -> None:
         "prompt_format": args.prompt_format,
         "summary_language": args.summary_language,
         "intake_research_mode": args.intake_research,
+        "stage_research_mode": args.stage_research,
         "execution_network_mode": args.execution_network,
         "cache": cache_config,
+        "host_facts": asdict(host_facts),
         "solver_count": solver_count,
         "solver_roles": roles,
         "workstream_hints": workstream_hints,
         "goal_gate_enabled": True,
+        "augmented_follow_up_enabled": True,
         "goal_checks": goal_checks,
         "reviewer_stack": REVIEWER_STACK,
         "stack_signals": asdict(signals),
@@ -1324,8 +1488,10 @@ def main() -> None:
             args.summary_language,
             goal_checks,
             args.intake_research,
+            args.stage_research,
             args.execution_network,
             cache_config,
+            host_facts,
         ),
     )
     write_text(run_dir / "brief.md", "# Brief\n\nPending intake stage.\n")
@@ -1345,8 +1511,10 @@ def main() -> None:
             args.summary_language,
             goal_checks,
             args.intake_research,
+            args.stage_research,
             args.execution_network,
             cache_config,
+            host_facts,
         ),
     )
 
@@ -1361,6 +1529,7 @@ def main() -> None:
                     angle=role_data["angle"],
                     validation_commands=validation_commands,
                     prompt_format=args.prompt_format,
+                    stage_research_mode=args.stage_research,
                 ),
             )
         write_text(
@@ -1376,6 +1545,7 @@ def main() -> None:
             REVIEWER_STACK,
             args.prompt_format,
             args.summary_language,
+            args.stage_research,
         ),
     )
     write_text(run_dir / "review" / "report.md", "# Review Report\n\nPending review stage.\n")
@@ -1387,8 +1557,10 @@ def main() -> None:
             run_dir,
             validation_commands,
             args.prompt_format,
+            args.stage_research,
             args.execution_network,
             cache_config,
+            host_facts,
         ),
     )
     write_text(run_dir / "execution" / "report.md", "# Execution Report\n\nPending execution stage.\n")
@@ -1399,6 +1571,8 @@ def main() -> None:
             validation_commands,
             args.prompt_format,
             args.summary_language,
+            args.stage_research,
+            host_facts,
         ),
     )
     write_text(run_dir / "verification" / "findings.md", "# Findings\n\nPending verification stage.\n")
@@ -1410,6 +1584,10 @@ def main() -> None:
     write_text(
         run_dir / "verification" / "improvement-request.md",
         "# Improvement Request\n\nPending verification stage.\n",
+    )
+    write_text(
+        run_dir / "verification" / "augmented-task.md",
+        "# Augmented Task\n\nPending verification stage.\n",
     )
 
     print(run_dir)

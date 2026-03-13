@@ -31,6 +31,13 @@ Prefer the cheapest relevant validation first:
 - direct reproduction commands
 - file inspection
 
+Scope discipline:
+
+- start from `execution/report.md` and review artifacts before reading additional code
+- prefer files explicitly named in execution evidence and files directly implicated by failing validation
+- do not read solver stdout logs unless direct evidence makes them necessary
+- avoid broad repo scans when a narrower evidence path can answer the question
+
 If validation cannot run, record:
 
 - the exact blocked command
@@ -89,7 +96,9 @@ Keep it brief and decision-oriented:
 
 ## Improvement Request
 
-Generate `verification/improvement-request.md` as the seed task for the next run.
+Generate `verification/improvement-request.md` as the narrow seed task for the next run.
+
+Generate `verification/augmented-task.md` as the fuller follow-up prompt for the next run.
 
 The improvement request should:
 
@@ -98,3 +107,11 @@ The improvement request should:
 - mention the current workspace and existing implementation
 - be implementation-oriented, not architecture-oriented
 - avoid repeating defects that were not actually verified
+
+The augmented task should:
+
+- preserve the original user goal verbatim or as close as possible
+- summarize verified progress that must not regress
+- list only verified blockers and evidence-backed next fixes
+- record do-not-regress constraints
+- define the next done state clearly enough that `rerun` can use it without manual prompt rewriting
