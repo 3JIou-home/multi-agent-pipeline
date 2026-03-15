@@ -365,16 +365,6 @@ Key artifacts:
 - `verification/goal-status.json`: completion gate and goal coverage
 - `runtime/token-ledger.json`: accumulated token accounting
 
-## Local Fast Paths
-
-The runtime has deterministic local paths for trivial requests when a model call would be wasteful.
-
-Current example:
-
-- Python hello-world tasks can complete through a local template path and direct validation of `main.py`
-
-This is used for smoke tests and for cheap deterministic handling of trivial tasks.
-
 ## Validation And Smoke Coverage
 
 The current repository is validated with:
