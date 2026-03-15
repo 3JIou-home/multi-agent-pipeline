@@ -394,7 +394,3 @@ The current repository is validated with:
 - `depends_on` and `needs` are metadata today, not execution graph edges
 - `execution` is still the only stage that edits the workspace directly
 - large-repository verification still uses bounded workspace embedding and cache tradeoffs rather than a full repository semantic index
-
-## Repository Notes
-
-This repository now represents the main Rust implementation at `multi-agent-pipeline`. The previous split between `multi-agent-pipeline` and `multi-agent-pipeline-rust` is no longer the intended operator-facing distinction.
