@@ -1,140 +1,348 @@
 # Multi-Agent Pipeline
 
-`multi-agent-pipeline` is a Codex skill for turning one user request into a staged workflow:
+`multi-agent-pipeline` is a Rust runtime for staged agent execution. It turns one user request into a resumable, file-based workflow driven by the `agpipe` binary and a run directory on disk.
 
-1. Intake and prompt builder
-2. One to three independent solver stages
-3. A final reviewer that compares solutions and writes a verdict
-4. An execution stage that implements the selected winner or hybrid
-5. A verification stage that audits the implementation and seeds the next improvement run
+The default flow is:
 
-The intake stage is expected to preserve the user's requested outcome and decompose compound requests into workstreams. It should not silently replace "build the service" with "make a scaffold" unless that is recorded as an explicit interim milestone.
-Every run also carries `goal_checks` in `plan.json`, and verification writes `verification/goal-status.json` so the launcher can distinguish "all stages ran" from "the original goal is actually complete".
-Every run also carries `host_facts` in `plan.json`, so device-sensitive stages can use detected platform, architecture, and preferred torch device instead of guessing from prose.
+1. interview and task finalization
+2. intake and brief construction
+3. one or more independent research or solver stages
+4. review and winner or hybrid selection
+5. execution in the real workspace
+6. verification against the actual result
 
-## Install
+The service is designed for iterative operator control, cache reuse, and auditable artifacts. The normal operator entry point is the TUI. The CLI is also fully usable for CI, automation, and debugging.
 
-Clone or copy this directory into your Codex skills directory:
+## Build
 
 ```bash
-mkdir -p ~/.codex/skills
-cp -R multi-agent-pipeline ~/.codex/skills/
+cargo build --release
+./target/release/agpipe --help
 ```
 
-If you want the pipeline to use the `agency-agents` role catalog, clone:
+## Validate
 
 ```bash
-git clone https://github.com/msitarzewski/agency-agents.git
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+cargo build --release
 ```
 
-Then point the skill at that checkout:
+## Quick Start
+
+Create and inspect a run:
 
 ```bash
-export AGENCY_AGENTS_DIR=/path/to/agency-agents
-```
-
-The pipeline works without `agency-agents`, but when it is available it can reuse the role library from `msitarzewski/agency-agents` for intake, solver selection, and review guidance.
-
-## Create A Run
-
-```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
+./target/release/agpipe create-run \
+  --task "Build a Python hello world program." \
   --workspace /path/to/workspace \
   --output-dir /path/to/agent-runs
+
+./target/release/agpipe status /path/to/run
+./target/release/agpipe start-next /path/to/run
+./target/release/agpipe resume /path/to/run --until verification
+./target/release/agpipe doctor /path/to/run
 ```
 
-Compact packet mode:
+Create and automate in one command:
 
 ```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
+./target/release/agpipe run \
+  --task "Build a Python hello world program." \
   --workspace /path/to/workspace \
   --output-dir /path/to/agent-runs \
-  --prompt-format compact
+  --until verification
 ```
 
-Choose the language for the user-facing review summary:
+Open the TUI:
 
 ```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
-  --workspace /path/to/workspace \
-  --output-dir /path/to/agent-runs \
-  --summary-language ru
+./target/release/agpipe
+./target/release/agpipe ui --root /path/to/agent-runs
 ```
 
-Allow execution to fetch missing dependencies or artifacts when needed:
+## Workflow Model
+
+Every run is file-based. The runtime keeps prompts, stage outputs, logs, review verdicts, execution reports, verification findings, cache metadata, and host evidence in the run directory.
+
+Core guarantees:
+
+- stages are resumable
+- solver outputs stay isolated until review
+- execution edits the real workspace only after review
+- verification reads the real workspace and records goal coverage
+- `goal-status.json` is the completion gate, not just "all stages ran"
+
+## YAML Pipeline Configuration
+
+The runtime supports a configurable ordered pipeline. Put `agpipe.pipeline.yml` in the workspace or pass `--pipeline-file`.
+
+Auto-detected paths:
+
+- `/path/to/workspace/agpipe.pipeline.yml`
+- `/path/to/workspace/.agpipe/pipeline.yml`
+
+Explicit path:
 
 ```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
+./target/release/agpipe create-run \
+  --task "Research and implement a CLI." \
   --workspace /path/to/workspace \
   --output-dir /path/to/agent-runs \
-  --execution-network fetch-if-needed
+  --pipeline-file /path/to/pipeline.yml
 ```
 
-Modes:
+Minimal example:
 
-- `fetch-if-needed`: execution may install or download genuinely required tools, packages, repos, weights, adapters, or datasets
-- `local-only`: execution must stay offline and treat missing external artifacts as blockers
+```yaml
+pipeline:
+  stages:
+    - id: intake
+      kind: intake
 
-Allow solver, review, execution, and verification stages to use web research:
+    - id: research-a
+      kind: research
+
+    - id: research-b
+      kind: research
+
+    - id: synthesis
+      kind: review
+
+    - id: implement
+      kind: execution
+
+    - id: audit
+      kind: verification
+```
+
+Example for research only:
+
+```yaml
+pipeline:
+  stages:
+    - id: intake
+      kind: intake
+    - id: researcher-a
+      kind: research
+    - id: researcher-b
+      kind: research
+    - id: review
+      kind: review
+    - id: audit
+      kind: verification
+```
+
+Supported stage kinds:
+
+- `intake`, `brief`, `planning`
+- `solver`, `research`, `analysis`, `researcher`
+- `review`, `compare`, `synthesis`
+- `execution`, `implement`, `implementation`, `apply`
+- `verification`, `verify`, `audit`, `check`
+
+Supported fields:
+
+- `id`: stable stage identifier used in status, logs, prompts, and cache keys
+- `kind`: behavioral stage type
+- `role`: optional explicit agent role override
+- `angle`: optional strategy hint for research or solver stages
+- `description`: optional metadata
+- `depends_on` or `needs`: accepted syntactically for future DAG use
+
+Current scheduler model:
+
+- pipeline order is the order in `stages`
+- `depends_on` and `needs` are parsed and preserved, but scheduling is still linear
+- this is not yet a full GitLab CI style DAG
+
+## Automatic `role` And `angle`
+
+For research or solver stages you usually do not need to specify `role` or `angle`.
+
+Current behavior:
+
+- if `role` is omitted, intake assigns it automatically from stage `kind` and inferred `task_kind`
+- if `role` is explicitly provided in YAML, it is treated as an override and is preserved
+- if `angle` is omitted, the runtime assigns a default diversification sequence across solver-like stages
+
+This keeps YAML compact while still producing differentiated researchers or solvers.
+
+Example without explicit roles:
+
+```yaml
+pipeline:
+  stages:
+    - id: intake
+      kind: intake
+    - id: research-a
+      kind: research
+    - id: research-b
+      kind: research
+    - id: implement
+      kind: execution
+    - id: audit
+      kind: verification
+```
+
+## Backends
+
+`execution` uses the local `codex` binary. Stage0 and non-execution stages can use the built-in OpenAI Responses backend.
+
+Codex path:
 
 ```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
-  --workspace /path/to/workspace \
-  --output-dir /path/to/agent-runs \
-  --stage-research local-first
+export AGPIPE_CODEX_BIN=/path/to/codex
 ```
 
-Modes:
-
-- `research-first`: non-intake stages may browse early for official docs, examples, issue threads, and similar solutions when that materially affects the stage outcome
-- `local-first`: non-intake stages inspect the workspace first and browse only when external guidance is needed
-- `local-only`: non-intake stages stay local unless the user explicitly asked for web research
-
-Configure a shared cache for research notes, downloads, wheels, models, and verification artifacts:
+Enable Responses for stage0:
 
 ```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
-  --workspace /path/to/workspace \
-  --output-dir /path/to/agent-runs \
-  --cache-root ~/.cache/multi-agent-pipeline \
-  --cache-policy reuse
+export OPENAI_API_KEY=...
+export AGPIPE_STAGE0_BACKEND=responses
 ```
 
-Cache policies:
-
-- `reuse`: stages may reuse and update shared cache entries
-- `refresh`: stages should ignore existing cache hits and repopulate cache
-- `off`: do not use shared cache
-
-Host facts:
-
-- `init_run.py` detects local platform, architecture, whether `torch` is installed, whether `cuda` or `mps` appears available, and the preferred torch device.
-- `host_facts` also records `source` and `captured_at`, so later stages know where the hardware facts came from.
-- Intake, execution, and verification should treat `host_facts` as authoritative local execution evidence instead of reinventing hardware support from prose or sandbox assumptions.
-
-Choose how intake gathers context before it finalizes stages:
+Enable Responses for all non-execution stages:
 
 ```bash
-python3 scripts/init_run.py \
-  --task 'Build a staged pipeline for this request' \
-  --workspace /path/to/workspace \
-  --output-dir /path/to/agent-runs \
-  --intake-research research-first
+export OPENAI_API_KEY=...
+export AGPIPE_STAGE0_BACKEND=responses
+export AGPIPE_STAGE_BACKEND=responses-readonly
 ```
 
-Modes:
+Important runtime behavior:
 
-- `research-first`: intake should browse first, then normalize the brief and stages
-- `local-first`: intake should inspect the workspace first and browse only when local context is insufficient
-- `local-only`: intake should stay local unless the user explicitly asks for web research
+- `execution` stays on Codex because it needs live tool use in the real workspace
+- `responses-readonly` is intended for intake, research, review, and some verification work
+- Responses requests use structured outputs instead of best-effort embedded JSON parsing
+- terminal response states are fail-closed: `failed`, `incomplete`, `cancelled`, and timeout states are surfaced as errors
+- create requests use idempotency keys
+- polling uses retry or backoff behavior and honors `Retry-After` when present
 
-This creates a run directory with:
+Privacy-related switches:
+
+```bash
+export AGPIPE_OPENAI_BACKGROUND=0
+export AGPIPE_OPENAI_STORE=0
+```
+
+`doctor` reports stored backend configuration from the run metadata, so diagnostics do not depend only on the current shell environment.
+
+## Cache
+
+`agpipe` uses a real runtime cache, not only advisory prompt hints.
+
+Cache areas include:
+
+- `research`
+- `downloads`
+- `wheelhouse`
+- `models`
+- `verification`
+- `stage-results`
+
+Local stage cache is content-addressed. The cache key includes the effective prompt inputs and backend fingerprint, not just timestamps.
+
+Important properties:
+
+- repeated `start`, `start-next`, `start-solvers`, and `resume` calls can restore stage outputs from cache
+- cache reuse restores both artifacts and logs, so the run stays auditable
+- stale lock directories are detected and recovered automatically
+- cache manifests track token usage and estimated savings
+- `runtime/token-ledger.json` stores local and provider-side token accounting
+
+Readonly backend cache behavior:
+
+- `responses-readonly` stages such as intake, research, and review do not invalidate on unrelated workspace edits
+- verification is different: verification cache includes workspace fingerprinting because it must reason about the actual implementation
+
+Prompt cache behavior:
+
+- prompt cache keys are based on stable prefix hashes instead of `workdir`
+- static prefix content is separated from dynamic stage suffix content to improve remote cache locality
+
+Inspect cache state:
+
+```bash
+./target/release/agpipe cache-status /path/to/run --refresh
+./target/release/agpipe cache-prune /path/to/run --max-age-days 14 --dry-run
+```
+
+## Interview Flow
+
+Interview mode helps normalize the task before creating a run.
+
+Commands:
+
+```bash
+./target/release/agpipe interview --task "..." --workspace /path/to/workspace --output-dir /tmp/agpipe-interview
+./target/release/agpipe interview-questions --task "..." --workspace /path/to/workspace --output-dir /tmp/agpipe-interview
+./target/release/agpipe interview-finalize --task "..." --workspace /path/to/workspace --session-dir /path/to/session --answers-file /path/to/answers.json
+```
+
+Behavior:
+
+- preserves the original goal
+- asks only the domain questions that matter
+- fails closed when the selected backend fails
+- keeps diagnostics instead of fabricating success artifacts
+
+## CLI Surface
+
+Primary commands:
+
+```bash
+./target/release/agpipe create-run ...
+./target/release/agpipe run ...
+./target/release/agpipe runs /path/to/agent-runs
+./target/release/agpipe status /path/to/run
+./target/release/agpipe doctor /path/to/run
+./target/release/agpipe next /path/to/run
+./target/release/agpipe show /path/to/run <stage>
+./target/release/agpipe copy /path/to/run <stage> --raw
+./target/release/agpipe start-next /path/to/run
+./target/release/agpipe start-solvers /path/to/run
+./target/release/agpipe resume /path/to/run --until verification
+./target/release/agpipe amend /path/to/run --note "..." --rewind intake
+./target/release/agpipe recheck /path/to/run verification
+./target/release/agpipe step-back /path/to/run verification
+./target/release/agpipe refresh-prompt /path/to/run verification
+./target/release/agpipe refresh-prompts /path/to/run
+./target/release/agpipe host-probe /path/to/run --refresh
+./target/release/agpipe cache-status /path/to/run --refresh
+./target/release/agpipe cache-prune /path/to/run --max-age-days 14 --dry-run
+./target/release/agpipe rerun /path/to/run
+./target/release/agpipe ui --root /path/to/agent-runs
+```
+
+## TUI
+
+Open the terminal UI:
+
+```bash
+./target/release/agpipe
+./target/release/agpipe ui --root /path/to/agent-runs
+```
+
+Important hotkeys:
+
+- `q`: quit
+- `j` or `k`: move between runs
+- `g`: refresh run list
+- `o` or `Enter`: open the selected artifact
+- `c`: create a new run
+- `n`: run `start-next`
+- `r`: resume until verification
+- `a`: append an amendment and rewind
+- `y`: create a follow-up rerun
+- `h`: capture a fresh host probe
+- `u`: refresh prompts
+- `b`: `step-back review`
+- `v`: `recheck verification`
+
+## Run Layout
+
+Each run contains:
 
 - `request.md`
 - `brief.md`
@@ -144,237 +352,49 @@ This creates a run directory with:
 - `review/`
 - `execution/`
 - `verification/`
+- `logs/`
+- `host/`
+- `runtime/`
 
-## Run Stages
+Key artifacts:
 
-Primary control-plane is now the Rust binary `agpipe`. Build it from the repo root:
+- `plan.json`: normalized run plan, backend configuration, cache config, and inferred task metadata
+- `review/summary.md`: review verdict and user-facing summary
+- `execution/report.md`: implementation report and validation notes
+- `verification/findings.md`: ordered verification findings
+- `verification/goal-status.json`: completion gate and goal coverage
+- `runtime/token-ledger.json`: accumulated token accounting
 
-```bash
-cargo build --release
-```
+## Local Fast Paths
 
-Default usage opens the terminal interface:
+The runtime has deterministic local paths for trivial requests when a model call would be wasteful.
 
-```bash
-./target/release/agpipe
-./target/release/agpipe ui --root /Users/admin/agent-runs
-```
+Current example:
 
-Useful non-interactive commands:
+- Python hello-world tasks can complete through a local template path and direct validation of `main.py`
 
-```bash
-./target/release/agpipe runs /Users/admin/agent-runs --limit 10
-./target/release/agpipe doctor /path/to/agent-runs/<run-id>
-./target/release/agpipe resume /path/to/agent-runs/<run-id> --until verification
-./target/release/agpipe amend /path/to/agent-runs/<run-id> --note 'Use the photo as a real analysis input.'
-./target/release/agpipe rm /path/to/agent-runs/<run-id>
-./target/release/agpipe prune-runs /Users/admin/agent-runs --keep 20 --older-than-days 14 --dry-run
-```
+This is used for smoke tests and for cheap deterministic handling of trivial tasks.
 
-`agpipe` is a Rust-first control-plane over the Python engine. It gives you:
+## Validation And Smoke Coverage
 
-- one compiled entrypoint for day-to-day use
-- a `ratatui` interface for run selection, status, previews, and logs
-- native `amend`, `rm`, `prune-runs`, `runs`, and `resume`
-- JSON-backed integration with the Python engine for status and doctor data
-- delegation to the Python engine for stage execution and fallback flows
+The current repository is validated with:
 
-The Python tools remain as internal/fallback engine layers:
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test`
+- `cargo build --release`
+- CLI smoke for hello-world generation
+- TUI integration tests
+- cache reuse and verification regressions
+- Responses backend regressions
+- custom YAML pipeline regressions
 
-- `scripts/run_stage.py` stays the stage engine
-- `scripts/map.py` still exists for interview/run flows that are not fully ported yet
-- user-facing day-to-day operation should go through `agpipe`
+## Current Limitations
 
-Typical high-level flow:
+- the configurable pipeline is ordered, not a true DAG scheduler yet
+- `depends_on` and `needs` are metadata today, not execution graph edges
+- `execution` is still the only stage that edits the workspace directly
+- large-repository verification still uses bounded workspace embedding and cache tradeoffs rather than a full repository semantic index
 
-```bash
-./target/release/agpipe run \
-  --task-file /tmp/llm-freecad-next.txt \
-  --workspace /Users/admin/llm-for-freecad \
-  --until review
+## Repository Notes
 
-./target/release/agpipe resume /Users/admin/agent-runs/<run-id> --until verification
-
-./target/release/agpipe amend /Users/admin/agent-runs/<run-id> \
-  --note 'Сейчас оно работает, но игнорирует фото и строит только похожую по форме деталь. Нужно использовать фото как реальный вход анализа, а не только размеры и template-like fallback.' \
-  --rewind intake
-```
-
-The default `run` flow is:
-
-1. stage0 interview agent inspects the task and asks the domain questions it still needs
-2. stage0 prompt builder generates the final normalized task prompt
-3. `init_run.py` creates the run
-4. autopilot executes stages until the chosen stop point
-5. at the review boundary it pauses for confirmation before execution unless you pass `--auto-approve`
-
-Typical amendment flow:
-
-1. add the new user correction with `agpipe amend` or from the TUI with `a`
-2. the amendment is written to `amendments.md`
-3. `doctor` will mark the run as stale for `intake`
-4. resume the run so the new correction is folded into the brief and downstream stages
-
-Binary-first examples:
-
-```bash
-./target/release/agpipe
-./target/release/agpipe runs /Users/admin/agent-runs --limit 10
-./target/release/agpipe status /Users/admin/agent-runs/<run-id>
-./target/release/agpipe doctor /Users/admin/agent-runs/<run-id>
-./target/release/agpipe resume /Users/admin/agent-runs/<run-id> --until verification
-./target/release/agpipe amend /Users/admin/agent-runs/<run-id> --note 'Фото должно использоваться как реальный вход анализа.'
-./target/release/agpipe rm /Users/admin/agent-runs/<run-id>
-./target/release/agpipe prune-runs /Users/admin/agent-runs --keep 20 --older-than-days 14 --dry-run
-```
-
-TUI hotkeys:
-
-- `q`: quit
-- `j` / `k`: move between runs
-- `g`: refresh the run list
-- `o` or `Enter`: open the current artifact in a fullscreen reader
-- `1`: `Summary`
-- `2`: `Findings`
-- `3`: `Augmented`
-- `4`: `Execution`
-- `5`: `Brief`
-- `s`: run the selected run's `safe-next-action`
-- `n`: `start-next`
-- `r`: autopilot resume until verification
-- `a`: add an amendment and rewind to `intake`
-- `y`: `rerun`
-- `h`: `host-probe --refresh`
-- `x`: delete the selected run
-- `p`: prune old runs with the default policy
-- `u`: refresh all prompts
-- `b`: `step-back review`
-- `v`: `recheck verification`
-
-TUI behavior notes:
-
-- `resume`, `safe-next`, `rerun`, `amend`, and similar actions now run in the background, so the interface stays responsive while logs update.
-- After `amend`, the usual next move is `r` to continue the run or `s` to execute just the next safe action.
-- In fullscreen artifact view, use `j` / `k` or `PgUp` / `PgDn` to scroll, `[` / `]` or `1..5` to switch artifacts, `Esc` to close the view, and `q` to quit the whole application.
-- Delete and prune now use button-based confirmation popups. Use `Left` / `Right` or `Tab` to select a button and `Enter` to confirm.
-
-Stage0 interview only:
-
-```bash
-./target/release/agpipe interview \
-  --task 'Build a working Telegram to FreeCAD service' \
-  --workspace /path/to/workspace \
-  --output-dir /path/to/agent-runs
-```
-
-Check progress:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> status
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> doctor
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> next
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> summary
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> findings
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> augmented-task
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> host-probe --refresh --history
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> cache-status --refresh
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> recheck verification --dry-run
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> step-back verification --dry-run
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> refresh-prompt verification
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> refresh-prompts
-```
-
-Run the next stage:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start-next
-```
-
-When the next work is the solver batch, `start-next` launches all pending solver stages in parallel and prints the updated status after each solver finishes.
-
-Run a specific stage:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start intake
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start solver-a
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start-solvers
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start review
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start execution
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start verification
-```
-
-Repeat a stage without creating a new run:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> refresh-prompt verification
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> recheck verification
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> start verification
-```
-
-Use `recheck verification` when `execution` is still valid and you only want a clean verification rerun. Use `step-back execution` or `step-back verification` when you intentionally want to rewind stage state.
-
-`step-back` resets the selected stage and dependent downstream stages to `pending`. Examples:
-
-- `step-back verification` resets only verification artifacts
-- `step-back execution` resets execution and verification
-- `step-back review` resets review, execution, and verification
-- `step-back solver-a` resets `solver-a`, review, execution, and verification
-
-Manage shared cache:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> cache-status --refresh --limit 10
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> cache-prune --max-age-days 14 --dry-run
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> cache-prune --max-age-days 30 --area research
-```
-
-Create the next improvement run from verification findings:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> rerun
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> rerun --prompt-source augmented
-```
-
-Inspect or copy a prompt without running it:
-
-```bash
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> show intake
-python3 scripts/run_stage.py /path/to/agent-runs/<run-id> copy solver-a
-```
-
-## Notes
-
-- Intake preserves the original requested outcome and records any phase-1 scaffold only as an interim milestone.
-- Intake can be configured with `--intake-research`; the default is `research-first`.
-- Solver, review, execution, and verification can be configured together with `--stage-research`; the default is `local-first`.
-- Execution can be configured with `--execution-network`; the default is `fetch-if-needed`.
-- Shared cache can be configured with `--cache-root` and `--cache-policy`; the default policy is `reuse`.
-- Compact mode emits JSON-like stage packets to reduce prompt overhead.
-- Intake may reuse research cache, and execution may reuse cached downloads, wheels, repos, and models when appropriate.
-- Solver stages are intended to stay independent until review.
-- Review writes both a machine-oriented verdict and `review/user-summary.md` in the selected language. The default is Russian via `--summary-language ru`.
-- Inspect the localized review summary before running execution if you want to adjust the plan or ask for corrections.
-- Verification audits the actual implementation, writes `verification/findings.md`, `verification/goal-status.json`, `verification/improvement-request.md`, and `verification/augmented-task.md` for the next run.
-- If verification says the critical goal is still incomplete, `status` shows `next: rerun` instead of `next: none`.
-- The launcher uses `codex exec` under the hood.
-- The launcher syncs missing solver artifacts if intake changes solver count or roles in `plan.json`.
-- The launcher also syncs execution and verification artifacts, can print the localized review summary with `run_stage.py <run_dir> summary`, can print post-execution findings with `run_stage.py <run_dir> findings`, and prints `status` automatically after stage runs.
-- `run_stage.py <run_dir> rerun` creates a follow-up run from `verification/improvement-request.md` against the same workspace.
-- `run_stage.py <run_dir> host-probe --refresh` captures launcher-side host/runtime facts with the current local Python, stores the latest copy in `host/probe.json`, and appends a timestamped snapshot under `host/probes/`.
-- `run_stage.py <run_dir> recheck verification` resets only verification artifacts, so you can rerun verification without `--force` while preserving a completed execution stage.
-- `run_stage.py <run_dir> step-back <stage>` rewinds a stage to `pending` without creating a new run.
-- `run_stage.py <run_dir> refresh-prompt <stage>` regenerates the raw stage prompt from the current skill logic for an existing run.
-- `run_stage.py <run_dir> refresh-prompts` regenerates all current stage prompt files in one pass.
-- `status` now shows `host-probe: captured (...)` and `host-drift: plan=... probe=...` when the current launcher environment disagrees with `plan.json`.
-- Execution and verification automatically refresh `host/probe.json` before they launch, so device-sensitive stages see current host evidence instead of only the original `host_facts`.
-- `host/probe.json` records visible environment variable names for common ML prefixes, but not their secret values.
-- `run_stage.py <run_dir> cache-status` prints the shared cache index, per-area size, and largest files.
-- `run_stage.py <run_dir> cache-prune` removes stale cache files by age and area, then rebuilds the cache index.
-- `run_stage.py <run_dir> doctor` catches stale downstream stages such as `verification: done` while `execution: pending`, warns when review/execution/verification artifacts are older than their upstream evidence, and recommends the next safe action.
-- `run_stage.py <run_dir> rerun --prompt-source augmented` prefers the fuller verification-generated follow-up prompt when available.
-- `agpipe run` still uses the separate Codex-based stage0 interview agent under the hood to gather missing domain clarifications before the actual pipeline run is created.
-- `agpipe resume` continues an existing run automatically and uses `start-solvers` when the next work is the solver batch.
-- `agpipe amend <run_dir> --note ... --rewind intake` is the fast path when the user wants to refine the current run instead of creating a new one.
-- `amendments.md` is treated as authoritative latest user input during later stage runs.
-- `agpipe rm <run_dir>` deletes one run, and `agpipe prune-runs <root> --keep N --older-than-days D` deletes old runs in bulk.
-- The skill can update downstream prompts and solver count after intake if the brief changes.
+This repository now represents the main Rust implementation at `multi-agent-pipeline`. The previous split between `multi-agent-pipeline` and `multi-agent-pipeline-rust` is no longer the intended operator-facing distinction.

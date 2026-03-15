@@ -1,11 +1,13 @@
 mod engine;
+mod runtime;
 mod tui;
 
 use engine::{
-    amend_run, automate_run, choose_prune_candidates, default_run_root, delete_run, discover_run_dirs,
-    doctor_report, map_py_stream, run_stage_stream, Context,
+    amend_run, automate_run, choose_prune_candidates, default_run_root, delete_run,
+    discover_run_dirs, doctor_report, run_stage_stream, task_flow_stream, Context,
 };
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -41,6 +43,11 @@ fn real_main() -> Result<ExitCode, String> {
             print_help();
             Ok(ExitCode::SUCCESS)
         }
+        "version" | "--version" | "-V" => {
+            println!("agpipe {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
+        }
+        "internal" => command_internal(&ctx, rest),
         "runs" => command_runs(&ctx, rest),
         "doctor" => command_delegate_run_stage_stream(&ctx, "doctor", rest),
         "status" => command_delegate_run_stage_stream(&ctx, "status", rest),
@@ -48,6 +55,8 @@ fn real_main() -> Result<ExitCode, String> {
         "summary" => command_delegate_run_stage_stream(&ctx, "summary", rest),
         "findings" => command_delegate_run_stage_stream(&ctx, "findings", rest),
         "augmented-task" => command_delegate_run_stage_stream(&ctx, "augmented-task", rest),
+        "show" => command_delegate_run_stage_stream(&ctx, "show", rest),
+        "copy" => command_delegate_run_stage_stream(&ctx, "copy", rest),
         "host-probe" => command_delegate_run_stage_stream(&ctx, "host-probe", rest),
         "start" => command_delegate_run_stage_stream(&ctx, "start", rest),
         "start-next" => command_delegate_run_stage_stream(&ctx, "start-next", rest),
@@ -59,12 +68,18 @@ fn real_main() -> Result<ExitCode, String> {
         "cache-status" => command_delegate_run_stage_stream(&ctx, "cache-status", rest),
         "cache-prune" => command_delegate_run_stage_stream(&ctx, "cache-prune", rest),
         "rerun" => command_delegate_run_stage_stream(&ctx, "rerun", rest),
+        "interview-questions" => {
+            command_task_flow_delegate_stream(&ctx, "interview-questions", rest)
+        }
+        "interview-finalize" => command_task_flow_delegate_stream(&ctx, "interview-finalize", rest),
+        "create-run" => command_task_flow_delegate_stream(&ctx, "create-run", rest),
         "resume" => command_resume(&ctx, rest),
+        "safe-next" => command_safe_next(&ctx, rest),
         "amend" => command_amend(&ctx, rest),
         "rm" => command_rm(rest),
         "prune-runs" => command_prune_runs(rest),
         "run" | "interview" => {
-            let code = map_py_stream(&ctx, &command, rest)?;
+            let code = task_flow_stream(&ctx, &command, rest)?;
             Ok(ExitCode::from(code as u8))
         }
         other => Err(format!("Unknown command: {other}")),
@@ -74,16 +89,85 @@ fn real_main() -> Result<ExitCode, String> {
 fn print_help() {
     println!(
         "agpipe\n\n\
-Default mode opens the terminal UI.\n\n\
-Examples:\n\
+Open the terminal UI and manage pipelines there.\n\n\
+User-facing commands:\n\
   agpipe\n\
-  agpipe ui --root /Users/admin/agent-runs\n\
-  agpipe runs /Users/admin/agent-runs --limit 10\n\
-  agpipe resume /Users/admin/agent-runs/<run-id> --until verification\n\
-  agpipe amend /Users/admin/agent-runs/<run-id> --note \"Use the photo as a real analysis input.\"\n\
-  agpipe rm /Users/admin/agent-runs/<run-id>\n\
-  agpipe prune-runs /Users/admin/agent-runs --keep 20 --older-than-days 14 --dry-run\n"
+  agpipe doctor /Users/admin/agent-runs/<run-id>\n\
+  agpipe version\n\n\
+Notes:\n\
+  - Create, continue, amend, rerun, and delete pipelines from the TUI.\n\
+  - Low-level automation and test commands are available under `agpipe internal ...`.\n\
+  - Run `agpipe internal help` only if you need scripting or debugging.\n"
     );
+}
+
+fn print_internal_help() {
+    println!(
+        "agpipe internal\n\n\
+Low-level automation and debugging commands.\n\n\
+Examples:\n\
+  agpipe internal runs /Users/admin/agent-runs --limit 10\n\
+  agpipe internal status /Users/admin/agent-runs/<run-id>\n\
+  agpipe internal start-next /Users/admin/agent-runs/<run-id>\n\
+  agpipe internal resume /Users/admin/agent-runs/<run-id> --until verification\n\
+  agpipe internal create-run --task '...' --workspace /path/to/workspace --output-dir /path/to/agent-runs\n\
+  agpipe internal interview-questions --task '...' --workspace /path/to/workspace\n"
+    );
+}
+
+fn command_internal(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        print_internal_help();
+        return Ok(ExitCode::SUCCESS);
+    }
+    let command = args[0].as_str();
+    let rest = &args[1..];
+    match command {
+        "help" | "--help" | "-h" => {
+            print_internal_help();
+            Ok(ExitCode::SUCCESS)
+        }
+        "ui" | "tui" => {
+            let (root, limit) = parse_root_limit(rest)?;
+            tui::launch(ctx, &root, limit)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        "runs" => command_runs(ctx, rest),
+        "doctor" => command_delegate_run_stage_stream(ctx, "doctor", rest),
+        "status" => command_delegate_run_stage_stream(ctx, "status", rest),
+        "next" => command_delegate_run_stage_stream(ctx, "next", rest),
+        "summary" => command_delegate_run_stage_stream(ctx, "summary", rest),
+        "findings" => command_delegate_run_stage_stream(ctx, "findings", rest),
+        "augmented-task" => command_delegate_run_stage_stream(ctx, "augmented-task", rest),
+        "show" => command_delegate_run_stage_stream(ctx, "show", rest),
+        "copy" => command_delegate_run_stage_stream(ctx, "copy", rest),
+        "host-probe" => command_delegate_run_stage_stream(ctx, "host-probe", rest),
+        "start" => command_delegate_run_stage_stream(ctx, "start", rest),
+        "start-next" => command_delegate_run_stage_stream(ctx, "start-next", rest),
+        "start-solvers" => command_delegate_run_stage_stream(ctx, "start-solvers", rest),
+        "refresh-prompts" => command_delegate_run_stage_stream(ctx, "refresh-prompts", rest),
+        "refresh-prompt" => command_delegate_run_stage_stream(ctx, "refresh-prompt", rest),
+        "step-back" => command_delegate_run_stage_stream(ctx, "step-back", rest),
+        "recheck" => command_delegate_run_stage_stream(ctx, "recheck", rest),
+        "cache-status" => command_delegate_run_stage_stream(ctx, "cache-status", rest),
+        "cache-prune" => command_delegate_run_stage_stream(ctx, "cache-prune", rest),
+        "rerun" => command_delegate_run_stage_stream(ctx, "rerun", rest),
+        "interview-questions" => {
+            command_task_flow_delegate_stream(ctx, "interview-questions", rest)
+        }
+        "interview-finalize" => command_task_flow_delegate_stream(ctx, "interview-finalize", rest),
+        "create-run" => command_task_flow_delegate_stream(ctx, "create-run", rest),
+        "resume" => command_resume(ctx, rest),
+        "safe-next" => command_safe_next(ctx, rest),
+        "amend" => command_amend(ctx, rest),
+        "rm" => command_rm(rest),
+        "prune-runs" => command_prune_runs(rest),
+        "run" | "interview" => {
+            let code = task_flow_stream(ctx, command, rest)?;
+            Ok(ExitCode::from(code as u8))
+        }
+        other => Err(format!("Unknown internal command: {other}")),
+    }
 }
 
 fn parse_root_limit(args: &[String]) -> Result<(PathBuf, usize), String> {
@@ -135,13 +219,27 @@ fn command_runs(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn command_delegate_run_stage_stream(ctx: &Context, subcommand: &str, args: &[String]) -> Result<ExitCode, String> {
+fn command_delegate_run_stage_stream(
+    ctx: &Context,
+    subcommand: &str,
+    args: &[String],
+) -> Result<ExitCode, String> {
     if args.is_empty() {
         return Err(format!("Command `{subcommand}` requires <run_dir>."));
     }
     let run_dir = PathBuf::from(&args[0]);
     let extra: Vec<&str> = args[1..].iter().map(|value| value.as_str()).collect();
     let code = run_stage_stream(ctx, &run_dir, subcommand, &extra)?;
+    Ok(ExitCode::from(code as u8))
+}
+
+fn command_task_flow_delegate_stream(
+    ctx: &Context,
+    subcommand: &str,
+    args: &[String],
+) -> Result<ExitCode, String> {
+    let forwarded: Vec<String> = args.to_vec();
+    let code = task_flow_stream(ctx, subcommand, &forwarded)?;
     Ok(ExitCode::from(code as u8))
 }
 
@@ -157,7 +255,7 @@ fn command_resume(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
         match args[index].as_str() {
             "--until" => {
                 index += 1;
-                until = args.get(index).ok_or("--until requires a value")?.clone();
+                until.clone_from(args.get(index).ok_or("--until requires a value")?);
             }
             "--auto-approve" => auto_approve = true,
             other => return Err(format!("Unexpected argument for resume: {other}")),
@@ -166,12 +264,48 @@ fn command_resume(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
     }
     let result = automate_run(ctx, &run_dir, &until, auto_approve)?;
     if !result.stdout.trim().is_empty() {
-        println!("{}", result.stdout.trim_end());
+        print!("{}", result.stdout);
+        std::io::stdout().flush().ok();
     }
     if !result.stderr.trim().is_empty() {
-        eprintln!("{}", result.stderr.trim_end());
+        eprint!("{}", result.stderr);
+        std::io::stderr().flush().ok();
     }
     Ok(ExitCode::from(result.code as u8))
+}
+
+fn command_safe_next(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err("safe-next requires <run_dir>".to_string());
+    }
+    let run_dir = PathBuf::from(&args[0]);
+    let report = doctor_report(ctx, &run_dir)?;
+    let action = report.safe_next_action.trim();
+    if action.is_empty() || action == "none" {
+        println!("No action to run.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if action == "start-solvers" {
+        let code = run_stage_stream(ctx, &run_dir, "start-solvers", &[])?;
+        return Ok(ExitCode::from(code as u8));
+    }
+    if action == "rerun" {
+        let code = run_stage_stream(ctx, &run_dir, "rerun", &[])?;
+        return Ok(ExitCode::from(code as u8));
+    }
+    if let Some(stage) = action.strip_prefix("start ") {
+        let code = run_stage_stream(ctx, &run_dir, "start", &[stage.trim()])?;
+        return Ok(ExitCode::from(code as u8));
+    }
+    if let Some(stage) = action.strip_prefix("step-back ") {
+        let code = run_stage_stream(ctx, &run_dir, "step-back", &[stage.trim()])?;
+        return Ok(ExitCode::from(code as u8));
+    }
+    if let Some(stage) = action.strip_prefix("recheck ") {
+        let code = run_stage_stream(ctx, &run_dir, "recheck", &[stage.trim()])?;
+        return Ok(ExitCode::from(code as u8));
+    }
+    Err(format!("Unsupported safe-next-action: {action}"))
 }
 
 fn command_amend(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
@@ -192,11 +326,13 @@ fn command_amend(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {
             }
             "--note-file" => {
                 index += 1;
-                note_file = Some(PathBuf::from(args.get(index).ok_or("--note-file requires a value")?));
+                note_file = Some(PathBuf::from(
+                    args.get(index).ok_or("--note-file requires a value")?,
+                ));
             }
             "--rewind" => {
                 index += 1;
-                rewind = args.get(index).ok_or("--rewind requires a value")?.clone();
+                rewind.clone_from(args.get(index).ok_or("--rewind requires a value")?);
             }
             "--auto-refresh-prompts" => auto_refresh = true,
             other => return Err(format!("Unexpected argument for amend: {other}")),
@@ -296,9 +432,13 @@ fn command_prune_runs(args: &[String]) -> Result<ExitCode, String> {
 fn confirm(prompt: &str) -> Result<bool, String> {
     use std::io::{self, Write};
     print!("{prompt}");
-    io::stdout().flush().map_err(|err| format!("Could not flush stdout: {err}"))?;
+    io::stdout()
+        .flush()
+        .map_err(|err| format!("Could not flush stdout: {err}"))?;
     let mut line = String::new();
-    io::stdin().read_line(&mut line).map_err(|err| format!("Could not read input: {err}"))?;
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|err| format!("Could not read input: {err}"))?;
     let answer = line.trim().to_lowercase();
     Ok(answer == "y" || answer == "yes")
 }
