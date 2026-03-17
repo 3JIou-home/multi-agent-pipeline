@@ -58,6 +58,9 @@ pub fn active_job_state(run_dir: &Path) -> Option<RuntimeJobState> {
     if !state.is_active() {
         return None;
     }
+    if state.exit_code.is_some() {
+        return None;
+    }
     if state.pid <= 0 && state.pgid <= 0 {
         let age = unix_now().saturating_sub(state.updated_at_unix);
         if age <= 15 {
@@ -175,6 +178,22 @@ pub fn update_job_process(
     state.pgid = pgid;
     if let Some(status) = status {
         state.status = status.to_string();
+    }
+    state.updated_at_unix = unix_now();
+    write_job_state(run_dir, &state)
+}
+
+pub fn update_job_stage(
+    run_dir: &Path,
+    stage: Option<&str>,
+    command_hint: Option<&str>,
+) -> Result<(), String> {
+    let Some(mut state) = load_job_state(run_dir) else {
+        return Ok(());
+    };
+    state.stage = stage.map(|value| value.to_string());
+    if let Some(command_hint) = command_hint {
+        state.command_hint = command_hint.to_string();
     }
     state.updated_at_unix = unix_now();
     write_job_state(run_dir, &state)
@@ -406,7 +425,8 @@ fn unix_now() -> u64 {
 mod tests {
     use super::{
         active_job_state, cancel_request_path, clear_interrupt_request, finish_job,
-        interrupt_requested, process_log_path, request_interrupt, start_job, tail_process_log,
+        interrupt_requested, load_job_state, process_log_path, request_interrupt, start_job,
+        tail_process_log, touch_job, update_job_stage,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -471,6 +491,41 @@ mod tests {
         clear_interrupt_request(&run_dir).expect("clear interrupt");
         assert!(!interrupt_requested(&run_dir));
 
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn exit_code_marks_running_status_as_inactive() {
+        let run_dir = temp_run_dir("terminal-exit-code");
+        start_job(&run_dir, "rerun", None, "rerun", 0, 0).expect("start job");
+        finish_job(&run_dir, "completed", Some(0), Some("done")).expect("finish job");
+        touch_job(&run_dir, "running").expect("simulate stale heartbeat");
+
+        assert!(active_job_state(&run_dir).is_none());
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn update_job_stage_rewrites_stage_for_active_job() {
+        let run_dir = temp_run_dir("update-stage");
+        start_job(
+            &run_dir,
+            "resume",
+            Some("intake"),
+            "resume until verification",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start job");
+
+        update_job_stage(&run_dir, Some("solver-a"), None).expect("update job stage");
+        let state = load_job_state(&run_dir).expect("load job state");
+
+        assert_eq!(state.stage.as_deref(), Some("solver-a"));
+        assert_eq!(state.command_hint, "resume until verification");
+
+        finish_job(&run_dir, "completed", Some(0), Some("done")).expect("finish job");
         let _ = fs::remove_dir_all(run_dir);
     }
 }

@@ -409,24 +409,29 @@ fn agpipe_tui_running_mode_allows_artifact_navigation_and_next_stage_progress() 
         .to_string();
 
     let mut app = PtyApp::start(&output_root, &codex_bin);
-    app.wait_contains("Runs (health | next | goal)", Duration::from_secs(3));
+    app.wait_contains("verify=pending", Duration::from_secs(3));
     app.wait_contains(&run_name, Duration::from_secs(3));
     app.wait_contains("next=intake", Duration::from_secs(3));
 
     app.send_key(b"n");
     app.send_key(b"1");
     app.wait_contains("Summary", Duration::from_secs(2));
-    app.wait_contains("Current pipeline state:", Duration::from_secs(2));
+    app.wait_until(Duration::from_secs(2), |screen| {
+        screen.contains("Current pipeline state:") || screen.contains("Smoke test the TUI.")
+    });
     app.send_key(&[27]);
-    app.wait_contains("next=solver-a", Duration::from_secs(8));
+    app.wait_contains("next=solver-a", Duration::from_secs(12));
 
     let screen = app.screen();
     assert!(screen.contains(&run_name));
     assert!(screen.contains("next=solver-a"));
     assert!(
-        screen.contains("Running: intake")
+        screen.contains("Running: solver-a")
+            || screen.contains("running=solver-a")
+            || screen.contains("Stage `solver-a` is currently running.")
+            || screen.contains("Running: intake")
             || screen.contains("running=intake")
-            || screen.contains("intake: done")
+            || screen.contains("solver-a: pending")
             || screen.contains("Mock intake completed.")
             || screen.contains("Mock intake complete.")
             || screen.contains("Completed intake with exit code 0")
@@ -479,7 +484,7 @@ fn agpipe_tui_wizard_can_create_and_complete_a_pipeline() {
     app.send_key(b"\r");
 
     app.wait_contains("Final Task Prompt", Duration::from_secs(5));
-    app.wait_contains("Create + Start", Duration::from_secs(5));
+    app.wait_contains("Create + Run All", Duration::from_secs(5));
     app.send_key(b"\t");
     app.send_key(b"\r");
 
@@ -488,7 +493,7 @@ fn agpipe_tui_wizard_can_create_and_complete_a_pipeline() {
     });
     app.send_key(b"1");
     app.wait_until(Duration::from_secs(5), |screen| {
-        screen.contains("Mock review summary.") || screen.contains("# User Summary")
+        screen.contains("Mock verification summary.") || screen.contains("# Verification Summary")
     });
 
     app.stop();

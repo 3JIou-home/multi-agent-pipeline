@@ -1,4 +1,5 @@
 use curl::easy::{Easy, List};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
@@ -6,14 +7,14 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::CStr;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ROLE_MAP_REF: &str = "references/agency-role-map.md";
 const REVIEW_RUBRIC_REF: &str = "references/review-rubric.md";
@@ -38,6 +39,22 @@ const REVIEWER_STACK: [&str; 3] = [
     "support/support-executive-summary-generator.md",
 ];
 const ANGLE_SEQUENCE: [&str; 3] = ["implementation-first", "architecture-first", "risk-first"];
+const RESEARCH_ANGLE_SEQUENCE: [&str; 3] = ["breadth-first", "evidence-first", "risk-first"];
+const AI_REVIEWER_STACK: [&str; 3] = [
+    "testing/testing-reality-checker.md",
+    "testing/testing-tool-evaluator.md",
+    "testing/testing-test-results-analyzer.md",
+];
+const RESEARCH_REVIEWER_STACK: [&str; 3] = [
+    "testing/testing-reality-checker.md",
+    "testing/testing-tool-evaluator.md",
+    "support/support-analytics-reporter.md",
+];
+const DOCS_REVIEWER_STACK: [&str; 3] = [
+    "engineering/engineering-technical-writer.md",
+    "testing/testing-reality-checker.md",
+    "support/support-executive-summary-generator.md",
+];
 const PLACEHOLDER_PREFIXES: [&str; 3] = ["pending ", "fill this file", "fill this"];
 const RESPONSES_DOC_MAX_CHARS_PER_DOC: usize = 20_000;
 const RESPONSES_DOC_TOTAL_CHARS: usize = 80_000;
@@ -45,6 +62,10 @@ const RESPONSES_POLL_MAX_ATTEMPTS: u32 = 300;
 const RESPONSES_HTTP_MAX_ATTEMPTS: u32 = 4;
 const RESPONSES_VERIFICATION_WORKSPACE_MAX_FILES: usize = 12;
 const RESPONSES_VERIFICATION_WORKSPACE_MAX_FILE_BYTES: usize = 64 * 1024;
+const RUNTIME_CHECK_SPEC_REF: &str = ".agpipe/runtime-check.json";
+const RUNTIME_CHECK_LEGACY_SPEC_REF: &str = "agpipe.runtime-check.json";
+const SERVICE_CHECK_SPEC_REF: &str = ".agpipe/service-check.json";
+const SERVICE_CHECK_LEGACY_SPEC_REF: &str = "agpipe.service-check.json";
 
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -64,6 +85,10 @@ pub struct Context {
 pub trait EngineObserver: Send + Sync {
     fn process_started(&self, _pid: i32, _pgid: i32) {}
     fn line(&self, _line: &str) {}
+    fn stage_changed(&self, _stage: &str) {}
+    fn interrupt_run_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 thread_local! {
@@ -82,8 +107,8 @@ where
     })
 }
 
-fn engine_observer_present() -> bool {
-    ENGINE_OBSERVER.with(|slot| slot.borrow().is_some())
+fn current_engine_observer() -> Option<Arc<dyn EngineObserver>> {
+    ENGINE_OBSERVER.with(|slot| slot.borrow().as_ref().map(Arc::clone))
 }
 
 fn notify_process_started(pid: i32, pgid: i32) {
@@ -100,6 +125,22 @@ fn notify_output_line(line: &str) {
             observer.line(line);
         }
     });
+}
+
+fn notify_stage_changed(stage: &str) {
+    ENGINE_OBSERVER.with(|slot| {
+        if let Some(observer) = slot.borrow().as_ref() {
+            observer.stage_changed(stage);
+        }
+    });
+}
+
+fn current_interrupt_run_dir() -> Option<PathBuf> {
+    ENGINE_OBSERVER.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|observer| observer.interrupt_run_dir())
+    })
 }
 
 impl Context {
@@ -203,9 +244,28 @@ pub struct DoctorPayload {
     #[serde(default)]
     pub safe_next_action: String,
     #[serde(default)]
+    pub last_attempt: Option<RuntimeAttemptPayload>,
+    #[serde(default)]
     pub issues: Vec<DoctorIssue>,
     #[serde(default)]
     pub warnings: Vec<DoctorIssue>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RuntimeAttemptPayload {
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub command_hint: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub message: String,
 }
 
 #[allow(dead_code)]
@@ -223,6 +283,8 @@ pub struct StatusPayload {
     pub goal: String,
     #[serde(default)]
     pub next: String,
+    #[serde(default)]
+    pub last_attempt: Option<RuntimeAttemptPayload>,
 }
 
 #[allow(dead_code)]
@@ -605,6 +667,176 @@ enum PipelineStageKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ServiceCheckSpec {
+    #[serde(default)]
+    version: u8,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    workdir: String,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    prepare_commands: Vec<String>,
+    #[serde(default)]
+    start_command: String,
+    #[serde(default)]
+    ready_command: String,
+    #[serde(default)]
+    ready_timeout_secs: u64,
+    #[serde(default)]
+    ready_interval_ms: u64,
+    #[serde(default)]
+    stop_command: String,
+    #[serde(default)]
+    cleanup_commands: Vec<String>,
+    #[serde(default)]
+    compose_file: String,
+    #[serde(default)]
+    compose_services: Vec<String>,
+    #[serde(default)]
+    compose_project_name: String,
+    #[serde(default)]
+    scenarios: Vec<ServiceCheckScenario>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ServiceCheckScenario {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    expect_exit_code: i32,
+    #[serde(default)]
+    expect_stdout_contains: Vec<String>,
+    #[serde(default)]
+    expect_stderr_contains: Vec<String>,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    expect_status: u32,
+    #[serde(default)]
+    expect_body_contains: Vec<String>,
+    #[serde(default)]
+    expect_body_not_contains: Vec<String>,
+    #[serde(default)]
+    rows: u16,
+    #[serde(default)]
+    cols: u16,
+    #[serde(default)]
+    steps: Vec<ServiceCheckStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ServiceCheckScenarioResult {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    exit_code: i32,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    failure_reason: String,
+    #[serde(default)]
+    stdout_path: String,
+    #[serde(default)]
+    stderr_path: String,
+    #[serde(default)]
+    screen_path: String,
+    #[serde(default)]
+    details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ServiceCheckSummary {
+    #[serde(default)]
+    version: u8,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    spec_path: String,
+    #[serde(default)]
+    workdir: String,
+    #[serde(default)]
+    started_at: String,
+    #[serde(default)]
+    finished_at: String,
+    #[serde(default)]
+    ready_status: String,
+    #[serde(default)]
+    ready_failure: String,
+    #[serde(default)]
+    start_log: String,
+    #[serde(default)]
+    error_messages: Vec<String>,
+    #[serde(default)]
+    scenarios: Vec<ServiceCheckScenarioResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ServiceCheckStep {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    pattern: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    timeout_secs: u64,
+    #[serde(default)]
+    expect_exit_code: i32,
+    #[serde(default)]
+    expect_stdout_contains: Vec<String>,
+    #[serde(default)]
+    expect_stderr_contains: Vec<String>,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    expect_status: u32,
+    #[serde(default)]
+    expect_body_contains: Vec<String>,
+    #[serde(default)]
+    expect_body_not_contains: Vec<String>,
+    #[serde(default)]
+    rows: u16,
+    #[serde(default)]
+    cols: u16,
+    #[serde(default)]
+    wait_ms: u64,
+    #[serde(default)]
+    keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct InterviewQuestion {
     #[serde(default)]
     id: String,
@@ -641,6 +873,13 @@ enum StageBackendKind {
     Codex,
     Responses,
     LocalTemplate(LocalTemplateKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage0BackendMode {
+    Codex,
+    Responses,
+    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1370,12 +1609,128 @@ fn infer_complexity(task: &str) -> String {
     }
 }
 
-fn solver_count_for(complexity: &str) -> usize {
-    match complexity {
+fn solver_count_for(
+    task_kind: &str,
+    complexity: &str,
+    execution_mode: &str,
+    workstream_hints: &[WorkstreamHint],
+) -> usize {
+    let mut count = match complexity {
         "low" => 1,
         "medium" => 2,
         _ => 3,
+    };
+    if matches!(task_kind, "research" | "docs") {
+        count = count.max(2);
     }
+    if execution_mode == "decomposed" && workstream_hints.len() >= 2 {
+        count = count.max(2);
+    }
+    if workstream_hints.len() >= 3 {
+        count = count.max(3);
+    }
+    count.clamp(1, 3)
+}
+
+fn angle_sequence_for(task_kind: &str) -> &'static [&'static str] {
+    if matches!(task_kind, "research" | "docs") {
+        &RESEARCH_ANGLE_SEQUENCE
+    } else {
+        &ANGLE_SEQUENCE
+    }
+}
+
+fn reviewer_stack_for(task_kind: &str) -> Vec<String> {
+    let stack = match task_kind {
+        "ai" => &AI_REVIEWER_STACK[..],
+        "research" => &RESEARCH_REVIEWER_STACK[..],
+        "docs" => &DOCS_REVIEWER_STACK[..],
+        _ => &REVIEWER_STACK[..],
+    };
+    stack.iter().map(|item| item.to_string()).collect()
+}
+
+fn task_requests_workspace_changes(task: &str) -> bool {
+    let text = task.to_lowercase();
+    [
+        "implement",
+        "implementation",
+        "edit file",
+        "edit the repo",
+        "change code",
+        "write code",
+        "patch",
+        "fix",
+        "refactor",
+        "integrate",
+        "migrate",
+        "build service",
+        "create service",
+        "create cli",
+        "создай сервис",
+        "создай cli",
+        "реализ",
+        "внедр",
+        "исправ",
+        "патч",
+        "рефактор",
+        "измени код",
+        "отредакт",
+        "добавь",
+        "мигрир",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+}
+
+fn task_is_analysis_only(task: &str) -> bool {
+    if task_requests_workspace_changes(task) {
+        return false;
+    }
+    let text = task.to_lowercase();
+    let signals = [
+        "compare",
+        "evaluate",
+        "research",
+        "recommend",
+        "proposal",
+        "summary",
+        "spec",
+        "analyze",
+        "analysis",
+        "audit",
+        "review",
+        "investigate",
+        "document",
+        "plan",
+        "design proposal",
+        "сравн",
+        "оцен",
+        "исслед",
+        "рекомен",
+        "предлож",
+        "резюме",
+        "спек",
+        "анализ",
+        "аудит",
+        "обзор",
+        "план",
+    ];
+    signals
+        .iter()
+        .filter(|signal| text.contains(**signal))
+        .count()
+        >= 2
+}
+
+fn default_pipeline_includes_execution(task_kind: &str, task: &str) -> bool {
+    if task_is_analysis_only(task) {
+        return false;
+    }
+    if !matches!(task_kind, "research" | "docs") {
+        return true;
+    }
+    task_requests_workspace_changes(task)
 }
 
 fn infer_token_budget(complexity: &str) -> TokenBudget {
@@ -1745,6 +2100,7 @@ fn detect_host_facts(source: &str) -> HostFacts {
 }
 
 fn choose_roles(task_kind: &str, solver_count: usize) -> Vec<SolverRole> {
+    let angles = angle_sequence_for(task_kind);
     role_matrix(task_kind)
         .into_iter()
         .take(solver_count)
@@ -1752,7 +2108,7 @@ fn choose_roles(task_kind: &str, solver_count: usize) -> Vec<SolverRole> {
         .map(|(index, role)| SolverRole {
             solver_id: format!("solver-{}", (b'a' + index as u8) as char),
             role: role.to_string(),
-            angle: ANGLE_SEQUENCE
+            angle: angles
                 .get(index)
                 .copied()
                 .unwrap_or("implementation-first")
@@ -2406,6 +2762,13 @@ fn stage_input_paths(
             if probe.exists() {
                 paths.push(probe);
             }
+            if let Some(spec) = discover_service_check_spec_path(run_dir) {
+                paths.push(spec);
+            }
+            let summary = service_check_summary_json_path(run_dir, "execution");
+            if summary.exists() {
+                paths.push(summary);
+            }
         }
         PipelineStageKind::Verification => {
             paths.push(run_dir.join("brief.md"));
@@ -2421,6 +2784,19 @@ fn stage_input_paths(
             let probe = host_probe_path(run_dir);
             if probe.exists() {
                 paths.push(probe);
+            }
+            if let Some(spec) = discover_service_check_spec_path(run_dir) {
+                paths.push(spec);
+            }
+            for phase in ["execution", "verification"] {
+                let summary_json = service_check_summary_json_path(run_dir, phase);
+                if summary_json.exists() {
+                    paths.push(summary_json);
+                }
+                let summary_md = service_check_summary_md_path(run_dir, phase);
+                if summary_md.exists() {
+                    paths.push(summary_md);
+                }
             }
         }
     }
@@ -2640,7 +3016,7 @@ fn save_token_ledger(run_dir: &Path, ledger: &RunTokenLedger) -> Result<(), Stri
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_token_usage(
+fn record_token_usage_with_replacement(
     run_dir: &Path,
     plan: &Plan,
     stage: &str,
@@ -2649,8 +3025,14 @@ fn record_token_usage(
     prompt_hashes: &PromptCacheHashes,
     workspace_hash: &str,
     usage: &TokenUsage,
+    replace_modes: &[&str],
 ) -> Result<(), String> {
     let mut ledger = load_token_ledger(run_dir, plan)?;
+    ledger.entries.retain(|entry| {
+        !(entry.stage == stage
+            && entry.cache_key == cache_key
+            && replace_modes.contains(&entry.mode.as_str()))
+    });
     ledger.updated_at = iso_timestamp();
     ledger.entries.push(RunTokenLedgerEntry {
         stage: stage.to_string(),
@@ -2662,6 +3044,30 @@ fn record_token_usage(
         usage: usage.clone(),
     });
     save_token_ledger(run_dir, &ledger)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_token_usage(
+    run_dir: &Path,
+    plan: &Plan,
+    stage: &str,
+    mode: &str,
+    cache_key: &str,
+    prompt_hashes: &PromptCacheHashes,
+    workspace_hash: &str,
+    usage: &TokenUsage,
+) -> Result<(), String> {
+    record_token_usage_with_replacement(
+        run_dir,
+        plan,
+        stage,
+        mode,
+        cache_key,
+        prompt_hashes,
+        workspace_hash,
+        usage,
+        &[],
+    )
 }
 
 fn summarize_token_ledger(run_dir: &Path, plan: &Plan) -> Result<RunTokenSummary, String> {
@@ -2699,6 +3105,18 @@ fn summarize_token_ledger(run_dir: &Path, plan: &Plan) -> Result<RunTokenSummary
         None
     };
     Ok(summary)
+}
+
+fn provisional_token_usage_for_prompt(prompt: &str) -> TokenUsage {
+    let prompt_tokens = estimate_token_count(&normalize_prompt_for_cache(prompt));
+    TokenUsage {
+        source: "estimated-prompt-start".to_string(),
+        prompt_tokens,
+        cached_prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: prompt_tokens,
+        estimated_saved_tokens: 0,
+    }
 }
 
 fn format_size(size_bytes: u64) -> String {
@@ -3046,6 +3464,7 @@ fn normalize_pipeline_stage_specs(
     _plan: &Plan,
 ) -> Result<Vec<PipelineStageSpec>, String> {
     let mut stages = config.stages.clone();
+    let angles = angle_sequence_for(&_plan.task_kind);
     if stages.is_empty() {
         return Ok(Vec::new());
     }
@@ -3080,7 +3499,7 @@ fn normalize_pipeline_stage_specs(
                 .iter()
                 .filter(|item| item.kind == "solver")
                 .count();
-            stage.angle = ANGLE_SEQUENCE[solver_index % ANGLE_SEQUENCE.len()].to_string();
+            stage.angle = angles[solver_index % angles.len()].to_string();
         }
         if !seen.insert(stage.id.clone()) {
             return Err(format!("Duplicate pipeline stage id `{}`.", stage.id));
@@ -3167,6 +3586,7 @@ fn default_pipeline_stage_specs(plan: &Plan, run_dir: Option<&Path>) -> Vec<Pipe
         .iter()
         .map(|item| (item.solver_id.clone(), item.clone()))
         .collect();
+    let angles = angle_sequence_for(&plan.task_kind);
     let mut stages = vec![PipelineStageSpec {
         id: "intake".to_string(),
         kind: "intake".to_string(),
@@ -3180,7 +3600,7 @@ fn default_pipeline_stage_specs(plan: &Plan, run_dir: Option<&Path>) -> Vec<Pipe
                 .unwrap_or(SolverRole {
                     solver_id: solver_id.clone(),
                     role: "engineering/engineering-senior-developer.md".to_string(),
-                    angle: ANGLE_SEQUENCE[index % ANGLE_SEQUENCE.len()].to_string(),
+                    angle: angles[index % angles.len()].to_string(),
                 })
         });
         stages.push(PipelineStageSpec {
@@ -3197,11 +3617,13 @@ fn default_pipeline_stage_specs(plan: &Plan, run_dir: Option<&Path>) -> Vec<Pipe
         kind: "review".to_string(),
         ..PipelineStageSpec::default()
     });
-    stages.push(PipelineStageSpec {
-        id: "execution".to_string(),
-        kind: "execution".to_string(),
-        ..PipelineStageSpec::default()
-    });
+    if default_pipeline_includes_execution(&plan.task_kind, &plan.original_task) {
+        stages.push(PipelineStageSpec {
+            id: "execution".to_string(),
+            kind: "execution".to_string(),
+            ..PipelineStageSpec::default()
+        });
+    }
     stages.push(PipelineStageSpec {
         id: "verification".to_string(),
         kind: "verification".to_string(),
@@ -3232,6 +3654,7 @@ fn apply_pipeline_solver_defaults(plan: &mut Plan, run_dir: Option<&Path>) -> Re
         .filter(|stage| pipeline_kind_from_str(&stage.kind) == Some(PipelineStageKind::Solver))
         .count();
     let default_roles = choose_roles(&plan.task_kind, std::cmp::max(1, solver_total));
+    let angles = angle_sequence_for(&plan.task_kind);
     let mut solver_index = 0usize;
     let mut solver_roles = Vec::new();
     for stage in &mut stages {
@@ -3239,15 +3662,18 @@ fn apply_pipeline_solver_defaults(plan: &mut Plan, run_dir: Option<&Path>) -> Re
             continue;
         }
         if stage.role_source.trim().eq_ignore_ascii_case("auto") || stage.role.trim().is_empty() {
-            let fallback = default_roles.get(solver_index).cloned().unwrap_or(SolverRole {
-                solver_id: stage.id.clone(),
-                role: "engineering/engineering-senior-developer.md".to_string(),
-                angle: ANGLE_SEQUENCE[solver_index % ANGLE_SEQUENCE.len()].to_string(),
-            });
+            let fallback = default_roles
+                .get(solver_index)
+                .cloned()
+                .unwrap_or(SolverRole {
+                    solver_id: stage.id.clone(),
+                    role: "engineering/engineering-senior-developer.md".to_string(),
+                    angle: angles[solver_index % angles.len()].to_string(),
+                });
             stage.role = fallback.role;
         }
         if stage.angle.trim().is_empty() {
-            stage.angle = ANGLE_SEQUENCE[solver_index % ANGLE_SEQUENCE.len()].to_string();
+            stage.angle = angles[solver_index % angles.len()].to_string();
         }
         solver_roles.push(SolverRole {
             solver_id: stage.id.clone(),
@@ -3855,7 +4281,7 @@ fn render_review_prompt(run_dir: &Path, plan: &Plan) -> String {
                 run_dir.join("review").join("scorecard.json").display().to_string(),
                 run_dir.join("review").join("user-summary.md").display().to_string(),
             ],
-            "reviewer_stack": if plan.reviewer_stack.is_empty() { REVIEWER_STACK.iter().map(|item| item.to_string()).collect::<Vec<_>>() } else { plan.reviewer_stack.clone() },
+            "reviewer_stack": if plan.reviewer_stack.is_empty() { reviewer_stack_for(&plan.task_kind) } else { plan.reviewer_stack.clone() },
             "user_summary_language": plan.summary_language,
             "stage_research_mode": plan.stage_research_mode,
             "validation_hints": plan.validation_commands,
@@ -3884,6 +4310,9 @@ fn render_review_prompt(run_dir: &Path, plan: &Plan) -> String {
 }
 
 fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
+    let validation_commands = effective_validation_commands(run_dir, plan, "execution");
+    let service_harness_expected =
+        task_looks_like_service(plan) || discover_service_check_spec_path(run_dir).is_some();
     let solution_files: Vec<String> = solver_ids(plan, run_dir)
         .into_iter()
         .map(|solver| {
@@ -3973,6 +4402,16 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
             "run the cheapest relevant validation after edits and record exact commands and outcomes".to_string(),
             "if blocked, implement the highest-value slice and state the blocker precisely".to_string(),
         ];
+        if service_harness_expected {
+            rules.push(format!(
+                "if the deliverable is a runtime target such as a service, TUI, or GUI app, keep `{}` updated so agpipe can execute realistic runtime scenarios",
+                RUNTIME_CHECK_SPEC_REF
+            ));
+            rules.push(format!(
+                "for runtime-facing work, define realistic runtime scenarios and run `{}` after implementation",
+                service_check_validation_command(run_dir, "execution")
+            ));
+        }
         if review_present {
             rules.insert(
                 2,
@@ -3998,7 +4437,7 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
                 "validation performed",
                 "remaining blockers and next steps"
             ],
-            "validation_hints": plan.validation_commands
+            "validation_hints": validation_commands
         }));
     }
     let review_section = if review_present {
@@ -4029,11 +4468,14 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
         plan.stage_research_mode,
         cache_config_from_plan(plan).policy,
         cache_config_from_plan(plan).root,
-        bullet_list(plan.validation_commands.iter().map(|item| item.as_str()))
+        bullet_list(validation_commands.iter().map(|item| item.as_str()))
     )
 }
 
 fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
+    let validation_commands = effective_validation_commands(run_dir, plan, "verification");
+    let service_harness_expected =
+        task_looks_like_service(plan) || discover_service_check_spec_path(run_dir).is_some();
     let review_present = first_stage_id_for_kind(plan, run_dir, PipelineStageKind::Review)
         .ok()
         .flatten()
@@ -4081,6 +4523,39 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
             );
         }
         reads.push(VERIFICATION_RUBRIC_REF.to_string());
+        let mut rules = vec![
+            "act in code-review mode: prioritize bugs, regressions, unsafe behavior, and missing validation".to_string(),
+            "run the cheapest relevant checks first and record exact evidence or blockers".to_string(),
+            "write findings ordered by severity with file references when possible".to_string(),
+            "verify device choice against host_facts from plan.json when relevant".to_string(),
+            "set goal_complete=false when any critical plan goal check remains missing, unverified, or replaced by a placeholder implementation".to_string(),
+            "if there are no meaningful findings, say so explicitly".to_string(),
+        ];
+        if service_harness_expected {
+            rules.push(format!(
+                "when `{}` exists, treat the latest runtime-check summary as runtime evidence and reconcile any failed scenarios with the actual implementation",
+                RUNTIME_CHECK_SPEC_REF
+            ));
+        }
+        if execution_present {
+            rules.insert(
+                0,
+                "review the actual workspace implementation, not only the plans".to_string(),
+            );
+            rules.insert(
+                2,
+                "start from execution/report.md and the review verdict".to_string(),
+            );
+        } else {
+            rules.insert(
+                0,
+                "audit the produced research or documentation artifacts against the brief, and verify any workspace-dependent claims against actual files when they matter".to_string(),
+            );
+            rules.insert(
+                2,
+                "start from the review verdict and solver evidence; inspect the workspace only where the recommendation depends on current code state".to_string(),
+            );
+        }
         return compact_lines(&json!({
             "stage": "verification",
             "mode": "audit",
@@ -4092,19 +4567,10 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
                 run_dir.join("verification").join("augmented-task.md").display().to_string(),
                 run_dir.join("verification").join("goal-status.json").display().to_string()
             ],
-            "validation_hints": plan.validation_commands,
+            "validation_hints": validation_commands,
             "user_summary_language": plan.summary_language,
             "stage_research_mode": plan.stage_research_mode,
-            "rules": [
-                "review the actual workspace implementation, not only the plans",
-                "act in code-review mode: prioritize bugs, regressions, unsafe behavior, and missing validation",
-                "start from execution/report.md and the review verdict",
-                "run the cheapest relevant checks first and record exact evidence or blockers",
-                "write findings ordered by severity with file references when possible",
-                "verify device choice against host_facts from plan.json when relevant",
-                "set goal_complete=false when any critical plan goal check remains missing, unverified, or replaced by a placeholder implementation",
-                "if there are no meaningful findings, say so explicitly"
-            ]
+            "rules": rules
         }));
     }
     let review_lines = if review_present {
@@ -4134,13 +4600,13 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
         execution_line,
         VERIFICATION_RUBRIC_REF,
         plan.stage_research_mode,
-        bullet_list(plan.validation_commands.iter().map(|item| item.as_str()))
+        bullet_list(validation_commands.iter().map(|item| item.as_str()))
     )
 }
 
 fn ensure_reviewer_stack(plan: &mut Plan) {
     if plan.reviewer_stack.is_empty() {
-        plan.reviewer_stack = REVIEWER_STACK.iter().map(|item| item.to_string()).collect();
+        plan.reviewer_stack = reviewer_stack_for(&plan.task_kind);
     }
 }
 
@@ -4297,15 +4763,20 @@ fn create_run(
     });
     let task_kind = infer_task_kind(task_text);
     let complexity = infer_complexity(task_text);
-    let solver_count = solver_count_for(&complexity);
-    let execution_mode = infer_execution_mode(&task_kind, &complexity, task_text);
     let workstream_hints = workstream_hints_for(&task_kind, task_text);
+    let execution_mode = infer_execution_mode(&task_kind, &complexity, task_text);
+    let mut solver_count =
+        solver_count_for(&task_kind, &complexity, &execution_mode, &workstream_hints);
+    if !default_pipeline_includes_execution(&task_kind, task_text) {
+        solver_count = solver_count.max(2);
+    }
     let goal_checks = infer_goal_checks(task_text, &task_kind, &workstream_hints);
     let token_budget = infer_token_budget(&complexity);
     let stack_signals = detect_stack(&workspace);
     let host_facts = detect_host_facts("init_run_local_rust");
     let validation_commands = build_validation_commands(&workspace, &stack_signals);
     let roles = choose_roles(&task_kind, solver_count);
+    let reviewer_stack = reviewer_stack_for(&task_kind);
     let run_dir =
         output_dir
             .expanduser()
@@ -4344,7 +4815,7 @@ fn create_run(
         goal_gate_enabled: true,
         augmented_follow_up_enabled: true,
         goal_checks,
-        reviewer_stack: REVIEWER_STACK.iter().map(|item| item.to_string()).collect(),
+        reviewer_stack,
         stack_signals,
         validation_commands,
         references: BTreeMap::from([
@@ -4710,6 +5181,7 @@ fn available_stages(run_dir: &Path) -> Result<Vec<String>, String> {
 }
 
 fn sync_run_artifacts(ctx: &Context, run_dir: &Path) -> Result<(), String> {
+    check_run_interrupt(run_dir)?;
     let mut plan = load_plan(run_dir)?;
     apply_pipeline_solver_defaults(&mut plan, Some(run_dir))?;
     ensure_reviewer_stack(&mut plan);
@@ -4720,10 +5192,12 @@ fn sync_run_artifacts(ctx: &Context, run_dir: &Path) -> Result<(), String> {
         .map_err(|err| format!("Could not create host dir: {err}"))?;
 
     for stage in pipeline {
+        check_run_interrupt(run_dir)?;
         let prompt_path = stage_prompt_path(run_dir, &stage.id)?;
         let prompt = render_stage_prompt(run_dir, &stage.id)?;
         write_text(&prompt_path, &prompt)?;
         for (path, content) in stage_placeholder_content(&plan, run_dir, &stage.id)? {
+            check_run_interrupt(run_dir)?;
             if path.exists() {
                 if path.ends_with("review/user-summary.md")
                     && review_complete_without_summary(run_dir)
@@ -4735,6 +5209,7 @@ fn sync_run_artifacts(ctx: &Context, run_dir: &Path) -> Result<(), String> {
             write_text(&path, &content)?;
         }
     }
+    check_run_interrupt(run_dir)?;
     if !backend_config_path(run_dir).exists() {
         persist_run_backend_config(run_dir, ctx)?;
     }
@@ -4833,10 +5308,14 @@ fn verification_is_stale(run_dir: &Path) -> Result<bool, String> {
     if !is_stage_complete(run_dir, &verification_stage)? {
         return Ok(false);
     }
-    let upstream = vec![
-        run_dir.join("execution").join("report.md"),
-        host_probe_path(run_dir),
-    ];
+    let mut upstream = vec![host_probe_path(run_dir)];
+    if first_stage_id_for_kind(&plan, run_dir, PipelineStageKind::Execution)?.is_some() {
+        upstream.push(run_dir.join("execution").join("report.md"));
+    } else if first_stage_id_for_kind(&plan, run_dir, PipelineStageKind::Review)?.is_some() {
+        upstream.push(run_dir.join("review").join("report.md"));
+        upstream.push(run_dir.join("review").join("scorecard.json"));
+        upstream.push(run_dir.join("review").join("user-summary.md"));
+    }
     let downstream = vec![
         run_dir.join("verification").join("findings.md"),
         run_dir.join("verification").join("user-summary.md"),
@@ -4927,6 +5406,48 @@ fn goal_state(run_dir: &Path) -> Result<String, String> {
     } else {
         "n/a".to_string()
     })
+}
+
+fn incomplete_stage_attempt(run_dir: &Path) -> Result<Option<RuntimeAttemptPayload>, String> {
+    let Some(state) = crate::runtime::load_job_state(run_dir) else {
+        return Ok(None);
+    };
+    let Some(stage) = state.stage.clone() else {
+        return Ok(None);
+    };
+    if state.is_active() {
+        return Ok(None);
+    }
+    if !available_stages(run_dir)?
+        .iter()
+        .any(|candidate| candidate == &stage)
+    {
+        return Ok(None);
+    }
+    if is_stage_complete(run_dir, &stage)? {
+        return Ok(None);
+    }
+    let message = state.message.clone().unwrap_or_else(|| {
+        if state.status == "completed" && state.exit_code == Some(0) {
+            "Tracked job reported completion, but the stage artifacts are still incomplete."
+                .to_string()
+        } else if let Some(code) = state.exit_code {
+            format!("Tracked job ended with exit code {code} before stage outputs completed.")
+        } else {
+            format!(
+                "Tracked job ended with status `{}` before stage outputs completed.",
+                state.status
+            )
+        }
+    });
+    Ok(Some(RuntimeAttemptPayload {
+        label: state.label,
+        stage,
+        command_hint: state.command_hint,
+        status: state.status,
+        exit_code: state.exit_code,
+        message,
+    }))
 }
 
 fn safe_next_action_for_run(run_dir: &Path) -> Result<String, String> {
@@ -5029,6 +5550,7 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
         first_stage_id_for_kind(&plan, run_dir, PipelineStageKind::Verification)?;
     let backend_config =
         load_run_backend_config(run_dir).unwrap_or_else(|| context_backend_config(ctx));
+    let last_attempt = incomplete_stage_attempt(run_dir)?;
 
     if matches!(
         backend_config.stage0_backend.trim().to_lowercase().as_str(),
@@ -5180,6 +5702,39 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
             fix: "Treat launcher probe as authoritative and rerun device-sensitive stages from the same host environment.".to_string(),
         });
     }
+    if let Some(attempt) = &last_attempt {
+        let fix = format!(
+            "Inspect {}/runtime/process.log and the latest stage logs, then rerun `start {}` or `safe-next` after fixing the blocker.",
+            run_dir.display(),
+            attempt.stage
+        );
+        match attempt.status.as_str() {
+            "interrupted" => warnings.push(DoctorIssue {
+                severity: "warn".to_string(),
+                message: format!(
+                    "Latest `{}` attempt for stage `{}` was interrupted before the stage completed.",
+                    attempt.label, attempt.stage
+                ),
+                fix,
+            }),
+            "completed" if attempt.exit_code == Some(0) => issues.push(DoctorIssue {
+                severity: "error".to_string(),
+                message: format!(
+                    "Latest `{}` attempt reported success for stage `{}`, but the stage artifacts are still incomplete.",
+                    attempt.label, attempt.stage
+                ),
+                fix,
+            }),
+            _ => issues.push(DoctorIssue {
+                severity: "error".to_string(),
+                message: format!(
+                    "Latest `{}` attempt for stage `{}` ended with status `{}` before the stage completed.",
+                    attempt.label, attempt.stage, attempt.status
+                ),
+                fix,
+            }),
+        }
+    }
     let goal = goal_state(run_dir)?;
     if matches!(goal.as_str(), "partial" | "blocked")
         && next_stage_for_run(run_dir)?.as_deref() != Some("rerun")
@@ -5230,6 +5785,7 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
         goal,
         next: next_stage_for_run(run_dir)?.unwrap_or_else(|| "none".to_string()),
         safe_next_action: safe_next_action_for_run(run_dir)?,
+        last_attempt,
         issues,
         warnings,
     })
@@ -5244,6 +5800,7 @@ fn status_payload(run_dir: &Path) -> Result<StatusPayload, String> {
         host_drift,
         goal: goal_state(run_dir)?,
         next: next_stage_for_run(run_dir)?.unwrap_or_else(|| "none".to_string()),
+        last_attempt: incomplete_stage_attempt(run_dir)?,
     })
 }
 
@@ -5493,6 +6050,35 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
         }
         if let Some(drift) = host_drift_message(&plan.host_facts, &host_probe) {
             dynamic_context.push(format!("- `host_drift`: {drift}"));
+        }
+    }
+    if task_looks_like_service(&plan) || discover_service_check_spec_path(run_dir).is_some() {
+        let spec_path = discover_service_check_spec_path(run_dir)
+            .unwrap_or_else(|| service_check_default_spec_path(&plan, run_dir));
+        dynamic_context.push("Runtime harness:".to_string());
+        dynamic_context.push(format!("- `spec_path`: `{}`", spec_path.display()));
+        dynamic_context.push(format!(
+            "- `runner_command`: `{}`",
+            service_check_validation_command(
+                run_dir,
+                if stage_kind == PipelineStageKind::Verification {
+                    "verification"
+                } else {
+                    "execution"
+                }
+            )
+        ));
+        if stage_kind == PipelineStageKind::Execution {
+            dynamic_context.push("- If this task produces a service, TUI, or GUI app, create or update the runtime-check spec before finishing execution.".to_string());
+        }
+        for phase in ["execution", "verification"] {
+            let summary = service_check_summary_md_path(run_dir, phase);
+            if summary.exists() {
+                dynamic_context.push(format!(
+                    "- `runtime_check_{phase}`: `{}`",
+                    summary.display()
+                ));
+            }
         }
     }
     let cache = cache_config_from_plan(&plan);
@@ -5773,6 +6359,16 @@ fn stage_context_documents(
                     read_text(&run_dir.join("solutions").join(&solver).join("RESULT.md"))?,
                 ));
             }
+            if let Some(spec) = discover_service_check_spec_path(run_dir) {
+                docs.push(("runtime-check/spec.json".to_string(), read_text(&spec)?));
+            }
+            let summary = service_check_summary_md_path(run_dir, "execution");
+            if summary.exists() {
+                docs.push((
+                    "runtime/runtime-check/execution/summary.md".to_string(),
+                    read_text(&summary)?,
+                ));
+            }
         }
         PipelineStageKind::Verification => {
             docs.push((
@@ -5813,6 +6409,18 @@ fn stage_context_documents(
             let host_probe = host_probe_path(run_dir);
             if host_probe.exists() {
                 docs.push(("host/probe.json".to_string(), read_text(&host_probe)?));
+            }
+            if let Some(spec) = discover_service_check_spec_path(run_dir) {
+                docs.push(("runtime-check/spec.json".to_string(), read_text(&spec)?));
+            }
+            for phase in ["execution", "verification"] {
+                let summary = service_check_summary_md_path(run_dir, phase);
+                if summary.exists() {
+                    docs.push((
+                        format!("runtime/runtime-check/{phase}/summary.md"),
+                        read_text(&summary)?,
+                    ));
+                }
             }
             docs.push((
                 "verification-rubric.md".to_string(),
@@ -6166,6 +6774,1565 @@ fn working_root(plan: &Plan, run_dir: &Path) -> PathBuf {
     }
 }
 
+fn service_check_runtime_dir(run_dir: &Path, phase: &str) -> PathBuf {
+    crate::runtime::runtime_dir(run_dir)
+        .join("runtime-check")
+        .join(sanitize_artifact_label(phase))
+}
+
+fn service_check_summary_json_path(run_dir: &Path, phase: &str) -> PathBuf {
+    service_check_runtime_dir(run_dir, phase).join("summary.json")
+}
+
+fn service_check_summary_md_path(run_dir: &Path, phase: &str) -> PathBuf {
+    service_check_runtime_dir(run_dir, phase).join("summary.md")
+}
+
+fn relative_to_run_dir(run_dir: &Path, path: &Path) -> String {
+    path.strip_prefix(run_dir)
+        .ok()
+        .map(|value| value.display().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn sanitize_artifact_label(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if mapped == '-' {
+            if !out.is_empty() && !last_dash {
+                out.push('-');
+            }
+            last_dash = true;
+        } else {
+            out.push(mapped);
+            last_dash = false;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "item".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn task_looks_like_service(plan: &Plan) -> bool {
+    let lower = plan.original_task.to_ascii_lowercase();
+    [
+        "service",
+        "server",
+        "api",
+        "http",
+        "grpc",
+        "daemon",
+        "worker",
+        "webhook",
+        "microservice",
+        "terminal ui",
+        "cli app",
+        "interactive terminal",
+        "desktop app",
+        "desktop application",
+        "electron",
+        "gtk",
+        "qt",
+        "swiftui",
+        "appkit",
+        "сервис",
+        "сервер",
+        "апи",
+        "интерактивный терминал",
+        "терминальный интерфейс",
+        "десктоп",
+        "настольное приложение",
+        "графический интерфейс",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn normalize_service_check_mode(mode: &str) -> String {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "docker" | "docker-compose" | "docker_compose" | "compose" => "docker-compose".to_string(),
+        "pty" => "pty".to_string(),
+        "workflow" | "scenario" => "workflow".to_string(),
+        _ => "process".to_string(),
+    }
+}
+
+fn service_check_default_spec_path(plan: &Plan, run_dir: &Path) -> PathBuf {
+    working_root(plan, run_dir).join(RUNTIME_CHECK_SPEC_REF)
+}
+
+fn service_check_candidate_paths(workspace: &Path) -> Vec<PathBuf> {
+    vec![
+        workspace.join(RUNTIME_CHECK_SPEC_REF),
+        workspace.join(RUNTIME_CHECK_LEGACY_SPEC_REF),
+        workspace.join(SERVICE_CHECK_SPEC_REF),
+        workspace.join(SERVICE_CHECK_LEGACY_SPEC_REF),
+    ]
+}
+
+fn discover_service_check_spec_path(run_dir: &Path) -> Option<PathBuf> {
+    let plan = load_plan(run_dir).ok()?;
+    let workspace = working_root(&plan, run_dir);
+    service_check_candidate_paths(&workspace)
+        .into_iter()
+        .find(|path| path.exists())
+}
+
+fn service_check_validation_command(run_dir: &Path, phase: &str) -> String {
+    format!(
+        "agpipe internal runtime-check {} --phase {}",
+        run_dir.display(),
+        phase
+    )
+}
+
+fn effective_validation_commands(run_dir: &Path, plan: &Plan, phase: &str) -> Vec<String> {
+    let mut commands = plan.validation_commands.clone();
+    if task_looks_like_service(plan) || discover_service_check_spec_path(run_dir).is_some() {
+        commands.push(service_check_validation_command(run_dir, phase));
+    }
+    let mut deduped = Vec::new();
+    for command in commands {
+        if !deduped.contains(&command) {
+            deduped.push(command);
+        }
+    }
+    deduped
+}
+
+fn runtime_check_required(run_dir: &Path, phase: &str) -> Result<bool, String> {
+    if !matches!(phase, "execution" | "verification") {
+        return Ok(false);
+    }
+    Ok(task_looks_like_service(&load_plan(run_dir)?))
+}
+
+fn load_service_check_spec(
+    run_dir: &Path,
+    explicit_spec: Option<&Path>,
+) -> Result<Option<(PathBuf, PathBuf, ServiceCheckSpec)>, String> {
+    let plan = load_plan(run_dir)?;
+    let workspace = working_root(&plan, run_dir);
+    let spec_path = if let Some(path) = explicit_spec {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            workspace.join(path)
+        }
+    } else if let Some(path) = discover_service_check_spec_path(run_dir) {
+        path
+    } else {
+        return Ok(None);
+    };
+    let text = read_text(&spec_path)?;
+    let mut spec: ServiceCheckSpec = serde_json::from_str(&text)
+        .map_err(|err| format!("Could not parse {}: {err}", spec_path.display()))?;
+    if spec.version == 0 {
+        spec.version = 1;
+    }
+    spec.mode = normalize_service_check_mode(&spec.mode);
+    if spec.ready_timeout_secs == 0 {
+        spec.ready_timeout_secs = 60;
+    }
+    if spec.ready_interval_ms == 0 {
+        spec.ready_interval_ms = 500;
+    }
+    if spec.scenarios.is_empty() {
+        return Err(format!(
+            "Runtime check spec {} must contain at least one scenario.",
+            spec_path.display()
+        ));
+    }
+    if spec.mode == "process" && spec.start_command.trim().is_empty() {
+        return Err(format!(
+            "Runtime check spec {} is missing `start_command` for process mode.",
+            spec_path.display()
+        ));
+    }
+    if spec.mode == "docker-compose" && spec.compose_file.trim().is_empty() {
+        return Err(format!(
+            "Runtime check spec {} is missing `compose_file` for docker-compose mode.",
+            spec_path.display()
+        ));
+    }
+    for (index, scenario) in spec.scenarios.iter_mut().enumerate() {
+        if scenario.id.trim().is_empty() {
+            scenario.id = format!("scenario-{}", index + 1);
+        }
+        scenario.kind = scenario.kind.trim().to_ascii_lowercase();
+        if scenario.kind.is_empty() {
+            scenario.kind = if !scenario.steps.is_empty() {
+                "workflow".to_string()
+            } else if !scenario.url.trim().is_empty() {
+                "http".to_string()
+            } else {
+                "command".to_string()
+            };
+        }
+        if scenario.expect_status == 0 && matches!(scenario.kind.as_str(), "http" | "rest") {
+            scenario.expect_status = 200;
+        }
+        if scenario.rows == 0 {
+            scenario.rows = 40;
+        }
+        if scenario.cols == 0 {
+            scenario.cols = 120;
+        }
+        match scenario.kind.as_str() {
+            "command" | "shell" | "gui-command" | "pty" => {
+                if scenario.command.trim().is_empty() {
+                    return Err(format!(
+                        "Runtime check spec {} has an empty command for scenario `{}`.",
+                        spec_path.display(),
+                        scenario.id
+                    ));
+                }
+            }
+            "http" | "rest" => {
+                if scenario.url.trim().is_empty() {
+                    return Err(format!(
+                        "Runtime check spec {} is missing `url` for scenario `{}`.",
+                        spec_path.display(),
+                        scenario.id
+                    ));
+                }
+            }
+            "workflow" => {
+                if scenario.steps.is_empty() {
+                    return Err(format!(
+                        "Runtime check spec {} has no `steps` for workflow scenario `{}`.",
+                        spec_path.display(),
+                        scenario.id
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "Runtime check spec {} uses unsupported scenario kind `{}` for `{}`.",
+                    spec_path.display(),
+                    other,
+                    scenario.id
+                ));
+            }
+        }
+        for (step_index, step) in scenario.steps.iter_mut().enumerate() {
+            step.kind = step.kind.trim().to_ascii_lowercase();
+            if step.expect_status == 0 && matches!(step.kind.as_str(), "http" | "rest") {
+                step.expect_status = 200;
+            }
+            match step.kind.as_str() {
+                "wait" | "wait_ms" | "sleep" | "pty_resize" => {}
+                "command" | "shell" | "gui-command" | "pty_start" => {
+                    if step.command.trim().is_empty() {
+                        return Err(format!(
+                            "Runtime check spec {} has an empty command for step {} in scenario `{}`.",
+                            spec_path.display(),
+                            step_index + 1,
+                            scenario.id
+                        ));
+                    }
+                }
+                "http" | "rest" => {
+                    if step.url.trim().is_empty() {
+                        return Err(format!(
+                            "Runtime check spec {} is missing `url` for step {} in scenario `{}`.",
+                            spec_path.display(),
+                            step_index + 1,
+                            scenario.id
+                        ));
+                    }
+                }
+                "file_contains" => {
+                    if step.path.trim().is_empty() || step.pattern.trim().is_empty() {
+                        return Err(format!(
+                            "Runtime check spec {} requires both `path` and `pattern` for file_contains step {} in scenario `{}`.",
+                            spec_path.display(),
+                            step_index + 1,
+                            scenario.id
+                        ));
+                    }
+                }
+                "pty_send_text" => {
+                    if step.text.is_empty() {
+                        return Err(format!(
+                            "Runtime check spec {} has an empty `text` for pty_send_text step {} in scenario `{}`.",
+                            spec_path.display(),
+                            step_index + 1,
+                            scenario.id
+                        ));
+                    }
+                }
+                "pty_send_keys" => {
+                    if step.keys.is_empty() {
+                        return Err(format!(
+                            "Runtime check spec {} requires at least one key for pty_send_keys step {} in scenario `{}`.",
+                            spec_path.display(),
+                            step_index + 1,
+                            scenario.id
+                        ));
+                    }
+                }
+                "pty_wait_contains" | "pty_assert_contains" => {
+                    if step.pattern.trim().is_empty() {
+                        return Err(format!(
+                            "Runtime check spec {} has an empty `pattern` for step {} in scenario `{}`.",
+                            spec_path.display(),
+                            step_index + 1,
+                            scenario.id
+                        ));
+                    }
+                }
+                "" => {
+                    return Err(format!(
+                        "Runtime check spec {} is missing `kind` for step {} in scenario `{}`.",
+                        spec_path.display(),
+                        step_index + 1,
+                        scenario.id
+                    ));
+                }
+                other => {
+                    return Err(format!(
+                        "Runtime check spec {} uses unsupported step kind `{}` for step {} in scenario `{}`.",
+                        spec_path.display(),
+                        other,
+                        step_index + 1,
+                        scenario.id
+                    ));
+                }
+            }
+        }
+    }
+    let workdir = if spec.workdir.trim().is_empty() {
+        workspace
+    } else {
+        let configured = PathBuf::from(spec.workdir.trim());
+        if configured.is_absolute() {
+            configured
+        } else {
+            workspace.join(configured)
+        }
+    };
+    Ok(Some((spec_path, workdir, spec)))
+}
+
+fn service_check_command_result(
+    command: &str,
+    cwd: &Path,
+    envs: &BTreeMap<String, String>,
+) -> Result<CommandResult, String> {
+    let output = Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .envs(envs)
+        .output()
+        .map_err(|err| format!("Could not run `{command}` in {}: {err}", cwd.display()))?;
+    Ok(CommandResult {
+        code: output.status.code().unwrap_or(1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn write_command_result_logs(
+    stdout_path: &Path,
+    stderr_path: &Path,
+    result: &CommandResult,
+) -> Result<(), String> {
+    write_text(stdout_path, &result.stdout)?;
+    write_text(stderr_path, &result.stderr)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeHttpResponse {
+    status: u32,
+    body: String,
+    headers: BTreeMap<String, String>,
+}
+
+struct PtyScenarioSession {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    parser: vt100::Parser,
+    reader_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl PtyScenarioSession {
+    fn start(
+        command: &str,
+        cwd: &Path,
+        envs: &BTreeMap<String, String>,
+        rows: u16,
+        cols: u16,
+        transcript_path: &Path,
+    ) -> Result<Self, String> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| format!("Could not open PTY: {err}"))?;
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.arg("-lc");
+        cmd.arg(command);
+        cmd.cwd(cwd);
+        for (key, value) in envs {
+            cmd.env(key, value);
+        }
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| format!("Could not start PTY command `{command}`: {err}"))?;
+        drop(pair.slave);
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| format!("Could not clone PTY reader: {err}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| format!("Could not take PTY writer: {err}"))?;
+        let (rx, handle) = spawn_pty_reader(reader, transcript_path.to_path_buf());
+        Ok(Self {
+            master: pair.master,
+            child,
+            writer,
+            rx,
+            parser: vt100::Parser::new(rows, cols, 0),
+            reader_handle: Some(handle),
+        })
+    }
+
+    fn drain(&mut self) {
+        while let Ok(bytes) = self.rx.try_recv() {
+            self.parser.process(&bytes);
+        }
+    }
+
+    fn screen(&mut self) -> String {
+        self.drain();
+        self.parser.screen().contents()
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.writer
+            .write_all(bytes)
+            .and_then(|_| self.writer.flush())
+            .map_err(|err| format!("Could not write to PTY: {err}"))
+    }
+
+    fn send_text(&mut self, text: &str) -> Result<(), String> {
+        for ch in text.bytes() {
+            self.send_bytes(&[ch])?;
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    fn wait_contains(&mut self, needle: &str, timeout: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.screen();
+            if screen.contains(needle) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "Timed out waiting for PTY screen fragment `{needle}`.\nCurrent screen:\n{screen}"
+                ));
+            }
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(bytes) => self.parser.process(&bytes),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(format!(
+                        "PTY disconnected while waiting for `{needle}`.\nCurrent screen:\n{}",
+                        self.screen()
+                    ))
+                }
+            }
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| format!("Could not resize PTY: {err}"))?;
+        self.parser.set_size(rows, cols);
+        Ok(())
+    }
+
+    fn stop(mut self) -> Result<i32, String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => {
+                    if let Some(handle) = self.reader_handle.take() {
+                        let _ = handle.join();
+                    }
+                    return Ok(status.exit_code() as i32);
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) | Err(_) => {
+                    let _ = self.child.kill();
+                    let status = self
+                        .child
+                        .wait()
+                        .map_err(|err| format!("Could not wait for PTY child: {err}"))?;
+                    if let Some(handle) = self.reader_handle.take() {
+                        let _ = handle.join();
+                    }
+                    return Ok(status.exit_code() as i32);
+                }
+            }
+        }
+    }
+}
+
+fn spawn_pty_reader(
+    mut reader: Box<dyn Read + Send>,
+    transcript_path: PathBuf,
+) -> (mpsc::Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let mut transcript = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&transcript_path)
+            .ok();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(size) => {
+                    if let Some(file) = transcript.as_mut() {
+                        let _ = file.write_all(&buf[..size]);
+                    }
+                    if tx.send(buf[..size].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (rx, handle)
+}
+
+fn runtime_http_request(
+    method: &str,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    body: Option<&str>,
+) -> Result<RuntimeHttpResponse, String> {
+    let mut easy = Easy::new();
+    easy.url(url)
+        .map_err(|err| format!("Could not configure URL `{url}`: {err}"))?;
+    easy.follow_location(true)
+        .map_err(|err| format!("Could not enable redirects for `{url}`: {err}"))?;
+    easy.connect_timeout(Duration::from_secs(5))
+        .map_err(|err| format!("Could not set connect timeout: {err}"))?;
+    easy.timeout(Duration::from_secs(30))
+        .map_err(|err| format!("Could not set request timeout: {err}"))?;
+    let upper_method = method.trim().to_ascii_uppercase();
+    match upper_method.as_str() {
+        "GET" => {}
+        "POST" => {
+            easy.post(true)
+                .map_err(|err| format!("Could not configure POST `{url}`: {err}"))?;
+            if let Some(body) = body {
+                easy.post_fields_copy(body.as_bytes())
+                    .map_err(|err| format!("Could not set POST body for `{url}`: {err}"))?;
+            }
+        }
+        other => {
+            easy.custom_request(other)
+                .map_err(|err| format!("Could not configure HTTP method `{other}`: {err}"))?;
+            if let Some(body) = body {
+                easy.post_fields_copy(body.as_bytes())
+                    .map_err(|err| format!("Could not set request body for `{url}`: {err}"))?;
+            }
+        }
+    }
+    if !headers.is_empty() {
+        let mut list = List::new();
+        for (key, value) in headers {
+            list.append(&format!("{key}: {value}"))
+                .map_err(|err| format!("Could not append HTTP header `{key}`: {err}"))?;
+        }
+        easy.http_headers(list)
+            .map_err(|err| format!("Could not attach HTTP headers: {err}"))?;
+    }
+    let mut response_body = Vec::new();
+    let mut response_headers = BTreeMap::new();
+    {
+        let mut transfer = easy.transfer();
+        transfer
+            .write_function(|data| {
+                response_body.extend_from_slice(data);
+                Ok(data.len())
+            })
+            .map_err(|err| format!("Could not capture HTTP body: {err}"))?;
+        transfer
+            .header_function(|header| {
+                let line = String::from_utf8_lossy(header).trim().to_string();
+                if let Some((key, value)) = line.split_once(':') {
+                    response_headers
+                        .insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+                true
+            })
+            .map_err(|err| format!("Could not capture HTTP headers: {err}"))?;
+        transfer
+            .perform()
+            .map_err(|err| format!("HTTP request `{upper_method} {url}` failed: {err}"))?;
+    }
+    let status = easy
+        .response_code()
+        .map_err(|err| format!("Could not read HTTP status for `{url}`: {err}"))?;
+    Ok(RuntimeHttpResponse {
+        status,
+        body: String::from_utf8_lossy(&response_body).to_string(),
+        headers: response_headers,
+    })
+}
+
+fn apply_command_expectations(
+    result: &CommandResult,
+    expect_exit_code: i32,
+    expect_stdout_contains: &[String],
+    expect_stderr_contains: &[String],
+) -> String {
+    if result.code != expect_exit_code {
+        return format!("expected exit code {expect_exit_code}, got {}", result.code);
+    }
+    for needle in expect_stdout_contains {
+        if !result.stdout.contains(needle) {
+            return format!("stdout is missing expected fragment `{needle}`");
+        }
+    }
+    for needle in expect_stderr_contains {
+        if !result.stderr.contains(needle) {
+            return format!("stderr is missing expected fragment `{needle}`");
+        }
+    }
+    String::new()
+}
+
+fn apply_http_expectations(
+    response: &RuntimeHttpResponse,
+    expect_status: u32,
+    expect_body_contains: &[String],
+    expect_body_not_contains: &[String],
+) -> String {
+    if expect_status > 0 && response.status != expect_status {
+        return format!(
+            "expected HTTP status {expect_status}, got {}",
+            response.status
+        );
+    }
+    for needle in expect_body_contains {
+        if !response.body.contains(needle) {
+            return format!("response body is missing expected fragment `{needle}`");
+        }
+    }
+    for needle in expect_body_not_contains {
+        if response.body.contains(needle) {
+            return format!("response body unexpectedly contains `{needle}`");
+        }
+    }
+    String::new()
+}
+
+fn encode_key_name(name: &str) -> Result<Vec<u8>, String> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let bytes = match normalized.as_str() {
+        "enter" | "return" => b"\r".to_vec(),
+        "esc" | "escape" => vec![27],
+        "tab" => b"\t".to_vec(),
+        "backspace" => vec![127],
+        "up" => b"\x1b[A".to_vec(),
+        "down" => b"\x1b[B".to_vec(),
+        "right" => b"\x1b[C".to_vec(),
+        "left" => b"\x1b[D".to_vec(),
+        "pageup" => b"\x1b[5~".to_vec(),
+        "pagedown" => b"\x1b[6~".to_vec(),
+        "home" => b"\x1b[H".to_vec(),
+        "end" => b"\x1b[F".to_vec(),
+        _ if normalized.starts_with("ctrl+") && normalized.len() == 6 => {
+            let letter = normalized.as_bytes()[5];
+            if letter.is_ascii_lowercase() {
+                vec![letter - b'a' + 1]
+            } else {
+                return Err(format!("Unsupported control key `{name}`"));
+            }
+        }
+        _ if normalized.len() == 1 => normalized.as_bytes().to_vec(),
+        _ => return Err(format!("Unsupported key name `{name}`")),
+    };
+    Ok(bytes)
+}
+
+fn runtime_check_step_timeout(step: &ServiceCheckStep) -> Duration {
+    Duration::from_secs(if step.timeout_secs == 0 {
+        5
+    } else {
+        step.timeout_secs
+    })
+}
+
+fn execute_runtime_check_step(
+    session: &mut Option<PtyScenarioSession>,
+    step: &ServiceCheckStep,
+    cwd: &Path,
+    envs: &BTreeMap<String, String>,
+    scenario_root: &Path,
+    details: &mut Vec<String>,
+) -> Result<(), String> {
+    let kind = step.kind.trim().to_ascii_lowercase();
+    match kind.as_str() {
+        "wait" | "wait_ms" | "sleep" => {
+            let wait_ms = if step.wait_ms > 0 {
+                step.wait_ms
+            } else {
+                runtime_check_step_timeout(step).as_millis() as u64
+            };
+            thread::sleep(Duration::from_millis(wait_ms));
+            details.push(format!("waited {}ms", wait_ms));
+            Ok(())
+        }
+        "command" | "shell" | "gui-command" => {
+            let log_label = sanitize_artifact_label(&format!("{}-{}", kind, details.len() + 1));
+            let stdout_path = scenario_root.join(format!("{log_label}.stdout.log"));
+            let stderr_path = scenario_root.join(format!("{log_label}.stderr.log"));
+            let result = service_check_command_result(&step.command, cwd, envs)?;
+            write_command_result_logs(&stdout_path, &stderr_path, &result)?;
+            let failure = apply_command_expectations(
+                &result,
+                step.expect_exit_code,
+                &step.expect_stdout_contains,
+                &step.expect_stderr_contains,
+            );
+            details.push(format!(
+                "command `{}` exit={} stdout=`{}` stderr=`{}`",
+                step.command,
+                result.code,
+                stdout_path.display(),
+                stderr_path.display()
+            ));
+            if failure.is_empty() {
+                Ok(())
+            } else {
+                Err(failure)
+            }
+        }
+        "http" | "rest" => {
+            let method = if step.method.trim().is_empty() {
+                "GET".to_string()
+            } else {
+                step.method.clone()
+            };
+            let response = runtime_http_request(
+                &method,
+                &step.url,
+                &step.headers,
+                if step.body.trim().is_empty() {
+                    None
+                } else {
+                    Some(step.body.as_str())
+                },
+            )?;
+            let log_label = sanitize_artifact_label(&format!("http-{}", details.len() + 1));
+            let body_path = scenario_root.join(format!("{log_label}.body.txt"));
+            let headers_path = scenario_root.join(format!("{log_label}.headers.json"));
+            write_text(&body_path, &response.body)?;
+            write_json(&headers_path, &response.headers)?;
+            let failure = apply_http_expectations(
+                &response,
+                step.expect_status,
+                &step.expect_body_contains,
+                &step.expect_body_not_contains,
+            );
+            details.push(format!(
+                "http {} {} status={} body=`{}`",
+                method,
+                step.url,
+                response.status,
+                body_path.display()
+            ));
+            if failure.is_empty() {
+                Ok(())
+            } else {
+                Err(failure)
+            }
+        }
+        "file_contains" => {
+            let path = if PathBuf::from(&step.path).is_absolute() {
+                PathBuf::from(&step.path)
+            } else {
+                cwd.join(&step.path)
+            };
+            let content = read_text(&path)?;
+            if content.contains(&step.pattern) {
+                details.push(format!(
+                    "file `{}` contains `{}`",
+                    path.display(),
+                    step.pattern
+                ));
+                Ok(())
+            } else {
+                Err(format!(
+                    "file `{}` is missing expected fragment `{}`",
+                    path.display(),
+                    step.pattern
+                ))
+            }
+        }
+        "pty_send_text" => {
+            let Some(session) = session.as_mut() else {
+                return Err("PTY send_text step requires an active PTY session.".to_string());
+            };
+            session.send_text(&step.text)?;
+            details.push(format!("pty_send_text `{}`", step.text));
+            Ok(())
+        }
+        "pty_send_keys" => {
+            let Some(session) = session.as_mut() else {
+                return Err("PTY send_keys step requires an active PTY session.".to_string());
+            };
+            for key in &step.keys {
+                session.send_bytes(&encode_key_name(key)?)?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            details.push(format!("pty_send_keys {}", step.keys.join(", ")));
+            Ok(())
+        }
+        "pty_wait_contains" => {
+            let Some(session) = session.as_mut() else {
+                return Err("PTY wait_contains step requires an active PTY session.".to_string());
+            };
+            session.wait_contains(&step.pattern, runtime_check_step_timeout(step))?;
+            details.push(format!("pty_wait_contains `{}`", step.pattern));
+            Ok(())
+        }
+        "pty_assert_contains" => {
+            let Some(session) = session.as_mut() else {
+                return Err("PTY assert_contains step requires an active PTY session.".to_string());
+            };
+            let screen = session.screen();
+            if screen.contains(&step.pattern) {
+                details.push(format!("pty_assert_contains `{}`", step.pattern));
+                Ok(())
+            } else {
+                Err(format!(
+                    "PTY screen is missing expected fragment `{}`.\nCurrent screen:\n{}",
+                    step.pattern, screen
+                ))
+            }
+        }
+        "pty_resize" => {
+            let Some(session) = session.as_mut() else {
+                return Err("PTY resize step requires an active PTY session.".to_string());
+            };
+            let rows = if step.rows == 0 { 40 } else { step.rows };
+            let cols = if step.cols == 0 { 120 } else { step.cols };
+            session.resize(rows, cols)?;
+            details.push(format!("pty_resize {}x{}", rows, cols));
+            Ok(())
+        }
+        other => Err(format!("Unsupported runtime-check step kind `{other}`")),
+    }
+}
+
+fn execute_runtime_check_scenario(
+    run_dir: &Path,
+    workdir: &Path,
+    envs: &BTreeMap<String, String>,
+    scenarios_root: &Path,
+    scenario: &ServiceCheckScenario,
+) -> Result<ServiceCheckScenarioResult, String> {
+    let scenario_kind = if scenario.kind.trim().is_empty() {
+        if !scenario.steps.is_empty() {
+            "workflow".to_string()
+        } else if !scenario.url.trim().is_empty() {
+            "http".to_string()
+        } else {
+            "command".to_string()
+        }
+    } else {
+        scenario.kind.trim().to_ascii_lowercase()
+    };
+    let label = sanitize_artifact_label(&scenario.id);
+    let scenario_root = scenarios_root.join(&label);
+    fs::create_dir_all(&scenario_root)
+        .map_err(|err| format!("Could not create {}: {err}", scenario_root.display()))?;
+    let stdout_path = scenario_root.join("stdout.log");
+    let stderr_path = scenario_root.join("stderr.log");
+    let screen_path = scenario_root.join("screen.txt");
+    let mut details = Vec::new();
+    let mut failure_reason = String::new();
+    let mut exit_code = 0;
+
+    match scenario_kind.as_str() {
+        "command" | "shell" | "gui-command" => {
+            let result = service_check_command_result(&scenario.command, workdir, envs)?;
+            write_command_result_logs(&stdout_path, &stderr_path, &result)?;
+            exit_code = result.code;
+            failure_reason = apply_command_expectations(
+                &result,
+                scenario.expect_exit_code,
+                &scenario.expect_stdout_contains,
+                &scenario.expect_stderr_contains,
+            );
+        }
+        "http" | "rest" => {
+            let method = if scenario.method.trim().is_empty() {
+                "GET".to_string()
+            } else {
+                scenario.method.clone()
+            };
+            let response = runtime_http_request(
+                &method,
+                &scenario.url,
+                &scenario.headers,
+                if scenario.body.trim().is_empty() {
+                    None
+                } else {
+                    Some(scenario.body.as_str())
+                },
+            )?;
+            exit_code = 0;
+            write_text(&stdout_path, &response.body)?;
+            write_json(&stderr_path, &response.headers)?;
+            failure_reason = apply_http_expectations(
+                &response,
+                scenario.expect_status,
+                &scenario.expect_body_contains,
+                &scenario.expect_body_not_contains,
+            );
+            details.push(format!("http_status={}", response.status));
+        }
+        "pty" => {
+            let rows = if scenario.rows == 0 {
+                40
+            } else {
+                scenario.rows
+            };
+            let cols = if scenario.cols == 0 {
+                120
+            } else {
+                scenario.cols
+            };
+            let transcript_path = scenario_root.join("pty.transcript.log");
+            let mut session = Some(PtyScenarioSession::start(
+                &scenario.command,
+                workdir,
+                envs,
+                rows,
+                cols,
+                &transcript_path,
+            )?);
+            for step in &scenario.steps {
+                if let Err(err) = execute_runtime_check_step(
+                    &mut session,
+                    step,
+                    workdir,
+                    envs,
+                    &scenario_root,
+                    &mut details,
+                ) {
+                    failure_reason = err;
+                    break;
+                }
+            }
+            if let Some(mut active) = session {
+                let screen = active.screen();
+                write_text(&screen_path, &screen)?;
+                exit_code = active.stop()?;
+            }
+            if failure_reason.is_empty() {
+                let expected_exit = scenario.expect_exit_code;
+                if exit_code != expected_exit {
+                    failure_reason = format!("expected exit code {expected_exit}, got {exit_code}");
+                }
+            }
+            write_text(&stdout_path, &details.join("\n"))?;
+            write_text(&stderr_path, &failure_reason)?;
+        }
+        "workflow" => {
+            let mut session: Option<PtyScenarioSession> = None;
+            for step in &scenario.steps {
+                let step_kind = step.kind.trim().to_ascii_lowercase();
+                if step_kind == "pty_start" {
+                    if session.is_some() {
+                        failure_reason =
+                            "workflow attempted to start a second PTY session".to_string();
+                        break;
+                    }
+                    let rows = if step.rows == 0 { 40 } else { step.rows };
+                    let cols = if step.cols == 0 { 120 } else { step.cols };
+                    let transcript_path = scenario_root.join("pty.transcript.log");
+                    match PtyScenarioSession::start(
+                        &step.command,
+                        workdir,
+                        envs,
+                        rows,
+                        cols,
+                        &transcript_path,
+                    ) {
+                        Ok(started) => {
+                            session = Some(started);
+                            details.push(format!("pty_start `{}`", step.command));
+                        }
+                        Err(err) => {
+                            failure_reason = err;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if let Err(err) = execute_runtime_check_step(
+                    &mut session,
+                    step,
+                    workdir,
+                    envs,
+                    &scenario_root,
+                    &mut details,
+                ) {
+                    failure_reason = err;
+                    break;
+                }
+            }
+            if let Some(mut active) = session {
+                let screen = active.screen();
+                write_text(&screen_path, &screen)?;
+                exit_code = active.stop()?;
+            }
+            if failure_reason.is_empty() {
+                let expected_exit = scenario.expect_exit_code;
+                if exit_code != expected_exit {
+                    failure_reason = format!("expected exit code {expected_exit}, got {exit_code}");
+                }
+            }
+            write_text(&stdout_path, &details.join("\n"))?;
+            write_text(&stderr_path, &failure_reason)?;
+        }
+        other => {
+            failure_reason = format!("Unsupported runtime-check scenario kind `{other}`");
+            write_text(&stdout_path, "")?;
+            write_text(&stderr_path, &failure_reason)?;
+        }
+    }
+
+    let status = if failure_reason.is_empty() {
+        "passed".to_string()
+    } else {
+        "failed".to_string()
+    };
+    Ok(ServiceCheckScenarioResult {
+        id: scenario.id.clone(),
+        description: scenario.description.clone(),
+        command: if scenario.command.trim().is_empty() {
+            scenario.url.clone()
+        } else {
+            scenario.command.clone()
+        },
+        exit_code,
+        status,
+        failure_reason,
+        stdout_path: relative_to_run_dir(run_dir, &stdout_path),
+        stderr_path: relative_to_run_dir(run_dir, &stderr_path),
+        screen_path: if screen_path.exists() {
+            relative_to_run_dir(run_dir, &screen_path)
+        } else {
+            String::new()
+        },
+        details,
+    })
+}
+
+fn start_background_shell_command(
+    command: &str,
+    cwd: &Path,
+    envs: &BTreeMap<String, String>,
+    stdout_path: &Path,
+    stderr_path: &Path,
+) -> Result<std::process::Child, String> {
+    initialize_capture_file(stdout_path)?;
+    initialize_capture_file(stderr_path)?;
+    let stdout_file = File::create(stdout_path)
+        .map_err(|err| format!("Could not create {}: {err}", stdout_path.display()))?;
+    let stderr_file = File::create(stderr_path)
+        .map_err(|err| format!("Could not create {}: {err}", stderr_path.display()))?;
+    let mut command_builder = Command::new("/bin/sh");
+    command_builder
+        .arg("-lc")
+        .arg(command)
+        .current_dir(cwd)
+        .envs(envs)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file));
+    unsafe {
+        command_builder.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command_builder
+        .spawn()
+        .map_err(|err| format!("Could not start `{command}` in {}: {err}", cwd.display()))
+}
+
+fn terminate_process_group(pid: i32) -> Result<(), String> {
+    if pid <= 0 {
+        return Ok(());
+    }
+    let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !crate::runtime::process_group_alive(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    Ok(())
+}
+
+fn service_check_summary_markdown(summary: &ServiceCheckSummary) -> String {
+    let mut lines = vec![
+        "# Runtime Check Summary".to_string(),
+        String::new(),
+        format!("- Phase: `{}`", summary.phase),
+        format!("- Status: `{}`", summary.status),
+        format!("- Mode: `{}`", summary.mode),
+        format!("- Spec: `{}`", summary.spec_path),
+        format!("- Workdir: `{}`", summary.workdir),
+    ];
+    if !summary.ready_status.is_empty() {
+        lines.push(format!("- Readiness: `{}`", summary.ready_status));
+    }
+    if !summary.start_log.is_empty() {
+        lines.push(format!("- Start log: `{}`", summary.start_log));
+    }
+    if !summary.ready_failure.is_empty() {
+        lines.push(format!("- Readiness failure: {}", summary.ready_failure));
+    }
+    if !summary.error_messages.is_empty() {
+        lines.push(String::new());
+        lines.push("## Errors".to_string());
+        lines.push(String::new());
+        for item in &summary.error_messages {
+            lines.push(format!("- {}", item));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Scenarios".to_string());
+    lines.push(String::new());
+    for scenario in &summary.scenarios {
+        lines.push(format!(
+            "- `{}` `{}` exit={} stdout=`{}` stderr=`{}`{}{}",
+            scenario.id,
+            scenario.status,
+            scenario.exit_code,
+            scenario.stdout_path,
+            scenario.stderr_path,
+            if scenario.screen_path.is_empty() {
+                String::new()
+            } else {
+                format!(" screen=`{}`", scenario.screen_path)
+            },
+            if scenario.failure_reason.is_empty() {
+                String::new()
+            } else {
+                format!(" reason={}", scenario.failure_reason)
+            }
+        ));
+        for detail in &scenario.details {
+            lines.push(format!("  detail: {}", detail));
+        }
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn write_service_check_summary(
+    run_dir: &Path,
+    phase: &str,
+    summary: &ServiceCheckSummary,
+) -> Result<(), String> {
+    let root = service_check_runtime_dir(run_dir, phase);
+    fs::create_dir_all(&root)
+        .map_err(|err| format!("Could not create {}: {err}", root.display()))?;
+    write_json(&service_check_summary_json_path(run_dir, phase), summary)?;
+    write_text(
+        &service_check_summary_md_path(run_dir, phase),
+        &service_check_summary_markdown(summary),
+    )?;
+    Ok(())
+}
+
+fn finalize_service_check(
+    run_dir: &Path,
+    phase: &str,
+    summary: &mut ServiceCheckSummary,
+    error_messages: &[String],
+) -> Result<CommandResult, String> {
+    summary.finished_at = iso_timestamp();
+    summary.error_messages = error_messages.to_vec();
+    write_service_check_summary(run_dir, phase, summary)?;
+    let stdout = format!(
+        "Runtime check {} for phase `{}`. Summary: {}\n",
+        summary.status,
+        phase,
+        service_check_summary_md_path(run_dir, phase).display()
+    );
+    let stderr = if summary.error_messages.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", summary.error_messages.join("\n"))
+    };
+    Ok(CommandResult {
+        code: if summary.status == "passed" { 0 } else { 1 },
+        stdout,
+        stderr,
+    })
+}
+
+fn service_check_compose_prefix(
+    run_dir: &Path,
+    phase: &str,
+    workdir: &Path,
+    spec: &ServiceCheckSpec,
+) -> String {
+    let compose_file = if PathBuf::from(&spec.compose_file).is_absolute() {
+        PathBuf::from(&spec.compose_file)
+    } else {
+        workdir.join(&spec.compose_file)
+    };
+    let mut parts = vec![
+        "docker".to_string(),
+        "compose".to_string(),
+        "-f".to_string(),
+        shell_quote(&compose_file.display().to_string()),
+    ];
+    let project_name = if spec.compose_project_name.trim().is_empty() {
+        format!(
+            "agpipe-{}-{}",
+            sanitize_artifact_label(
+                &run_dir
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("run")
+                    .to_string()
+            ),
+            sanitize_artifact_label(phase)
+        )
+    } else {
+        spec.compose_project_name.trim().to_string()
+    };
+    parts.push("-p".to_string());
+    parts.push(shell_quote(&project_name));
+    parts.join(" ")
+}
+
+fn run_service_check_loaded(
+    run_dir: &Path,
+    phase: &str,
+    spec_path: &Path,
+    workdir: &Path,
+    spec: &ServiceCheckSpec,
+) -> Result<CommandResult, String> {
+    let root = service_check_runtime_dir(run_dir, phase);
+    fs::create_dir_all(&root)
+        .map_err(|err| format!("Could not create {}: {err}", root.display()))?;
+    let start_stdout = root.join("service.stdout.log");
+    let start_stderr = root.join("service.stderr.log");
+    let ready_stdout = root.join("ready.stdout.log");
+    let ready_stderr = root.join("ready.stderr.log");
+    let docker_up_stdout = root.join("docker-up.stdout.log");
+    let docker_up_stderr = root.join("docker-up.stderr.log");
+    let docker_logs = root.join("docker.logs.txt");
+    let stop_stdout = root.join("stop.stdout.log");
+    let stop_stderr = root.join("stop.stderr.log");
+    let cleanup_stdout = root.join("cleanup.stdout.log");
+    let cleanup_stderr = root.join("cleanup.stderr.log");
+    let mut summary = ServiceCheckSummary {
+        version: 1,
+        phase: phase.to_string(),
+        status: "running".to_string(),
+        mode: spec.mode.clone(),
+        spec_path: spec_path.display().to_string(),
+        workdir: workdir.display().to_string(),
+        started_at: iso_timestamp(),
+        ready_status: "pending".to_string(),
+        start_log: relative_to_run_dir(
+            run_dir,
+            if spec.mode == "docker-compose" {
+                &docker_logs
+            } else {
+                &start_stdout
+            },
+        ),
+        ..ServiceCheckSummary::default()
+    };
+    let mut service_child: Option<std::process::Child> = None;
+    let mut error_messages = Vec::new();
+
+    for (index, command) in spec.prepare_commands.iter().enumerate() {
+        let stdout_path = root.join(format!("prepare-{:02}.stdout.log", index + 1));
+        let stderr_path = root.join(format!("prepare-{:02}.stderr.log", index + 1));
+        let result = service_check_command_result(command, workdir, &spec.env)?;
+        write_command_result_logs(&stdout_path, &stderr_path, &result)?;
+        if result.code != 0 {
+            error_messages.push(format!(
+                "Prepare command failed: `{}` exit={} stdout=`{}` stderr=`{}`",
+                command,
+                result.code,
+                relative_to_run_dir(run_dir, &stdout_path),
+                relative_to_run_dir(run_dir, &stderr_path)
+            ));
+            summary.status = "failed".to_string();
+            return finalize_service_check(run_dir, phase, &mut summary, &error_messages);
+        }
+    }
+
+    if spec.mode == "docker-compose" {
+        let prefix = service_check_compose_prefix(run_dir, phase, workdir, spec);
+        let services = spec
+            .compose_services
+            .iter()
+            .map(|service| shell_quote(service))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let up_command = if services.is_empty() {
+            format!("{prefix} up -d --build")
+        } else {
+            format!("{prefix} up -d --build {services}")
+        };
+        let up_result = service_check_command_result(&up_command, workdir, &spec.env)?;
+        write_command_result_logs(&docker_up_stdout, &docker_up_stderr, &up_result)?;
+        if up_result.code != 0 {
+            error_messages.push(format!(
+                "Docker compose startup failed: stdout=`{}` stderr=`{}`",
+                relative_to_run_dir(run_dir, &docker_up_stdout),
+                relative_to_run_dir(run_dir, &docker_up_stderr)
+            ));
+            summary.ready_status = "startup-failed".to_string();
+            let _ = write_text(&docker_logs, "");
+            summary.status = "failed".to_string();
+            return finalize_service_check(run_dir, phase, &mut summary, &error_messages);
+        }
+    } else if spec.mode == "process" && !spec.start_command.trim().is_empty() {
+        let child = start_background_shell_command(
+            &spec.start_command,
+            workdir,
+            &spec.env,
+            &start_stdout,
+            &start_stderr,
+        )?;
+        service_child = Some(child);
+    }
+
+    if spec.ready_command.trim().is_empty() {
+        summary.ready_status = "skipped".to_string();
+    } else {
+        let deadline = Instant::now() + Duration::from_secs(spec.ready_timeout_secs);
+        let mut last_result = CommandResult::default();
+        let mut ready = false;
+        while Instant::now() <= deadline {
+            let result = service_check_command_result(&spec.ready_command, workdir, &spec.env)?;
+            last_result = result.clone();
+            write_command_result_logs(&ready_stdout, &ready_stderr, &result)?;
+            if result.code == 0 {
+                ready = true;
+                break;
+            }
+            if let Some(child) = service_child.as_ref() {
+                if !crate::runtime::pid_alive(child.id() as i32) {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(spec.ready_interval_ms));
+        }
+        if ready {
+            summary.ready_status = "passed".to_string();
+        } else {
+            summary.ready_status = "failed".to_string();
+            summary.ready_failure = if last_result.combined_output().trim().is_empty() {
+                format!(
+                    "Readiness command `{}` did not succeed within {}s.",
+                    spec.ready_command, spec.ready_timeout_secs
+                )
+            } else {
+                format!(
+                    "Readiness command `{}` failed: {}",
+                    spec.ready_command,
+                    last_result.combined_output().trim()
+                )
+            };
+            error_messages.push(summary.ready_failure.clone());
+        }
+    }
+
+    let scenarios_root = root.join("scenarios");
+    fs::create_dir_all(&scenarios_root)
+        .map_err(|err| format!("Could not create {}: {err}", scenarios_root.display()))?;
+    if error_messages.is_empty() {
+        for scenario in &spec.scenarios {
+            let result = execute_runtime_check_scenario(
+                run_dir,
+                workdir,
+                &spec.env,
+                &scenarios_root,
+                scenario,
+            )?;
+            if result.status != "passed" {
+                error_messages.push(format!(
+                    "Scenario `{}` failed: {}",
+                    scenario.id, result.failure_reason
+                ));
+            }
+            summary.scenarios.push(result);
+        }
+    }
+
+    if spec.mode == "docker-compose" {
+        let prefix = service_check_compose_prefix(run_dir, phase, workdir, spec);
+        if let Ok(logs) =
+            service_check_command_result(&format!("{prefix} logs --no-color"), workdir, &spec.env)
+        {
+            let combined = logs.combined_output();
+            let _ = write_text(&docker_logs, &combined);
+        }
+        let down_result = service_check_command_result(
+            &format!("{prefix} down --remove-orphans"),
+            workdir,
+            &spec.env,
+        )?;
+        let _ = write_command_result_logs(&stop_stdout, &stop_stderr, &down_result);
+    } else if let Some(child) = service_child.as_mut() {
+        if !spec.stop_command.trim().is_empty() {
+            let stop_result = service_check_command_result(&spec.stop_command, workdir, &spec.env)?;
+            let _ = write_command_result_logs(&stop_stdout, &stop_stderr, &stop_result);
+            if stop_result.code != 0 {
+                error_messages.push(format!(
+                    "Stop command failed: `{}` exit={}",
+                    spec.stop_command, stop_result.code
+                ));
+            }
+        }
+        let _ = terminate_process_group(child.id() as i32);
+        let _ = child.wait();
+    }
+
+    if !spec.cleanup_commands.is_empty() {
+        let mut cleanup_stdout_text = String::new();
+        let mut cleanup_stderr_text = String::new();
+        for command in &spec.cleanup_commands {
+            let result = service_check_command_result(command, workdir, &spec.env)?;
+            cleanup_stdout_text.push_str(&format!("$ {command}\n{}", result.stdout));
+            cleanup_stderr_text.push_str(&format!("$ {command}\n{}", result.stderr));
+            if result.code != 0 {
+                error_messages.push(format!(
+                    "Cleanup command failed: `{}` exit={}",
+                    command, result.code
+                ));
+            }
+        }
+        let _ = write_text(&cleanup_stdout, &cleanup_stdout_text);
+        let _ = write_text(&cleanup_stderr, &cleanup_stderr_text);
+    }
+
+    if error_messages.is_empty() {
+        summary.status = "passed".to_string();
+        finalize_service_check(run_dir, phase, &mut summary, &error_messages)
+    } else {
+        summary.status = "failed".to_string();
+        finalize_service_check(run_dir, phase, &mut summary, &error_messages)
+    }
+}
+
+pub fn service_check_run(
+    run_dir: &Path,
+    phase: &str,
+    explicit_spec: Option<&Path>,
+) -> Result<CommandResult, String> {
+    let Some((spec_path, workdir, spec)) = load_service_check_spec(run_dir, explicit_spec)? else {
+        return Err(format!(
+            "No runtime check spec found. Create `{}` in the workspace or pass --spec.",
+            RUNTIME_CHECK_SPEC_REF
+        ));
+    };
+    run_service_check_loaded(run_dir, phase, &spec_path, &workdir, &spec)
+}
+
+pub fn runtime_check_run(
+    run_dir: &Path,
+    phase: &str,
+    explicit_spec: Option<&Path>,
+) -> Result<CommandResult, String> {
+    service_check_run(run_dir, phase, explicit_spec)
+}
+
+fn maybe_run_service_check(run_dir: &Path, phase: &str) -> Result<Option<CommandResult>, String> {
+    let Some((spec_path, workdir, spec)) = load_service_check_spec(run_dir, None)? else {
+        if runtime_check_required(run_dir, phase)? {
+            return Ok(Some(CommandResult {
+                code: 1,
+                stdout: format!(
+                    "Runtime check failed for phase `{phase}` because no workspace spec was found.\n"
+                ),
+                stderr: format!(
+                    "Runtime-facing tasks must create `{}` before `{}` can complete.\n",
+                    RUNTIME_CHECK_SPEC_REF, phase
+                ),
+            }));
+        }
+        return Ok(None);
+    };
+    Ok(Some(run_service_check_loaded(
+        run_dir, phase, &spec_path, &workdir, &spec,
+    )?))
+}
+
+fn append_runtime_check_output(buffer: &mut String, result: &CommandResult) {
+    if !result.stdout.trim().is_empty() {
+        buffer.push_str(result.stdout.trim_end());
+        buffer.push('\n');
+    }
+    if !result.stderr.trim().is_empty() {
+        buffer.push_str(result.stderr.trim_end());
+        buffer.push('\n');
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -6313,7 +8480,11 @@ fn run_prompted_command_capture(
     stdout_path: &Path,
     stderr_path: &Path,
     run_dir: Option<&Path>,
+    mirror_stderr_to_stdout: bool,
 ) -> Result<i32, String> {
+    initialize_capture_file(stdout_path)?;
+    initialize_capture_file(stderr_path)?;
+    let observer = current_engine_observer();
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     cmd.stdin(Stdio::piped());
@@ -6341,8 +8512,18 @@ fn run_prompted_command_capture(
         .stderr
         .take()
         .ok_or_else(|| "Spawned command did not expose stderr.".to_string())?;
-    let stdout_thread = stream_pipe_to_file(stdout, stdout_path.to_path_buf());
-    let stderr_thread = stream_pipe_to_file(stderr, stderr_path.to_path_buf());
+    let stdout_thread =
+        stream_pipe_to_files(stdout, stdout_path.to_path_buf(), None, observer.clone());
+    let stderr_thread = stream_pipe_to_files(
+        stderr,
+        stderr_path.to_path_buf(),
+        if mirror_stderr_to_stdout {
+            Some(stdout_path.to_path_buf())
+        } else {
+            None
+        },
+        observer,
+    );
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(prompt.as_bytes())
@@ -6397,7 +8578,11 @@ fn run_prompted_command_capture(
     if interrupted {
         Ok(130)
     } else {
-        Ok(status.code().unwrap_or(1))
+        let code = status.code().unwrap_or(1);
+        if mirror_stderr_to_stdout && code == 0 {
+            initialize_capture_file(stderr_path)?;
+        }
+        Ok(code)
     }
 }
 
@@ -6663,47 +8848,87 @@ fn run_local_template_stage(
     Ok(0)
 }
 
-fn stream_pipe_to_file<R>(mut reader: R, path: PathBuf) -> thread::JoinHandle<Result<(), String>>
+fn initialize_capture_file(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    }
+    fs::write(path, "").map_err(|err| format!("Could not initialize {}: {err}", path.display()))
+}
+
+fn stream_pipe_to_files<R>(
+    mut reader: R,
+    path: PathBuf,
+    mirror_path: Option<PathBuf>,
+    observer: Option<Arc<dyn EngineObserver>>,
+) -> thread::JoinHandle<Result<(), String>>
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
-        }
-        let mut file = File::create(&path)
-            .map_err(|err| format!("Could not create {}: {err}", path.display()))?;
-        let mut buffer = [0u8; 8192];
-        let mut pending = Vec::new();
-        loop {
-            let read = reader.read(&mut buffer).map_err(|err| {
-                format!(
-                    "Could not read command output for {}: {err}",
-                    path.display()
+        let capture = || -> Result<(), String> {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|err| format!("Could not open {}: {err}", path.display()))?;
+            let mut mirror = if let Some(mirror_path) = mirror_path {
+                Some(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&mirror_path)
+                        .map_err(|err| {
+                            format!("Could not open {}: {err}", mirror_path.display())
+                        })?,
                 )
-            })?;
-            if read == 0 {
-                break;
+            } else {
+                None
+            };
+            let mut buffer = [0u8; 8192];
+            let mut pending = Vec::new();
+            loop {
+                let read = reader.read(&mut buffer).map_err(|err| {
+                    format!(
+                        "Could not read command output for {}: {err}",
+                        path.display()
+                    )
+                })?;
+                if read == 0 {
+                    break;
+                }
+                file.write_all(&buffer[..read])
+                    .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
+                file.flush()
+                    .map_err(|err| format!("Could not flush {}: {err}", path.display()))?;
+                if let Some(mirror) = mirror.as_mut() {
+                    mirror.write_all(&buffer[..read]).map_err(|err| {
+                        format!("Could not write mirrored {}: {err}", path.display())
+                    })?;
+                    mirror.flush().map_err(|err| {
+                        format!("Could not flush mirrored {}: {err}", path.display())
+                    })?;
+                }
+                pending.extend_from_slice(&buffer[..read]);
+                while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+                    let line = String::from_utf8_lossy(&pending[..pos]).to_string();
+                    notify_output_line(line.trim_end_matches('\r'));
+                    pending.drain(..=pos);
+                }
             }
-            file.write_all(&buffer[..read])
-                .map_err(|err| format!("Could not write {}: {err}", path.display()))?;
-            file.flush()
-                .map_err(|err| format!("Could not flush {}: {err}", path.display()))?;
-            pending.extend_from_slice(&buffer[..read]);
-            while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
-                let line = String::from_utf8_lossy(&pending[..pos]).to_string();
-                notify_output_line(line.trim_end_matches('\r'));
-                pending.drain(..=pos);
+            if !pending.is_empty() {
+                let line = String::from_utf8_lossy(&pending).to_string();
+                if !line.is_empty() {
+                    notify_output_line(line.trim_end_matches('\r'));
+                }
             }
+            Ok(())
+        };
+        if let Some(observer) = observer {
+            with_engine_observer(observer, capture)
+        } else {
+            capture()
         }
-        if !pending.is_empty() {
-            let line = String::from_utf8_lossy(&pending).to_string();
-            if !line.is_empty() {
-                notify_output_line(line.trim_end_matches('\r'));
-            }
-        }
-        Ok(())
     })
 }
 
@@ -6718,6 +8943,16 @@ fn status_text(report: &StatusPayload) -> String {
     }
     lines.push(format!("goal: {}", report.goal));
     lines.push(format!("next: {}", report.next));
+    if let Some(attempt) = &report.last_attempt {
+        lines.push(format!("last-attempt-stage: {}", attempt.stage));
+        lines.push(format!("last-attempt-status: {}", attempt.status));
+        if let Some(code) = attempt.exit_code {
+            lines.push(format!("last-attempt-exit-code: {code}"));
+        }
+        if !attempt.message.trim().is_empty() {
+            lines.push(format!("last-attempt-message: {}", attempt.message));
+        }
+    }
     lines.join("\n")
 }
 
@@ -6741,6 +8976,18 @@ fn doctor_text(report: &DoctorPayload) -> String {
     }
     if let Some(drift) = &report.host_drift {
         lines.push(format!("host-drift: {drift}"));
+    }
+    if let Some(attempt) = &report.last_attempt {
+        lines.push(format!(
+            "last-attempt: {} [{} -> {}]",
+            attempt.stage, attempt.label, attempt.status
+        ));
+        if let Some(code) = attempt.exit_code {
+            lines.push(format!("last-attempt-exit-code: {code}"));
+        }
+        if !attempt.message.trim().is_empty() {
+            lines.push(format!("last-attempt-message: {}", attempt.message));
+        }
     }
     if !report.issues.is_empty() {
         lines.push("\nissues:".to_string());
@@ -6806,11 +9053,34 @@ fn start_stage(
 ) -> Result<CommandResult, String> {
     check_run_interrupt(run_dir)?;
     require_valid_order(run_dir, stage, args.force)?;
+    let stage_kind = pipeline_stage_kind_for(&load_plan(run_dir)?, run_dir, stage)?;
     if matches!(
-        pipeline_stage_kind_for(&load_plan(run_dir)?, run_dir, stage)?,
+        stage_kind,
         PipelineStageKind::Execution | PipelineStageKind::Verification
     ) {
         let _ = capture_host_probe(run_dir)?;
+    }
+    let mut preflight_stdout = String::new();
+    if stage_kind == PipelineStageKind::Verification {
+        if let Some(result) = maybe_run_service_check(run_dir, "verification")? {
+            append_runtime_check_output(&mut preflight_stdout, &result);
+            if result.code != 0 {
+                let mut stdout = String::new();
+                if !preflight_stdout.trim().is_empty() {
+                    stdout.push_str(preflight_stdout.trim_end());
+                    stdout.push_str("\n\n");
+                }
+                stdout.push_str(&format!(
+                    "Blocked {stage} because runtime-check did not pass.\n"
+                ));
+                stdout.push_str(&print_status_after_action(ctx, run_dir)?);
+                return Ok(CommandResult {
+                    code: result.code.max(1),
+                    stdout,
+                    stderr: String::new(),
+                });
+            }
+        }
     }
     let backend = stage_backend_kind(ctx, run_dir, stage)?;
     let (command, prompt, prompt_path, last_message_path, stdout_path, stderr_path) =
@@ -6872,13 +9142,28 @@ fn start_stage(
             });
         }
     }
-    let code = match backend {
+    if !matches!(backend, StageBackendKind::LocalTemplate(_)) {
+        let provisional_usage = provisional_token_usage_for_prompt(&prompt);
+        record_token_usage_with_replacement(
+            run_dir,
+            &plan,
+            stage,
+            "provisional",
+            &cache_key,
+            &prompt_hashes,
+            &workspace_hash,
+            &provisional_usage,
+            &["provisional"],
+        )?;
+    }
+    let mut code = match backend {
         StageBackendKind::Codex => run_prompted_command_capture(
             &command,
             &prompt,
             &stdout_path,
             &stderr_path,
             Some(run_dir),
+            true,
         )?,
         StageBackendKind::Responses => run_responses_stage_capture(
             ctx,
@@ -6901,6 +9186,17 @@ fn start_stage(
     };
     sync_run_artifacts(ctx, run_dir)?;
     check_run_interrupt(run_dir)?;
+    if code == 0 && stage_kind == PipelineStageKind::Execution {
+        if let Some(result) = maybe_run_service_check(run_dir, "execution")? {
+            if !preflight_stdout.is_empty() {
+                preflight_stdout.push('\n');
+            }
+            append_runtime_check_output(&mut preflight_stdout, &result);
+            if result.code != 0 {
+                code = result.code;
+            }
+        }
+    }
     if code == 0 && is_stage_complete(run_dir, stage)? {
         let token_usage = match backend {
             StageBackendKind::LocalTemplate(template) => local_template_token_usage(template),
@@ -6919,7 +9215,7 @@ fn start_stage(
             &output_paths,
             &log_paths,
         )?;
-        record_token_usage(
+        record_token_usage_with_replacement(
             run_dir,
             &plan,
             stage,
@@ -6928,14 +9224,20 @@ fn start_stage(
             &prompt_hashes,
             &workspace_hash,
             &token_usage,
+            &["provisional"],
         )?;
     }
     let _ = refresh_cache_index(&cache)?;
-    let mut stdout = format!(
+    let mut stdout = String::new();
+    if !preflight_stdout.trim().is_empty() {
+        stdout.push_str(preflight_stdout.trim_end());
+        stdout.push_str("\n\n");
+    }
+    stdout.push_str(&format!(
         "Completed {stage} with exit code {code}.\ncache key: {cache_key}\nstdout log: {}\nstderr log: {}\n",
         stdout_path.display(),
         stderr_path.display()
-    );
+    ));
     stdout.push_str(&print_status_after_action(ctx, run_dir)?);
     Ok(CommandResult {
         code,
@@ -6981,7 +9283,7 @@ fn start_solver_batch(
             Ok(StageBackendKind::Responses | StageBackendKind::LocalTemplate(_))
         )
     });
-    if engine_observer_present() || requires_in_process {
+    if requires_in_process {
         let mut combined = String::new();
         let mut exit_code = 0;
         for stage in stages {
@@ -7008,6 +9310,7 @@ fn start_solver_batch(
             stderr: String::new(),
         });
     }
+    let observer = current_engine_observer();
     let mut prepared = Vec::new();
     for stage in stages {
         let (command, prompt, prompt_path, last_message_path, stdout_path, stderr_path) =
@@ -7105,23 +9408,47 @@ fn start_solver_batch(
                 continue;
             }
         }
-        let mut cmd = Command::new(&command[0]);
-        cmd.args(&command[1..]);
-        cmd.stdin(Stdio::piped());
-        let stdout_file = File::create(&stdout_path)
-            .map_err(|err| format!("Could not open {}: {err}", stdout_path.display()))?;
-        let stderr_file = File::create(&stderr_path)
-            .map_err(|err| format!("Could not open {}: {err}", stderr_path.display()))?;
-        cmd.stdout(Stdio::from(stdout_file));
-        cmd.stderr(Stdio::from(stderr_file));
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| format!("Failed to start {stage}: {err}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(prompt.as_bytes())
-                .map_err(|err| format!("Could not write stdin for {stage}: {err}"))?;
-        }
+        let provisional_usage = provisional_token_usage_for_prompt(&prompt);
+        record_token_usage_with_replacement(
+            run_dir,
+            &plan,
+            &stage,
+            "provisional",
+            &cache_key,
+            &prompt_hashes,
+            &workspace_hash,
+            &provisional_usage,
+            &["provisional"],
+        )?;
+        let run_dir_for_thread = run_dir.to_path_buf();
+        let command_for_thread = command.clone();
+        let prompt_for_thread = prompt.clone();
+        let stdout_path_for_thread = stdout_path.clone();
+        let stderr_path_for_thread = stderr_path.clone();
+        let observer_for_thread = observer.clone();
+        let handle = thread::spawn(move || {
+            if let Some(observer) = observer_for_thread {
+                with_engine_observer(observer, || {
+                    run_prompted_command_capture(
+                        &command_for_thread,
+                        &prompt_for_thread,
+                        &stdout_path_for_thread,
+                        &stderr_path_for_thread,
+                        Some(&run_dir_for_thread),
+                        true,
+                    )
+                })
+            } else {
+                run_prompted_command_capture(
+                    &command_for_thread,
+                    &prompt_for_thread,
+                    &stdout_path_for_thread,
+                    &stderr_path_for_thread,
+                    Some(&run_dir_for_thread),
+                    true,
+                )
+            }
+        });
         out.push_str(&format!(
             "Started {stage}. cache key: {cache_key}. Logs: {}, {}\n",
             stdout_path.display(),
@@ -7129,7 +9456,7 @@ fn start_solver_batch(
         ));
         children.push((
             stage,
-            child,
+            handle,
             prompt,
             last_message_path,
             stdout_path,
@@ -7148,7 +9475,7 @@ fn start_solver_batch(
     let mut exit_code = 0;
     for (
         stage,
-        mut child,
+        handle,
         prompt,
         last_message_path,
         stdout_path,
@@ -7165,11 +9492,9 @@ fn start_solver_batch(
     ) in children
     {
         check_run_interrupt(run_dir)?;
-        let result = child
-            .wait()
-            .map_err(|err| format!("Failed to wait for {stage}: {err}"))?
-            .code()
-            .unwrap_or(1);
+        let result = handle
+            .join()
+            .map_err(|_| format!("Failed to join {stage} capture thread."))??;
         if result != 0 && exit_code == 0 {
             exit_code = result;
         }
@@ -7189,7 +9514,7 @@ fn start_solver_batch(
                 &outputs,
                 &logs,
             )?;
-            record_token_usage(
+            record_token_usage_with_replacement(
                 run_dir,
                 &plan,
                 &stage,
@@ -7198,6 +9523,7 @@ fn start_solver_batch(
                 &prompt_hashes,
                 &workspace_hash,
                 &token_usage,
+                &["provisional"],
             )?;
         }
         let _ = refresh_cache_index(&cache)?;
@@ -7286,10 +9612,8 @@ fn stage_reset_order(run_dir: &Path, stage: &str) -> Result<Vec<String>, String>
 }
 
 fn print_user_summary(run_dir: &Path) -> Result<CommandResult, String> {
-    let summary_path = run_dir.join("review").join("user-summary.md");
-    if summary_path.exists() {
-        let text = read_text(&summary_path)?;
-        if !output_looks_placeholder("review-summary", &text) {
+    if let Some((_summary_path, text)) = effective_user_summary(run_dir) {
+        if !text.trim().is_empty() {
             return Ok(CommandResult {
                 code: 0,
                 stdout: format!("{}\n", text.trim_end()),
@@ -7455,6 +9779,48 @@ fn print_cache_status(run_dir: &Path, args: &CacheStatusArgs) -> Result<CommandR
     })
 }
 
+fn effective_user_summary(run_dir: &Path) -> Option<(PathBuf, String)> {
+    let candidates = [
+        (
+            "verification-summary",
+            run_dir.join("verification").join("user-summary.md"),
+        ),
+        (
+            "review-summary",
+            run_dir.join("review").join("user-summary.md"),
+        ),
+    ];
+    for (kind, path) in candidates {
+        if !path.exists() {
+            continue;
+        }
+        let Ok(text) = read_text(&path) else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() || output_looks_placeholder(kind, trimmed) {
+            continue;
+        }
+        return Some((path, text));
+    }
+    None
+}
+
+fn request_preview(run_dir: &Path) -> Option<(PathBuf, String)> {
+    let path = run_dir.join("request.md");
+    if !path.exists() {
+        return None;
+    }
+    let Ok(text) = read_text(&path) else {
+        return None;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some((path, text))
+}
+
 fn run_cache_prune(run_dir: &Path, args: &CachePruneArgs) -> Result<CommandResult, String> {
     let plan = load_plan(run_dir)?;
     let cache = cache_config_from_plan(&plan);
@@ -7556,6 +9922,7 @@ fn step_back_stage(
     stage: &str,
     dry_run: bool,
 ) -> Result<CommandResult, String> {
+    check_run_interrupt(run_dir)?;
     let plan = load_plan(run_dir)?;
     let reset_stages = stage_reset_order(run_dir, stage)?;
     let mut reset_files = Vec::new();
@@ -7582,7 +9949,9 @@ fn step_back_stage(
         });
     }
     for item in &reset_stages {
+        check_run_interrupt(run_dir)?;
         for (path, content) in stage_placeholder_content(&plan, run_dir, item)? {
+            check_run_interrupt(run_dir)?;
             write_text(&path, &content)?;
         }
     }
@@ -7595,6 +9964,7 @@ fn step_back_stage(
             let _ = fs::remove_file(&probe_path);
         }
     }
+    check_run_interrupt(run_dir)?;
     sync_run_artifacts(ctx, run_dir)?;
     lines.push("\nReset complete.".to_string());
     lines.push(print_status_after_action(ctx, run_dir)?);
@@ -7611,6 +9981,7 @@ fn recheck_stage(
     stage: &str,
     dry_run: bool,
 ) -> Result<CommandResult, String> {
+    check_run_interrupt(run_dir)?;
     let plan = load_plan(run_dir)?;
     if pipeline_stage_kind_for(&plan, run_dir, stage)? != PipelineStageKind::Verification {
         return Err(format!("Unsupported recheck stage: {stage}"));
@@ -7648,8 +10019,10 @@ fn recheck_stage(
         });
     }
     for (path, content) in stage_placeholder_content(&plan, run_dir, stage)? {
+        check_run_interrupt(run_dir)?;
         write_text(&path, &content)?;
     }
+    check_run_interrupt(run_dir)?;
     sync_run_artifacts(ctx, run_dir)?;
     lines.push("\nRecheck reset complete.".to_string());
     lines.push(print_status_after_action(ctx, run_dir)?);
@@ -7665,6 +10038,7 @@ fn refresh_stage_prompt(
     stage: &str,
     dry_run: bool,
 ) -> Result<CommandResult, String> {
+    check_run_interrupt(run_dir)?;
     let prompt_text = render_stage_prompt(run_dir, stage)?;
     let prompt_path = stage_prompt_path(run_dir, stage)?;
     if dry_run {
@@ -7686,6 +10060,7 @@ fn refresh_all_stage_prompts(run_dir: &Path, dry_run: bool) -> Result<CommandRes
     let stages = available_stages(run_dir)?;
     let mut chunks = Vec::new();
     for (index, stage) in stages.iter().enumerate() {
+        check_run_interrupt(run_dir)?;
         let result = refresh_stage_prompt(run_dir, stage, dry_run)?;
         chunks.push(result.stdout.trim_end().to_string());
         if dry_run && index + 1 < stages.len() {
@@ -8392,10 +10767,329 @@ fn extract_json_object(text: &str) -> Result<Value, String> {
     }
 }
 
-fn using_responses_backend(ctx: &Context) -> bool {
-    matches!(
-        ctx.stage0_backend.trim().to_lowercase().as_str(),
-        "responses" | "openai" | "responses-api"
+fn stage0_backend_mode(ctx: &Context) -> Stage0BackendMode {
+    match ctx.stage0_backend.trim().to_lowercase().as_str() {
+        "responses" | "responses-readonly" | "mixed" | "openai" | "responses-api" => {
+            Stage0BackendMode::Responses
+        }
+        "local" => Stage0BackendMode::Local,
+        _ => Stage0BackendMode::Codex,
+    }
+}
+
+fn stage0_backend_name(mode: Stage0BackendMode) -> &'static str {
+    match mode {
+        Stage0BackendMode::Codex => "codex",
+        Stage0BackendMode::Responses => "responses",
+        Stage0BackendMode::Local => "local",
+    }
+}
+
+fn stage0_prompt_path(artifact_dir: &Path, label: &str) -> PathBuf {
+    artifact_dir.join(format!("{label}.prompt.md"))
+}
+
+fn stage0_last_message_path(artifact_dir: &Path, label: &str) -> PathBuf {
+    artifact_dir.join(format!("{label}.last.md"))
+}
+
+fn stage0_stdout_path(artifact_dir: &Path, label: &str) -> PathBuf {
+    artifact_dir.join(format!("{label}.stdout.log"))
+}
+
+fn stage0_stderr_path(artifact_dir: &Path, label: &str) -> PathBuf {
+    artifact_dir.join(format!("{label}.stderr.log"))
+}
+
+fn stage0_fallback_metadata_path(artifact_dir: &Path, label: &str) -> PathBuf {
+    artifact_dir.join(format!("{label}.fallback.json"))
+}
+
+fn language_is_russian(language: &str) -> bool {
+    language.trim().to_ascii_lowercase().starts_with("ru")
+}
+
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn build_local_goal_summary(raw_task: &str) -> String {
+    for line in raw_task.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let candidate = trimmed.trim_matches('#').trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let lowered = candidate.to_ascii_lowercase();
+        if matches!(
+            lowered.as_str(),
+            "raw request" | "augmented task" | "final task" | "task" | "brief" | "request"
+        ) {
+            continue;
+        }
+        return candidate.chars().take(160).collect();
+    }
+    collapse_whitespace(raw_task).chars().take(160).collect()
+}
+
+fn task_looks_execution_ready(raw_task: &str) -> bool {
+    let collapsed = collapse_whitespace(raw_task);
+    let lowered = collapsed.to_ascii_lowercase();
+    let has_structure = raw_task.contains("##")
+        || raw_task
+            .lines()
+            .filter(|line| line.trim_start().starts_with('-'))
+            .count()
+            >= 2;
+    let has_acceptance_markers = [
+        "definition of done",
+        "done state",
+        "deliverable",
+        "goal check",
+        "validation",
+        "do not regress",
+        "verification",
+        "критери",
+        "готов",
+        "не ломать",
+        "провер",
+        "артефакт",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker));
+    collapsed.chars().count() >= 240 || (has_structure && has_acceptance_markers)
+}
+
+fn build_local_interview_questions_payload(
+    raw_task: &str,
+    language: &str,
+    max_questions: usize,
+) -> Value {
+    let mut questions = Vec::new();
+    if max_questions > 0 && !task_looks_execution_ready(raw_task) {
+        let question = if language_is_russian(language) {
+            InterviewQuestion {
+                id: "scope_constraints".to_string(),
+                question:
+                    "Какие ограничения или критерии успеха обязательны для первого рабочего прохода?"
+                        .to_string(),
+                why: "Локальный fallback сохраняет цель без сужения и просит только один уточняющий сигнал."
+                    .to_string(),
+                required: false,
+            }
+        } else {
+            InterviewQuestion {
+                id: "scope_constraints".to_string(),
+                question:
+                    "Which constraints or success criteria are mandatory for the first working pass?"
+                        .to_string(),
+                why: "The local fallback preserves the original goal and asks only one clarification when the task is still underspecified."
+                    .to_string(),
+                required: false,
+            }
+        };
+        questions.push(question);
+    }
+    json!({
+        "goal_summary": build_local_goal_summary(raw_task),
+        "questions": questions.into_iter().take(max_questions).collect::<Vec<_>>(),
+    })
+}
+
+fn build_local_final_task_markdown(raw_task: &str, qa_pairs: &[Value], language: &str) -> String {
+    let mut final_task = raw_task.trim().to_string();
+    let answered: Vec<(String, String)> = qa_pairs
+        .iter()
+        .filter_map(|item| {
+            let question = collapse_whitespace(
+                item.get("question")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            );
+            let answer = collapse_whitespace(
+                item.get("answer")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            );
+            (!question.is_empty() && !answer.is_empty()).then_some((question, answer))
+        })
+        .collect();
+    let unanswered: Vec<String> = qa_pairs
+        .iter()
+        .filter_map(|item| {
+            let question = collapse_whitespace(
+                item.get("question")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            );
+            let answer = collapse_whitespace(
+                item.get("answer")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            );
+            (!question.is_empty() && answer.is_empty()).then_some(question)
+        })
+        .collect();
+    if !answered.is_empty() {
+        let heading = if language_is_russian(language) {
+            "## Уточнения"
+        } else {
+            "## Clarifications"
+        };
+        final_task.push_str("\n\n");
+        final_task.push_str(heading);
+        final_task.push_str("\n\n");
+        for (question, answer) in answered {
+            final_task.push_str(&format!("- {question}: {answer}\n"));
+        }
+    }
+    if !unanswered.is_empty() {
+        let heading = if language_is_russian(language) {
+            "## Открытые вопросы"
+        } else {
+            "## Open Questions"
+        };
+        final_task.push_str("\n");
+        final_task.push_str(heading);
+        final_task.push_str("\n\n");
+        for question in unanswered {
+            final_task.push_str(&format!("- {question}\n"));
+        }
+    }
+    final_task.push('\n');
+    final_task
+}
+
+fn stage0_backend_failure_evidence(artifact_dir: &Path, label: &str, err: &str) -> String {
+    let mut parts = vec![err.trim().to_string()];
+    for path in [
+        stage0_stderr_path(artifact_dir, label),
+        stage0_stdout_path(artifact_dir, label),
+    ] {
+        if let Ok(text) = read_text(&path) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed.to_string());
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn classify_stage0_backend_unavailable(
+    mode: Stage0BackendMode,
+    artifact_dir: &Path,
+    label: &str,
+    err: &str,
+) -> Option<String> {
+    if mode == Stage0BackendMode::Local {
+        return None;
+    }
+    let evidence = stage0_backend_failure_evidence(artifact_dir, label, err);
+    let lowered = evidence.to_ascii_lowercase();
+    let contract_markers = [
+        "interview agent did not return a json object",
+        "interview agent returned invalid json",
+        "interview agent returned json, but it was not an object",
+        "responses api returned invalid structured json",
+        "responses api did not return structured json output text",
+        "without writing the expected last-message artifact",
+        "did not return message text",
+        "exit code 130",
+        "interrupt",
+    ];
+    if contract_markers
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return None;
+    }
+    let backend_markers = match mode {
+        Stage0BackendMode::Codex => &[
+            "failed to run command",
+            "no such file or directory",
+            "dns",
+            "lookup",
+            "websocket",
+            "https",
+            "tls",
+            "network",
+            "transport",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+            "not logged",
+            "unauthorized",
+            "authentication",
+            "forbidden",
+            "service unavailable",
+        ][..],
+        Stage0BackendMode::Responses => &[
+            "openai_api_key",
+            "http request to",
+            "status 401",
+            "status 403",
+            "status 429",
+            "status 500",
+            "status 502",
+            "status 503",
+            "status 504",
+            "dns",
+            "lookup",
+            "timed out",
+            "timeout",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "tls",
+            "network",
+        ][..],
+        Stage0BackendMode::Local => &[][..],
+    };
+    backend_markers
+        .iter()
+        .any(|marker| lowered.contains(marker))
+        .then_some(evidence)
+}
+
+fn write_stage0_fallback_metadata(
+    artifact_dir: &Path,
+    label: &str,
+    requested_backend: &str,
+    reason_kind: &str,
+    reason: &str,
+    inputs: &[PathBuf],
+) -> Result<(), String> {
+    append_log_line(
+        &stage0_stdout_path(artifact_dir, label),
+        &format!(
+            "stage0 backend requested={} effective=local reason_kind={}",
+            requested_backend, reason_kind
+        ),
+    )?;
+    append_log_line(
+        &stage0_stderr_path(artifact_dir, label),
+        &format!(
+            "local fallback engaged: {}",
+            reason.lines().next().unwrap_or(reason)
+        ),
+    )?;
+    write_json(
+        &stage0_fallback_metadata_path(artifact_dir, label),
+        &json!({
+            "created_at": iso_timestamp(),
+            "label": label,
+            "requested_backend": requested_backend,
+            "effective_backend": "local",
+            "reason_kind": reason_kind,
+            "reason": reason,
+            "input_artifacts": inputs.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+        }),
     )
 }
 
@@ -8923,6 +11617,7 @@ fn run_codex_last_message(
     workdir: &Path,
     artifact_dir: &Path,
     label: &str,
+    interrupt_run_dir: Option<&Path>,
 ) -> Result<String, String> {
     fs::create_dir_all(artifact_dir)
         .map_err(|err| format!("Could not create {}: {err}", artifact_dir.display()))?;
@@ -8946,13 +11641,41 @@ fn run_codex_last_message(
         last_message_path.display().to_string(),
         "-".to_string(),
     ];
-    let code = run_prompted_command_capture(&command, prompt, &stdout_path, &stderr_path, None)?;
+    let code = run_prompted_command_capture(
+        &command,
+        prompt,
+        &stdout_path,
+        &stderr_path,
+        interrupt_run_dir,
+        true,
+    )?;
     if code != 0 {
         let detail = read_text(&stderr_path)
             .or_else(|_| read_text(&stdout_path))
             .unwrap_or_default();
+        let last_message_status = if !last_message_path.exists() {
+            format!(
+                "The last-message artifact was not written at {}",
+                last_message_path.display()
+            )
+        } else {
+            match read_text(&last_message_path) {
+                Ok(text) if text.trim().is_empty() => format!(
+                    "The last-message artifact exists but is empty at {}",
+                    last_message_path.display()
+                ),
+                Ok(_) => format!(
+                    "A partial last-message artifact was written at {}",
+                    last_message_path.display()
+                ),
+                Err(err) => format!(
+                    "The last-message artifact could not be read at {} ({err})",
+                    last_message_path.display()
+                ),
+            }
+        };
         return Err(format!(
-            "codex exec failed during `{label}` with exit code {code}. See {} and {}. {}",
+            "codex exec failed during `{label}` with exit code {code}. {last_message_status}. See {} and {}. {}",
             stdout_path.display(),
             stderr_path.display(),
             detail.chars().take(400).collect::<String>()
@@ -8960,10 +11683,22 @@ fn run_codex_last_message(
     }
     if !last_message_path.exists() {
         return Err(format!(
-            "codex exec did not write the expected last-message artifact for `{label}`."
+            "codex exec completed `{label}` without writing the expected last-message artifact at {}. See {} and {}.",
+            last_message_path.display(),
+            stdout_path.display(),
+            stderr_path.display(),
         ));
     }
-    read_text(&last_message_path)
+    let last_message = read_text(&last_message_path)?;
+    if last_message.trim().is_empty() {
+        return Err(format!(
+            "codex exec completed `{label}` but the last-message artifact is empty at {}. See {} and {} for the upstream failure details.",
+            last_message_path.display(),
+            stdout_path.display(),
+            stderr_path.display(),
+        ));
+    }
+    Ok(last_message)
 }
 
 fn run_stage0_last_message(
@@ -8973,19 +11708,32 @@ fn run_stage0_last_message(
     artifact_dir: &Path,
     label: &str,
 ) -> Result<String, String> {
-    if using_responses_backend(ctx) {
-        let text_format = responses_text_format_for_label(label);
-        run_responses_last_message(
+    let interrupt_run_dir = current_interrupt_run_dir();
+    match stage0_backend_mode(ctx) {
+        Stage0BackendMode::Responses => {
+            let text_format = responses_text_format_for_label(label);
+            run_responses_last_message(
+                ctx,
+                prompt,
+                workdir,
+                artifact_dir,
+                label,
+                interrupt_run_dir.as_deref(),
+                text_format.as_ref(),
+            )
+        }
+        Stage0BackendMode::Codex => run_codex_last_message(
             ctx,
             prompt,
             workdir,
             artifact_dir,
             label,
-            None,
-            text_format.as_ref(),
-        )
-    } else {
-        run_codex_last_message(ctx, prompt, workdir, artifact_dir, label)
+            interrupt_run_dir.as_deref(),
+        ),
+        Stage0BackendMode::Local => Err(
+            "Local stage0 backend is handled directly by the interview fallback helpers."
+                .to_string(),
+        ),
     }
 }
 
@@ -9027,10 +11775,15 @@ fn generate_interview_questions(
     let session_dir = output_root
         .join("_interviews")
         .join(timestamp_slug(title.unwrap_or("interview")));
-    fs::create_dir_all(session_dir.join("logs"))
+    let artifact_dir = session_dir.join("logs");
+    fs::create_dir_all(&artifact_dir)
         .map_err(|err| format!("Could not create {}: {err}", session_dir.display()))?;
     write_text(&session_dir.join("raw-task.md"), raw_task)?;
     let prompt = build_interview_questions_prompt(raw_task, workspace, language, max_questions);
+    write_text(
+        &stage0_prompt_path(&artifact_dir, "interview-questions"),
+        &prompt,
+    )?;
     let cwd =
         env::current_dir().map_err(|err| format!("Could not read current directory: {err}"))?;
     let workdir = if workspace.exists() {
@@ -9038,14 +11791,69 @@ fn generate_interview_questions(
     } else {
         cwd
     };
-    let raw_questions = run_stage0_last_message(
-        ctx,
-        &prompt,
-        &workdir,
-        &session_dir.join("logs"),
-        "interview-questions",
-    )?;
-    let payload = extract_json_object(&raw_questions)?;
+    let requested_backend = stage0_backend_name(stage0_backend_mode(ctx));
+    let payload = match stage0_backend_mode(ctx) {
+        Stage0BackendMode::Local => {
+            let payload =
+                build_local_interview_questions_payload(raw_task, language, max_questions);
+            let rendered = serde_json::to_string_pretty(&payload)
+                .map_err(|err| format!("Could not serialize local stage0 questions: {err}"))?;
+            write_text(
+                &stage0_last_message_path(&artifact_dir, "interview-questions"),
+                &rendered,
+            )?;
+            write_stage0_fallback_metadata(
+                &artifact_dir,
+                "interview-questions",
+                requested_backend,
+                "configured-local",
+                "AGPIPE_STAGE0_BACKEND=local",
+                &[session_dir.join("raw-task.md")],
+            )?;
+            payload
+        }
+        mode => {
+            let raw_questions = match run_stage0_last_message(
+                ctx,
+                &prompt,
+                &workdir,
+                &artifact_dir,
+                "interview-questions",
+            ) {
+                Ok(value) => value,
+                Err(err) => {
+                    let Some(reason) = classify_stage0_backend_unavailable(
+                        mode,
+                        &artifact_dir,
+                        "interview-questions",
+                        &err,
+                    ) else {
+                        return Err(err);
+                    };
+                    let payload =
+                        build_local_interview_questions_payload(raw_task, language, max_questions);
+                    let rendered =
+                        serde_json::to_string_pretty(&payload).map_err(|serialize_err| {
+                            format!("Could not serialize local stage0 questions: {serialize_err}")
+                        })?;
+                    write_text(
+                        &stage0_last_message_path(&artifact_dir, "interview-questions"),
+                        &rendered,
+                    )?;
+                    write_stage0_fallback_metadata(
+                        &artifact_dir,
+                        "interview-questions",
+                        requested_backend,
+                        "backend-unavailable",
+                        &reason,
+                        &[session_dir.join("raw-task.md")],
+                    )?;
+                    rendered
+                }
+            };
+            extract_json_object(&raw_questions)?
+        }
+    };
     write_json(&session_dir.join("questions.json"), &payload)?;
     Ok((session_dir, payload))
 }
@@ -9060,6 +11868,13 @@ fn finalize_interview_prompt(
 ) -> Result<PathBuf, String> {
     write_json(&session_dir.join("answers.json"), &qa_pairs)?;
     let prompt = build_interview_finalize_prompt(raw_task, qa_pairs, language);
+    let artifact_dir = session_dir.join("logs");
+    fs::create_dir_all(&artifact_dir)
+        .map_err(|err| format!("Could not create {}: {err}", artifact_dir.display()))?;
+    write_text(
+        &stage0_prompt_path(&artifact_dir, "interview-finalize"),
+        &prompt,
+    )?;
     let cwd =
         env::current_dir().map_err(|err| format!("Could not read current directory: {err}"))?;
     let workdir = if workspace.exists() {
@@ -9067,13 +11882,64 @@ fn finalize_interview_prompt(
     } else {
         cwd
     };
-    let final_task_text = run_stage0_last_message(
-        ctx,
-        &prompt,
-        &workdir,
-        &session_dir.join("logs"),
-        "interview-finalize",
-    )?;
+    let requested_backend = stage0_backend_name(stage0_backend_mode(ctx));
+    let final_task_text = match stage0_backend_mode(ctx) {
+        Stage0BackendMode::Local => {
+            let final_task_text = build_local_final_task_markdown(raw_task, qa_pairs, language);
+            write_text(
+                &stage0_last_message_path(&artifact_dir, "interview-finalize"),
+                &final_task_text,
+            )?;
+            write_stage0_fallback_metadata(
+                &artifact_dir,
+                "interview-finalize",
+                requested_backend,
+                "configured-local",
+                "AGPIPE_STAGE0_BACKEND=local",
+                &[
+                    session_dir.join("raw-task.md"),
+                    session_dir.join("answers.json"),
+                ],
+            )?;
+            final_task_text
+        }
+        mode => match run_stage0_last_message(
+            ctx,
+            &prompt,
+            &workdir,
+            &artifact_dir,
+            "interview-finalize",
+        ) {
+            Ok(value) => value,
+            Err(err) => {
+                let Some(reason) = classify_stage0_backend_unavailable(
+                    mode,
+                    &artifact_dir,
+                    "interview-finalize",
+                    &err,
+                ) else {
+                    return Err(err);
+                };
+                let final_task_text = build_local_final_task_markdown(raw_task, qa_pairs, language);
+                write_text(
+                    &stage0_last_message_path(&artifact_dir, "interview-finalize"),
+                    &final_task_text,
+                )?;
+                write_stage0_fallback_metadata(
+                    &artifact_dir,
+                    "interview-finalize",
+                    requested_backend,
+                    "backend-unavailable",
+                    &reason,
+                    &[
+                        session_dir.join("raw-task.md"),
+                        session_dir.join("answers.json"),
+                    ],
+                )?;
+                final_task_text
+            }
+        },
+    };
     let final_task_path = session_dir.join("final-task.md");
     write_text(&final_task_path, &final_task_text)?;
     Ok(final_task_path)
@@ -9221,6 +12087,7 @@ pub fn automate_run(
             combined.push_str("Paused before execution.\n");
             break;
         }
+        notify_stage_changed(&next);
         let result = if bucket == "solvers" {
             run_stage_capture(ctx, run_dir, "start-solvers", &[])?
         } else {
@@ -9295,10 +12162,12 @@ pub fn amend_run(
     rewind: &str,
     auto_refresh_prompts: bool,
 ) -> Result<CommandResult, String> {
+    check_run_interrupt(run_dir)?;
     append_amendment(run_dir, note)?;
     let amendment_path = run_dir.join("amendments.md");
     let mut details = format!("Recorded amendment in {}\n", amendment_path.display());
     if rewind != "none" {
+        check_run_interrupt(run_dir)?;
         let result = run_stage_capture(ctx, run_dir, "step-back", &[rewind])?;
         details.push_str(result.stdout.trim_end());
         details.push('\n');
@@ -9315,6 +12184,7 @@ pub fn amend_run(
         }
     }
     if auto_refresh_prompts {
+        check_run_interrupt(run_dir)?;
         let result = run_stage_capture(ctx, run_dir, "refresh-prompts", &[])?;
         details.push_str(result.stdout.trim_end());
         details.push('\n');
@@ -9330,6 +12200,7 @@ pub fn amend_run(
             });
         }
     }
+    check_run_interrupt(run_dir)?;
     Ok(CommandResult {
         code: 0,
         stdout: format!(
@@ -9399,12 +12270,25 @@ pub fn append_amendment(run_dir: &Path, note: &str) -> Result<PathBuf, String> {
 }
 
 pub fn preview_text(run_dir: &Path, max_chars: usize) -> (String, String) {
+    if let Some((_path, text)) = effective_user_summary(run_dir) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return (
+                "Summary".to_string(),
+                trimmed.chars().take(max_chars).collect(),
+            );
+        }
+    }
+    if let Some((_path, text)) = request_preview(run_dir) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return (
+                "Request".to_string(),
+                trimmed.chars().take(max_chars).collect(),
+            );
+        }
+    }
     let candidates = [
-        (
-            "Summary",
-            "review-summary",
-            run_dir.join("review").join("user-summary.md"),
-        ),
         (
             "Augmented",
             "augmented-task",
@@ -9466,11 +12350,17 @@ fn latest_log_file(logs_dir: &Path) -> Option<PathBuf> {
     let mut logs: Vec<PathBuf> = fs::read_dir(logs_dir)
         .ok()?
         .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.is_file())
         .collect();
     if logs.is_empty() {
         return None;
     }
-    logs.sort_by_key(|path| path.metadata().and_then(|meta| meta.modified()).ok());
+    logs.sort_by_key(|path| {
+        (
+            log_path_has_visible_content(path),
+            path.metadata().and_then(|meta| meta.modified()).ok(),
+        )
+    });
     logs.pop()
 }
 
@@ -9486,14 +12376,26 @@ fn stage_live_log_candidates(stage: &str) -> Vec<String> {
     ]
 }
 
+fn log_path_has_visible_content(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .map(|content| content.lines().any(|line| !line.trim().is_empty()))
+        .unwrap_or(false)
+}
+
 fn stage_live_log_path(logs_dir: &Path, stage: &str) -> Option<PathBuf> {
+    let mut fallback = None;
     for candidate in stage_live_log_candidates(stage) {
         let path = logs_dir.join(candidate);
         if path.exists() {
-            return Some(path);
+            if fallback.is_none() {
+                fallback = Some(path.clone());
+            }
+            if log_path_has_visible_content(&path) {
+                return Some(path);
+            }
         }
     }
-    None
+    fallback
 }
 
 pub fn contextual_log_excerpt(
@@ -9969,30 +12871,45 @@ pub fn task_flow_stream(ctx: &Context, subcommand: &str, extra: &[String]) -> Re
 #[cfg(test)]
 mod tests {
     use super::{
-        automate_run, available_stages, build_cache_config, build_responses_stage_prompt,
-        cache_lock, cache_lock_owner_path, capture_host_probe, choose_roles,
-        contextual_log_excerpt, create_follow_up_run, create_run, current_unix_secs,
+        amend_run, automate_run, available_stages, build_cache_config,
+        build_responses_stage_prompt, cache_lock, cache_lock_owner_path, capture_host_probe,
+        choose_roles, contextual_log_excerpt, create_follow_up_run, create_run, current_unix_secs,
         detect_host_facts, detect_local_template, doctor_report, ensure_cache_layout,
-        finalize_interview_prompt, generate_interview_questions, host_probe_path,
-        host_probe_state, load_plan, materialize_embedded_repo_root,
-        maybe_copy_interview_artifacts, next_stage_for_run, output_looks_placeholder,
-        preview_text, read_file_digest, read_json, read_text, require_valid_order,
-        restore_stage_cache, run_stage_capture, safe_next_action_for_run, save_plan,
-        stage_cache_key, stage_prompt_path, stage_rank, status_report, store_stage_cache,
-        summarize_token_ledger, sync_run_artifacts, task_flow_capture, write_json, write_text,
-        CacheLockOwner, Context, InterviewFinalizePayload, InterviewQuestionsPayload,
-        LocalTemplateKind, Plan, RerunArgs, RunTokenLedger, RunTokenLedgerEntry,
-        StageBackendKind, TokenUsage, DECOMPOSITION_RULES_REF, REVIEW_RUBRIC_REF,
+        finalize_interview_prompt, generate_interview_questions, host_probe_path, host_probe_state,
+        load_plan, load_service_check_spec, materialize_embedded_repo_root,
+        maybe_copy_interview_artifacts, next_stage_for_run, output_looks_placeholder, preview_text,
+        read_file_digest, read_json, read_text, record_token_usage_with_replacement,
+        render_verification_prompt, require_valid_order, restore_stage_cache, reviewer_stack_for,
+        run_prompted_command_capture, run_stage0_last_message, run_stage_capture,
+        runtime_check_required, runtime_check_run, safe_next_action_for_run, save_plan,
+        solver_count_for, stage_cache_key, stage_prompt_path, stage_rank, status_report,
+        status_text, store_stage_cache, summarize_token_ledger, sync_run_artifacts,
+        task_flow_capture, with_engine_observer, write_json, write_text, CacheLockOwner, Context,
+        EngineObserver, InterviewFinalizePayload, InterviewQuestionsPayload, LocalTemplateKind,
+        Plan, PromptCacheHashes, RerunArgs, RunTokenLedger, RunTokenLedgerEntry, StageBackendKind,
+        TokenBudget, TokenUsage, WorkstreamHint, DECOMPOSITION_RULES_REF, REVIEW_RUBRIC_REF,
         ROLE_MAP_REF, STAGE_RESULTS_AREA, VERIFICATION_RUBRIC_REF,
     };
-    use serde_json::json;
+    use crate::runtime;
+    use serde_json::{json, Value};
     use std::fs;
     use std::io::{BufRead, BufReader, Read as _, Write as _};
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::thread;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    struct InterruptObserver {
+        run_dir: PathBuf,
+    }
+
+    impl EngineObserver for InterruptObserver {
+        fn interrupt_run_dir(&self) -> Option<PathBuf> {
+            Some(self.run_dir.clone())
+        }
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -10233,6 +13150,131 @@ print "mock $label complete"
             invocations_path,
             tokens_path,
         )
+    }
+
+    fn mock_script_context(name: &str, script: &str) -> (Context, PathBuf) {
+        let root = temp_dir(&format!("mock-script-{name}"));
+        let bin_path = root.join("mock-script.zsh");
+        write_text(&bin_path, script).expect("write mock script");
+        let mut permissions = fs::metadata(&bin_path)
+            .expect("stat mock script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin_path, permissions).expect("chmod mock script");
+        (
+            Context {
+                repo_root: std::env::current_dir().expect("current dir"),
+                codex_bin: bin_path.display().to_string(),
+                stage0_backend: "codex".to_string(),
+                stage_backend: "codex".to_string(),
+                openai_api_base: "https://api.openai.com/v1".to_string(),
+                openai_api_key: None,
+                openai_model: "gpt-5".to_string(),
+                openai_prompt_cache_key_prefix: "agpipe-stage0-v1".to_string(),
+                openai_prompt_cache_retention: None,
+                openai_store: false,
+                openai_background: true,
+            },
+            root,
+        )
+    }
+
+    fn mock_parallel_solver_context(name: &str, solver_sleep_secs: u64) -> (Context, PathBuf) {
+        let root = temp_dir(&format!("mock-parallel-solver-{name}"));
+        let bin_path = root.join("mock-codex.zsh");
+        let script = format!(
+            r##"#!/bin/zsh
+set -euo pipefail
+
+last_message=""
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+prompt="$(cat)"
+if [[ -z "$last_message" ]]; then
+  echo "missing --output-last-message" >&2
+  exit 2
+fi
+
+label="${{${{last_message:t}}%.last.md}}"
+root="${{last_message:h:h}}"
+mkdir -p "$root"
+
+case "$label" in
+  intake)
+    cat > "$root/brief.md" <<'EOF'
+# Brief
+
+Mock intake completed.
+EOF
+    cat > "$last_message" <<'EOF'
+Mock intake complete.
+EOF
+    ;;
+  solver-*)
+    mkdir -p "$root/solutions/$label"
+    python3 -c 'import pathlib, time, sys; pathlib.Path(sys.argv[1]).write_text(f"{{time.time():.6f}}\n", encoding="utf-8")' "$root/solutions/$label/started-at.txt"
+    sleep {solver_sleep_secs}
+    cat > "$root/solutions/$label/RESULT.md" <<EOF
+# Result
+
+Mock solution from $label.
+EOF
+    cat > "$last_message" <<EOF
+Mock $label complete.
+EOF
+    ;;
+  *)
+    cat > "$last_message" <<EOF
+Mock $label complete.
+EOF
+    ;;
+esac
+
+print "mock $label complete"
+"##,
+            solver_sleep_secs = solver_sleep_secs
+        );
+        write_text(&bin_path, &script).expect("write mock parallel solver codex");
+        let mut permissions = fs::metadata(&bin_path)
+            .expect("stat mock parallel solver codex")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&bin_path, permissions).expect("chmod mock parallel solver codex");
+        (
+            Context {
+                repo_root: std::env::current_dir().expect("current dir"),
+                codex_bin: bin_path.display().to_string(),
+                stage0_backend: "codex".to_string(),
+                stage_backend: "codex".to_string(),
+                openai_api_base: "https://api.openai.com/v1".to_string(),
+                openai_api_key: None,
+                openai_model: "gpt-5".to_string(),
+                openai_prompt_cache_key_prefix: "agpipe-stage0-v1".to_string(),
+                openai_prompt_cache_retention: None,
+                openai_store: false,
+                openai_background: true,
+            },
+            root,
+        )
+    }
+
+    fn read_solver_started_at(run_dir: &Path, stage: &str) -> f64 {
+        read_text(&run_dir.join("solutions").join(stage).join("started-at.txt"))
+            .expect("read solver started-at")
+            .trim()
+            .trim_end_matches("\\n")
+            .parse::<f64>()
+            .expect("parse solver started-at")
     }
 
     fn mock_responses_context(
@@ -10531,6 +13573,334 @@ print "mock $label complete"
         .expect("seed execution report");
     }
 
+    fn seed_preexecution_outputs(run_dir: &Path, plan: &Plan) {
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nSeeded intake.\n").expect("seed brief");
+        for solver in &plan.solver_roles {
+            write_text(
+                &run_dir
+                    .join("solutions")
+                    .join(&solver.solver_id)
+                    .join("RESULT.md"),
+                &format!("# Result\n\nSeeded result for {}.\n", solver.solver_id),
+            )
+            .expect("seed solver result");
+        }
+        write_text(
+            &run_dir.join("review").join("report.md"),
+            "# Review Report\n\nSeeded review.\n",
+        )
+        .expect("seed review report");
+        write_text(
+            &run_dir.join("review").join("scorecard.json"),
+            "{\"winner\":\"solver-a\"}\n",
+        )
+        .expect("seed scorecard");
+        write_text(
+            &run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nSeeded review summary.\n",
+        )
+        .expect("seed review summary");
+    }
+
+    #[test]
+    fn runtime_check_rest_alias_defaults_to_http_200_for_scenarios_and_steps() {
+        let ctx = test_context();
+        let workspace = temp_dir("runtime-check-rest-alias-workspace");
+        let output_root = temp_dir("runtime-check-rest-alias-output");
+        let cache_root = temp_dir("runtime-check-rest-alias-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Проверить runtime-check spec alias normalization.",
+            &workspace,
+            &output_root,
+            Some("runtime-check-rest-alias"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create runtime-check alias run");
+
+        write_text(
+            &workspace.join(".agpipe").join("runtime-check.json"),
+            &serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "mode": "workflow",
+                "workdir": ".",
+                "scenarios": [
+                    {
+                        "id": "rest-scenario",
+                        "kind": "rest",
+                        "url": "https://example.invalid/rest"
+                    },
+                    {
+                        "id": "rest-step",
+                        "kind": "workflow",
+                        "steps": [
+                            {
+                                "kind": "rest",
+                                "url": "https://example.invalid/step"
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .expect("serialize rest alias spec"),
+        )
+        .expect("write rest alias spec");
+
+        let (_, _, spec) = load_service_check_spec(&run_dir, None)
+            .expect("load runtime-check spec")
+            .expect("discovered runtime-check spec");
+
+        assert_eq!(spec.scenarios[0].kind, "rest");
+        assert_eq!(spec.scenarios[0].expect_status, 200);
+        assert_eq!(spec.scenarios[1].steps[0].kind, "rest");
+        assert_eq!(spec.scenarios[1].steps[0].expect_status, 200);
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn runtime_check_workflow_enforces_the_pty_exit_code() {
+        let ctx = test_context();
+        let workspace = temp_dir("runtime-check-workflow-exit-workspace");
+        let output_root = temp_dir("runtime-check-workflow-exit-output");
+        let cache_root = temp_dir("runtime-check-workflow-exit-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Проверить workflow runtime-check через PTY.",
+            &workspace,
+            &output_root,
+            Some("runtime-check-workflow-exit"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create workflow runtime-check run");
+
+        write_text(
+            &workspace.join("bad.py"),
+            "import sys\nprint(\"BOOT\", flush=True)\nsys.exit(7)\n",
+        )
+        .expect("write bad pty script");
+        write_text(
+            &workspace.join(".agpipe").join("runtime-check.json"),
+            &serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "mode": "workflow",
+                "workdir": ".",
+                "scenarios": [
+                    {
+                        "id": "bad-workflow",
+                        "kind": "workflow",
+                        "expect_exit_code": 0,
+                        "steps": [
+                            {
+                                "kind": "pty_start",
+                                "command": "python3 bad.py",
+                                "rows": 20,
+                                "cols": 80
+                            },
+                            {
+                                "kind": "pty_wait_contains",
+                                "pattern": "BOOT",
+                                "timeout_secs": 2
+                            }
+                        ]
+                    }
+                ]
+            }))
+            .expect("serialize workflow runtime-check spec"),
+        )
+        .expect("write workflow runtime-check spec");
+
+        let result =
+            runtime_check_run(&run_dir, "verification", None).expect("run workflow runtime-check");
+        assert_eq!(result.code, 1);
+
+        let summary: Value = read_json(
+            &run_dir
+                .join("runtime")
+                .join("runtime-check")
+                .join("verification")
+                .join("summary.json"),
+        )
+        .expect("read runtime-check summary");
+        assert_eq!(summary["status"], "failed");
+        assert_eq!(summary["scenarios"][0]["status"], "failed");
+        assert_eq!(summary["scenarios"][0]["exit_code"], 7);
+        assert!(summary["scenarios"][0]["failure_reason"]
+            .as_str()
+            .expect("workflow failure reason")
+            .contains("expected exit code 0, got 7"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn runtime_check_requirement_ignores_generic_fullstack_hints_without_runtime_keywords() {
+        let ctx = test_context();
+        let workspace = temp_dir("runtime-check-requirement-workspace");
+        let output_root = temp_dir("runtime-check-requirement-output");
+        let cache_root = temp_dir("runtime-check-requirement-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Проверить cache reuse на verification stage.",
+            &workspace,
+            &output_root,
+            Some("runtime-check-requirement"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create runtime-check requirement run");
+
+        assert!(!runtime_check_required(&run_dir, "verification")
+            .expect("check runtime-check requirement"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn verification_stage_stops_before_backend_when_runtime_check_fails() {
+        let workspace = temp_dir("runtime-check-verification-gate-workspace");
+        let output_root = temp_dir("runtime-check-verification-gate-output");
+        let cache_root = temp_dir("runtime-check-verification-gate-cache");
+        let (ctx, mock_root, _bin, invocations_path, _tokens_path) =
+            mock_codex_context("verification-runtime-gate");
+
+        let run_dir = create_run(
+            &ctx,
+            "Проверить verification gate без лишнего backend вызова.",
+            &workspace,
+            &output_root,
+            Some("verification-runtime-gate"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create verification gate run");
+        let plan = load_plan(&run_dir).expect("load verification gate plan");
+        seed_preverification_outputs(&run_dir, &plan);
+        write_text(
+            &workspace.join(".agpipe").join("runtime-check.json"),
+            &serde_json::to_string_pretty(&json!({
+                "version": 1,
+                "mode": "workflow",
+                "workdir": ".",
+                "scenarios": [
+                    {
+                        "id": "failing-preflight",
+                        "kind": "command",
+                        "command": "echo runtime-check-broken >&2; exit 7",
+                        "expect_exit_code": 0
+                    }
+                ]
+            }))
+            .expect("serialize failing verification spec"),
+        )
+        .expect("write failing verification spec");
+
+        let result = run_stage_capture(&ctx, &run_dir, "start", &["verification"])
+            .expect("run verification with failing runtime-check");
+        assert_eq!(result.code, 1);
+        assert!(result
+            .stdout
+            .contains("Blocked verification because runtime-check did not pass."));
+        assert_eq!(line_count(&invocations_path), 0);
+
+        let summary: Value = read_json(
+            &run_dir
+                .join("runtime")
+                .join("runtime-check")
+                .join("verification")
+                .join("summary.json"),
+        )
+        .expect("read verification runtime-check summary");
+        assert_eq!(summary["status"], "failed");
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn execution_stage_requires_runtime_check_for_runtime_facing_tasks() {
+        let workspace = temp_dir("runtime-check-required-execution-workspace");
+        let output_root = temp_dir("runtime-check-required-execution-output");
+        let cache_root = temp_dir("runtime-check-required-execution-cache");
+        let (ctx, mock_root, _bin, invocations_path, _tokens_path) =
+            mock_codex_context("execution-runtime-required");
+
+        let run_dir = create_run(
+            &ctx,
+            "Поднять HTTP сервис и прогнать его через runtime gate.",
+            &workspace,
+            &output_root,
+            Some("execution-runtime-required"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create execution runtime-required run");
+        let plan = load_plan(&run_dir).expect("load execution runtime-required plan");
+        seed_preexecution_outputs(&run_dir, &plan);
+
+        let result =
+            run_stage_capture(&ctx, &run_dir, "start", &["execution"]).expect("run execution");
+        assert_eq!(result.code, 1);
+        assert!(result.stdout.contains(
+            "Runtime check failed for phase `execution` because no workspace spec was found."
+        ));
+        assert!(result
+            .stdout
+            .contains("Runtime-facing tasks must create `.agpipe/runtime-check.json` before `execution` can complete."));
+        assert_eq!(line_count(&invocations_path), 1);
+        assert!(run_dir.join("execution").join("report.md").exists());
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
     #[test]
     fn contextual_log_excerpt_prefers_pending_stage_log() {
         let run_dir = temp_run_dir("pending-stage-log");
@@ -10554,6 +13924,292 @@ print "mock $label complete"
     }
 
     #[test]
+    fn contextual_log_excerpt_uses_stderr_when_stdout_is_empty() {
+        let run_dir = temp_run_dir("pending-stage-stderr-log");
+        fs::write(run_dir.join("logs").join("intake.stdout.log"), "").expect("write empty stdout");
+        fs::write(
+            run_dir.join("logs").join("intake.stderr.log"),
+            "progress 1\nprogress 2\n",
+        )
+        .expect("write stderr log");
+
+        let (title, lines) = contextual_log_excerpt(&run_dir, None, Some("intake"), 12);
+
+        assert_eq!(title, "intake.stderr.log");
+        assert_eq!(lines, vec!["progress 1", "progress 2"]);
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn codex_capture_moves_successful_progress_out_of_stderr_log() {
+        let root = temp_dir("codex-log-normalization");
+        let script = root.join("mock-codex-progress.zsh");
+        write_text(
+            &script,
+            "#!/bin/zsh\nset -euo pipefail\ncat >/dev/null\nprint 'stdout line'\nprint 'progress line' >&2\n",
+        )
+        .expect("write mock progress script");
+        let mut permissions = fs::metadata(&script)
+            .expect("stat mock progress script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod mock progress script");
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+
+        let code = run_prompted_command_capture(
+            &[script.display().to_string()],
+            "prompt",
+            &stdout_path,
+            &stderr_path,
+            None,
+            true,
+        )
+        .expect("run prompted command");
+
+        assert_eq!(code, 0);
+        let stdout = read_text(&stdout_path).expect("read stdout log");
+        let stderr = read_text(&stderr_path).expect("read stderr log");
+        assert!(stdout.contains("stdout line"));
+        assert!(stdout.contains("progress line"));
+        assert!(stderr.trim().is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompted_command_capture_returns_130_when_interrupt_requested() {
+        let root = temp_dir("prompted-command-interrupt");
+        let run_dir = temp_run_dir("prompted-command-interrupt-run");
+        let script = root.join("mock-capture-sleep.zsh");
+        write_text(
+            &script,
+            "#!/bin/zsh\nset -euo pipefail\ncat >/dev/null\nsleep 30\n",
+        )
+        .expect("write mock sleep script");
+        let mut permissions = fs::metadata(&script)
+            .expect("stat mock sleep script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod mock sleep script");
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let run_dir_for_thread = run_dir.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            crate::runtime::request_interrupt(&run_dir_for_thread).expect("request interrupt");
+        });
+
+        let code = run_prompted_command_capture(
+            &[script.display().to_string()],
+            "prompt",
+            &stdout_path,
+            &stderr_path,
+            Some(&run_dir),
+            true,
+        )
+        .expect("run prompted command");
+
+        assert_eq!(code, 130);
+
+        let _ = crate::runtime::clear_interrupt_request(&run_dir);
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stage0_codex_capture_honors_interrupt_requests_from_observer() {
+        let root = temp_dir("stage0-codex-interrupt");
+        let run_dir = temp_run_dir("stage0-codex-interrupt-run");
+        let script = root.join("mock-codex-sleep.zsh");
+        write_text(
+            &script,
+            "#!/bin/zsh\nset -euo pipefail\ncat >/dev/null\nsleep 30\n",
+        )
+        .expect("write mock codex sleep script");
+        let mut permissions = fs::metadata(&script)
+            .expect("stat mock codex sleep script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod mock codex sleep script");
+
+        let ctx = Context {
+            repo_root: root.clone(),
+            codex_bin: script.display().to_string(),
+            stage0_backend: "codex".to_string(),
+            stage_backend: "codex".to_string(),
+            openai_api_base: "https://api.openai.com/v1".to_string(),
+            openai_api_key: None,
+            openai_model: "gpt-5".to_string(),
+            openai_prompt_cache_key_prefix: "agpipe-stage0-v1".to_string(),
+            openai_prompt_cache_retention: None,
+            openai_store: false,
+            openai_background: false,
+        };
+        let observer = Arc::new(InterruptObserver {
+            run_dir: run_dir.clone(),
+        });
+        let run_dir_for_thread = run_dir.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            crate::runtime::request_interrupt(&run_dir_for_thread).expect("request interrupt");
+        });
+
+        let err = with_engine_observer(observer, || {
+            run_stage0_last_message(
+                &ctx,
+                "prompt",
+                &root,
+                &root.join("artifacts"),
+                "stage0-test",
+            )
+        })
+        .expect_err("stage0 capture should be interrupted");
+
+        assert!(
+            err.contains("exit code 130"),
+            "unexpected interrupt error: {err}"
+        );
+
+        let _ = crate::runtime::clear_interrupt_request(&run_dir);
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_run_artifacts_honors_interrupt_request() {
+        let ctx = test_context();
+        let workspace = temp_dir("sync-interrupt-workspace");
+        let output_root = temp_dir("sync-interrupt-output");
+        let run_dir = create_run(
+            &ctx,
+            "Build a backend service.",
+            &workspace,
+            &output_root,
+            Some("sync-interrupt"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        crate::runtime::request_interrupt(&run_dir).expect("request interrupt");
+        let err = sync_run_artifacts(&ctx, &run_dir).expect_err("sync should be interrupted");
+        assert!(err.contains("Interrupted from agpipe."));
+
+        let _ = crate::runtime::clear_interrupt_request(&run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn amend_run_honors_interrupt_request() {
+        let ctx = test_context();
+        let workspace = temp_dir("amend-interrupt-workspace");
+        let output_root = temp_dir("amend-interrupt-output");
+        let run_dir = create_run(
+            &ctx,
+            "Build a backend service.",
+            &workspace,
+            &output_root,
+            Some("amend-interrupt"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        crate::runtime::request_interrupt(&run_dir).expect("request interrupt");
+        let err = amend_run(&ctx, &run_dir, "new note", "intake", true)
+            .expect_err("amend should be interrupted");
+        assert!(err.contains("Interrupted from agpipe."));
+
+        let _ = crate::runtime::clear_interrupt_request(&run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn provisional_token_usage_is_replaced_by_final_stage_usage() {
+        let run_dir = temp_run_dir("provisional-token-ledger");
+        let plan = Plan {
+            token_budget: TokenBudget {
+                total_tokens: 1_000,
+                warning_threshold_tokens: 100,
+                source: "test".to_string(),
+            },
+            ..Plan::default()
+        };
+        let prompt_hashes = PromptCacheHashes {
+            combined: "combined".to_string(),
+            stable_prefix: "stable".to_string(),
+            dynamic_suffix: "dynamic".to_string(),
+        };
+        let provisional = TokenUsage {
+            source: "estimated-prompt-start".to_string(),
+            prompt_tokens: 100,
+            cached_prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 100,
+            estimated_saved_tokens: 0,
+        };
+        let final_usage = TokenUsage {
+            source: "estimated-local".to_string(),
+            prompt_tokens: 100,
+            cached_prompt_tokens: 0,
+            completion_tokens: 50,
+            total_tokens: 150,
+            estimated_saved_tokens: 0,
+        };
+
+        record_token_usage_with_replacement(
+            &run_dir,
+            &plan,
+            "intake",
+            "provisional",
+            "cache-key",
+            &prompt_hashes,
+            "workspace-hash",
+            &provisional,
+            &["provisional"],
+        )
+        .expect("record provisional usage");
+        let provisional_summary =
+            summarize_token_ledger(&run_dir, &plan).expect("summarize provisional");
+        assert_eq!(provisional_summary.used_total_tokens, 100);
+        assert_eq!(provisional_summary.remaining_tokens, Some(900));
+
+        record_token_usage_with_replacement(
+            &run_dir,
+            &plan,
+            "intake",
+            "executed",
+            "cache-key",
+            &prompt_hashes,
+            "workspace-hash",
+            &final_usage,
+            &["provisional"],
+        )
+        .expect("record final usage");
+        let final_summary = summarize_token_ledger(&run_dir, &plan).expect("summarize final");
+        assert_eq!(final_summary.used_total_tokens, 150);
+        assert_eq!(final_summary.remaining_tokens, Some(850));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
     fn contextual_log_excerpt_reports_missing_stage_and_shows_latest_available() {
         let run_dir = temp_run_dir("missing-stage-log");
         fs::write(
@@ -10568,6 +14224,27 @@ print "mock $label complete"
         assert_eq!(title, "Pending stage: review");
         assert!(joined.contains("No log yet for pending stage `review`."));
         assert!(joined.contains("Latest available log: review.prompt.md"));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn contextual_log_excerpt_prefers_latest_visible_log_over_empty_newer_log() {
+        let run_dir = temp_run_dir("missing-stage-visible-latest");
+        fs::write(
+            run_dir.join("logs").join("execution.stdout.log"),
+            "useful execution output\n",
+        )
+        .expect("write stdout log");
+        fs::write(run_dir.join("logs").join("execution.stderr.log"), "")
+            .expect("write empty stderr log");
+
+        let (title, lines) = contextual_log_excerpt(&run_dir, None, Some("verification"), 12);
+        let joined = lines.join("\n");
+
+        assert_eq!(title, "Pending stage: verification");
+        assert!(joined.contains("Latest available log: execution.stdout.log"));
+        assert!(joined.contains("useful execution output"));
 
         let _ = fs::remove_dir_all(run_dir);
     }
@@ -10689,6 +14366,299 @@ print "mock $label complete"
 
         let _ = fs::remove_dir_all(output_root);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn generate_interview_questions_falls_back_locally_when_backend_is_unavailable() {
+        let output_root = temp_dir("interview-questions-fallback-output");
+        let workspace = temp_dir("interview-questions-fallback-workspace");
+        let (ctx, root) = mock_script_context(
+            "stage0-network-fallback",
+            r##"#!/bin/zsh
+set -euo pipefail
+
+last_message=""
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+: > "$last_message"
+echo "dns lookup failure while contacting codex websocket backend" >&2
+exit 1
+"##,
+        );
+
+        let (session_dir, payload) = generate_interview_questions(
+            &ctx,
+            "Полностью проверить pipeline end-to-end, сохранить реальные артефакты stage0 и не регресснуть validation path.",
+            &workspace,
+            &output_root,
+            Some("fallback"),
+            "ru",
+            1,
+        )
+        .expect("expected local fallback");
+
+        assert!(session_dir.join("questions.json").exists());
+        assert!(session_dir
+            .join("logs")
+            .join("interview-questions.fallback.json")
+            .exists());
+        assert!(!payload
+            .get("goal_summary")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .is_empty());
+        assert!(payload
+            .get("questions")
+            .and_then(|value| value.as_array())
+            .map(|items| items.len() <= 1)
+            .unwrap_or(false));
+        let fallback: Value = read_json(
+            &session_dir
+                .join("logs")
+                .join("interview-questions.fallback.json"),
+        )
+        .expect("read fallback metadata");
+        assert_eq!(
+            fallback
+                .get("requested_backend")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+            "codex"
+        );
+        assert_eq!(
+            fallback
+                .get("effective_backend")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+            "local"
+        );
+        assert_eq!(
+            fallback
+                .get("reason_kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+            "backend-unavailable"
+        );
+        assert!(
+            read_text(&session_dir.join("logs").join("interview-questions.last.md"))
+                .expect("read fallback last message")
+                .contains("\"goal_summary\"")
+        );
+        assert!(read_text(
+            &session_dir
+                .join("logs")
+                .join("interview-questions.stderr.log")
+        )
+        .expect("read fallback stderr")
+        .contains("dns lookup failure"));
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generate_interview_questions_does_not_hide_invalid_json_with_local_fallback() {
+        let output_root = temp_dir("interview-questions-invalid-json-output");
+        let workspace = temp_dir("interview-questions-invalid-json-workspace");
+        let (ctx, root) = mock_script_context(
+            "stage0-invalid-json",
+            r##"#!/bin/zsh
+set -euo pipefail
+
+last_message=""
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+cat > "$last_message" <<'EOF'
+not-json
+EOF
+print "mock invalid json"
+"##,
+        );
+
+        let err = generate_interview_questions(
+            &ctx,
+            "Need a narrow validation probe.",
+            &workspace,
+            &output_root,
+            Some("invalid-json"),
+            "en",
+            2,
+        )
+        .expect_err("invalid JSON should fail closed");
+
+        assert!(err.contains("Interview agent did not return a JSON object."));
+        let session_dir = only_child_dir(&output_root.join("_interviews"));
+        assert!(!session_dir
+            .join("logs")
+            .join("interview-questions.fallback.json")
+            .exists());
+        assert!(!session_dir.join("questions.json").exists());
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_stage0_last_message_reports_empty_last_message_on_codex_failure() {
+        let workspace = temp_dir("stage0-empty-last-message-workspace");
+        let artifacts = temp_dir("stage0-empty-last-message-artifacts");
+        let (ctx, root) = mock_script_context(
+            "empty-last-message",
+            r##"#!/bin/zsh
+set -euo pipefail
+
+last_message=""
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+: > "$last_message"
+echo "mock transport failure" >&2
+exit 1
+"##,
+        );
+
+        let err = run_stage0_last_message(
+            &ctx,
+            "stage0 failure probe",
+            &workspace,
+            &artifacts,
+            "interview-questions",
+        )
+        .expect_err("expected stage0 failure");
+
+        assert!(err.contains("last-message artifact exists but is empty"));
+        assert!(err.contains("mock transport failure"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(artifacts);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_stage0_last_message_reports_missing_last_message_on_success_exit() {
+        let workspace = temp_dir("stage0-missing-last-message-workspace");
+        let artifacts = temp_dir("stage0-missing-last-message-artifacts");
+        let (ctx, root) = mock_script_context(
+            "missing-last-message",
+            r##"#!/bin/zsh
+set -euo pipefail
+echo "mock success without artifact"
+exit 0
+"##,
+        );
+
+        let err = run_stage0_last_message(
+            &ctx,
+            "stage0 missing artifact probe",
+            &workspace,
+            &artifacts,
+            "interview-finalize",
+        )
+        .expect_err("expected missing last-message failure");
+
+        assert!(err.contains("without writing the expected last-message artifact"));
+        assert!(err.contains("interview-finalize.last.md"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(artifacts);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn finalize_interview_prompt_falls_back_locally_when_backend_is_unavailable() {
+        let session_dir = temp_dir("interview-finalize-fallback-session");
+        let workspace = temp_dir("interview-finalize-fallback-workspace");
+        let (ctx, root) = mock_script_context(
+            "finalize-network-fallback",
+            r##"#!/bin/zsh
+set -euo pipefail
+
+last_message=""
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+: > "$last_message"
+echo "websocket transport timeout while contacting codex" >&2
+exit 1
+"##,
+        );
+        let raw_task =
+            "# Augmented Task\n\nСохранить исходную цель и собрать доказательство до execution.";
+        write_text(&session_dir.join("raw-task.md"), raw_task).expect("seed raw task");
+        let answers = vec![json!({
+            "id": "proof_mode",
+            "question": "Какой proof path обязателен?",
+            "answer": "Нужен живой target-workspace path до execution."
+        })];
+
+        let final_task_path =
+            finalize_interview_prompt(&ctx, raw_task, &workspace, &session_dir, &answers, "ru")
+                .expect("expected finalize fallback");
+
+        let final_task = read_text(&final_task_path).expect("read final task");
+        assert!(final_task.contains("Сохранить исходную цель"));
+        assert!(final_task.contains("живой target-workspace path до execution"));
+        assert!(session_dir
+            .join("logs")
+            .join("interview-finalize.fallback.json")
+            .exists());
+        let fallback: Value = read_json(
+            &session_dir
+                .join("logs")
+                .join("interview-finalize.fallback.json"),
+        )
+        .expect("read finalize fallback metadata");
+        assert_eq!(
+            fallback
+                .get("reason_kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+            "backend-unavailable"
+        );
+
+        let _ = fs::remove_dir_all(session_dir);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10949,6 +14919,52 @@ print "mock $label complete"
 
         assert_eq!(label, "Brief");
         assert!(preview.contains("Real intake brief"));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn preview_text_prefers_verification_summary_when_available() {
+        let run_dir = temp_run_dir("preview-verification-summary");
+        fs::create_dir_all(run_dir.join("review")).expect("create review dir");
+        fs::create_dir_all(run_dir.join("verification")).expect("create verification dir");
+        write_text(
+            &run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nReview summary.\n",
+        )
+        .expect("write review summary");
+        write_text(
+            &run_dir.join("verification").join("user-summary.md"),
+            "# Verification Summary\n\nVerification summary.\n",
+        )
+        .expect("write verification summary");
+
+        let (label, preview) = preview_text(&run_dir, 2400);
+
+        assert_eq!(label, "Summary");
+        assert!(preview.contains("Verification summary."));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn preview_text_falls_back_to_request_before_intake() {
+        let run_dir = temp_run_dir("preview-request-fallback");
+        write_text(
+            &run_dir.join("request.md"),
+            "# Follow-up Task\n\nRepair the preserved-path smoke blocker.\n",
+        )
+        .expect("write request");
+        write_text(
+            &run_dir.join("brief.md"),
+            "# Brief\n\nPending intake stage.\n",
+        )
+        .expect("write placeholder brief");
+
+        let (label, preview) = preview_text(&run_dir, 2400);
+
+        assert_eq!(label, "Request");
+        assert!(preview.contains("Repair the preserved-path smoke blocker."));
 
         let _ = fs::remove_dir_all(run_dir);
     }
@@ -11722,8 +15738,11 @@ print "mock $label complete"
         let ctx = test_context();
         let workspace = temp_dir("pipeline-automate-workspace");
         let output_root = temp_dir("pipeline-automate-output");
-        write_text(&workspace.join("agpipe.pipeline.yml"), custom_pipeline_yaml())
-            .expect("write pipeline yaml");
+        write_text(
+            &workspace.join("agpipe.pipeline.yml"),
+            custom_pipeline_yaml(),
+        )
+        .expect("write pipeline yaml");
 
         let run_dir = create_run(
             &ctx,
@@ -11743,7 +15762,11 @@ print "mock $label complete"
         .expect("create run");
 
         let result = automate_run(&ctx, &run_dir, "verification", true).expect("automate run");
-        assert_eq!(result.code, 0, "unexpected automation output:\n{}", result.stdout);
+        assert_eq!(
+            result.code, 0,
+            "unexpected automation output:\n{}",
+            result.stdout
+        );
         let status = status_report(&ctx, &run_dir).expect("status");
         assert_eq!(status.next, "none");
         assert_eq!(status.goal, "complete");
@@ -11756,10 +15779,7 @@ print "mock $label complete"
             status.stages.get("research-a").map(String::as_str),
             Some("done")
         );
-        assert_eq!(
-            status.stages.get("audit").map(String::as_str),
-            Some("done")
-        );
+        assert_eq!(status.stages.get("audit").map(String::as_str), Some("done"));
     }
 
     #[test]
@@ -11791,7 +15811,8 @@ print "mock $label complete"
         .expect("create run");
 
         let mut plan = load_plan(&run_dir).expect("load plan");
-        let initial_expected = choose_roles(&plan.task_kind, std::cmp::max(1, plan.solver_roles.len()));
+        let initial_expected =
+            choose_roles(&plan.task_kind, std::cmp::max(1, plan.solver_roles.len()));
         assert_eq!(
             plan.solver_roles.first().map(|role| role.role.as_str()),
             initial_expected.first().map(|role| role.role.as_str())
@@ -11810,8 +15831,10 @@ print "mock $label complete"
         sync_run_artifacts(&ctx, &run_dir).expect("sync run");
 
         let updated = load_plan(&run_dir).expect("reload plan");
-        let updated_expected =
-            choose_roles(&updated.task_kind, std::cmp::max(1, updated.solver_roles.len()));
+        let updated_expected = choose_roles(
+            &updated.task_kind,
+            std::cmp::max(1, updated.solver_roles.len()),
+        );
         assert_eq!(
             updated.solver_roles.first().map(|role| role.role.as_str()),
             updated_expected.first().map(|role| role.role.as_str())
@@ -11820,6 +15843,358 @@ print "mock $label complete"
             updated.solver_roles.first().map(|role| role.role.as_str()),
             Some("engineering/engineering-frontend-developer.md")
         );
+    }
+
+    #[test]
+    fn solver_count_defaults_raise_research_floor_and_follow_workstreams() {
+        assert_eq!(solver_count_for("backend", "low", "alternatives", &[]), 1);
+        assert_eq!(solver_count_for("research", "low", "alternatives", &[]), 2);
+        assert_eq!(
+            solver_count_for(
+                "ai",
+                "low",
+                "decomposed",
+                &[
+                    WorkstreamHint {
+                        name: "ingress".to_string(),
+                        goal: "ingress".to_string(),
+                        suggested_role: String::new(),
+                    },
+                    WorkstreamHint {
+                        name: "analysis".to_string(),
+                        goal: "analysis".to_string(),
+                        suggested_role: String::new(),
+                    },
+                    WorkstreamHint {
+                        name: "execution".to_string(),
+                        goal: "execution".to_string(),
+                        suggested_role: String::new(),
+                    },
+                ]
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn research_default_pipeline_skips_execution_and_uses_research_defaults() {
+        let ctx = test_context();
+        let workspace = temp_dir("research-default-workspace");
+        let output_root = temp_dir("research-default-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("research-defaults"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create research run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let stage_ids: Vec<String> = plan
+            .pipeline
+            .stages
+            .iter()
+            .map(|stage| stage.id.clone())
+            .collect();
+        assert_eq!(
+            stage_ids,
+            vec!["intake", "solver-a", "solver-b", "review", "verification"]
+        );
+        assert_eq!(plan.solver_count, 2);
+        assert_eq!(
+            plan.solver_roles
+                .iter()
+                .map(|role| role.angle.as_str())
+                .collect::<Vec<_>>(),
+            vec!["breadth-first", "evidence-first"]
+        );
+        assert_eq!(plan.reviewer_stack, reviewer_stack_for("research"));
+        assert_eq!(
+            available_stages(&run_dir).expect("available stages"),
+            vec!["intake", "solver-a", "solver-b", "review", "verification"]
+        );
+
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nResearch brief.\n").expect("brief");
+        write_text(
+            &run_dir.join("solutions").join("solver-a").join("RESULT.md"),
+            "# Result\n\nOption A.\n",
+        )
+        .expect("solver-a");
+        write_text(
+            &run_dir.join("solutions").join("solver-b").join("RESULT.md"),
+            "# Result\n\nOption B.\n",
+        )
+        .expect("solver-b");
+        write_text(
+            &run_dir.join("review").join("report.md"),
+            "# Review Report\n\nSelected solver-a.\n",
+        )
+        .expect("review report");
+        write_json(
+            &run_dir.join("review").join("scorecard.json"),
+            &json!({"winner": "solver-a"}),
+        )
+        .expect("review scorecard");
+        write_text(
+            &run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nResearch summary.\n",
+        )
+        .expect("review summary");
+
+        assert_eq!(
+            next_stage_for_run(&run_dir).expect("next after review"),
+            Some("verification".to_string())
+        );
+    }
+
+    #[test]
+    fn start_solver_batch_runs_solver_stages_in_parallel() {
+        let (ctx, mock_root) = mock_parallel_solver_context("batch", 2);
+        let workspace = temp_dir("solver-parallel-workspace");
+        let output_root = temp_dir("solver-parallel-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("solver-parallel"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create solver parallel run");
+
+        let intake = run_stage_capture(&ctx, &run_dir, "start", &["intake"]).expect("intake");
+        assert_eq!(intake.code, 0);
+
+        let solvers =
+            run_stage_capture(&ctx, &run_dir, "start-solvers", &[]).expect("start solvers");
+
+        assert_eq!(solvers.code, 0, "solver batch failed:\n{}", solvers.stdout);
+        assert!(solvers.stdout.contains("Started solver-a."));
+        assert!(solvers.stdout.contains("Started solver-b."));
+        assert!(
+            run_dir
+                .join("solutions")
+                .join("solver-a")
+                .join("RESULT.md")
+                .exists(),
+            "solver-a result missing"
+        );
+        assert!(
+            run_dir
+                .join("solutions")
+                .join("solver-b")
+                .join("RESULT.md")
+                .exists(),
+            "solver-b result missing"
+        );
+        let started_gap = (read_solver_started_at(&run_dir, "solver-a")
+            - read_solver_started_at(&run_dir, "solver-b"))
+        .abs();
+        assert!(
+            started_gap < 1.0,
+            "expected solver batch start overlap under observer-free capture, got gap {:.3}s\nstdout:\n{}",
+            started_gap,
+            solvers.stdout
+        );
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn start_solver_batch_stays_parallel_with_engine_observer() {
+        let (ctx, mock_root) = mock_parallel_solver_context("batch-observer", 2);
+        let workspace = temp_dir("solver-parallel-observer-workspace");
+        let output_root = temp_dir("solver-parallel-observer-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("solver-parallel-observer"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create solver parallel observer run");
+
+        let intake = run_stage_capture(&ctx, &run_dir, "start", &["intake"]).expect("intake");
+        assert_eq!(intake.code, 0);
+
+        let observer = Arc::new(InterruptObserver {
+            run_dir: run_dir.clone(),
+        });
+        let solvers = with_engine_observer(observer, || {
+            run_stage_capture(&ctx, &run_dir, "start-solvers", &[])
+        })
+        .expect("start solvers with observer");
+
+        assert_eq!(solvers.code, 0, "solver batch failed:\n{}", solvers.stdout);
+        let started_gap = (read_solver_started_at(&run_dir, "solver-a")
+            - read_solver_started_at(&run_dir, "solver-b"))
+        .abs();
+        assert!(
+            started_gap < 1.0,
+            "expected solver batch to stay parallel with observer attached, got gap {:.3}s\nstdout:\n{}",
+            started_gap,
+            solvers.stdout
+        );
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn verification_prompt_without_execution_stage_uses_artifact_audit_guidance() {
+        let workspace = temp_dir("verification-research-workspace");
+        let output_root = temp_dir("verification-research-output");
+        let ctx = test_context();
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("verification-research"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create research run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        let prompt = render_verification_prompt(&run_dir, &plan);
+
+        assert!(!prompt.contains("execution/report.md"));
+        assert!(prompt.contains("research or documentation artifacts"));
+        assert!(prompt.contains("review verdict and solver evidence"));
+    }
+
+    #[test]
+    fn doctor_and_status_surface_failed_incomplete_stage_attempts() {
+        let ctx = test_context();
+        let workspace = temp_dir("failed-attempt-workspace");
+        let output_root = temp_dir("failed-attempt-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Исправить баг в коде и подтвердить результат.",
+            &workspace,
+            &output_root,
+            Some("failed-attempt"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nReady.\n").expect("brief");
+        write_text(
+            &run_dir.join("solutions").join("solver-a").join("RESULT.md"),
+            "# Result\n\nOption A.\n",
+        )
+        .expect("solver-a");
+        write_text(
+            &run_dir.join("solutions").join("solver-b").join("RESULT.md"),
+            "# Result\n\nOption B.\n",
+        )
+        .expect("solver-b");
+        write_text(
+            &run_dir.join("solutions").join("solver-c").join("RESULT.md"),
+            "# Result\n\nOption C.\n",
+        )
+        .expect("solver-c");
+        write_text(
+            &run_dir.join("review").join("report.md"),
+            "# Review Report\n\nSelected solver-a.\n",
+        )
+        .expect("review report");
+        write_json(
+            &run_dir.join("review").join("scorecard.json"),
+            &json!({"winner": "solver-a"}),
+        )
+        .expect("scorecard");
+        write_text(
+            &run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nSelected solver-a.\n",
+        )
+        .expect("review summary");
+
+        runtime::start_job(
+            &run_dir,
+            "start-next",
+            Some("execution"),
+            "start-next",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start job");
+        runtime::finish_job(
+            &run_dir,
+            "exited",
+            None,
+            Some("Tracked process is no longer alive. Inspect run artifacts and logs."),
+        )
+        .expect("finish job");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "broken");
+        assert_eq!(doctor.next, "execution");
+        let attempt = doctor.last_attempt.as_ref().expect("last attempt");
+        assert_eq!(attempt.stage, "execution");
+        assert_eq!(attempt.status, "exited");
+        assert!(
+            doctor.issues.iter().any(|issue| issue.message.contains(
+                "Latest `start-next` attempt for stage `execution` ended with status `exited`"
+            )),
+            "expected failed attempt issue, got {:?}",
+            doctor.issues
+        );
+
+        let status = status_report(&ctx, &run_dir).expect("status report");
+        let attempt = status.last_attempt.as_ref().expect("status last attempt");
+        assert_eq!(attempt.stage, "execution");
+        let text = status_text(&status);
+        assert!(text.contains("next: execution"));
+        assert!(text.contains("last-attempt-stage: execution"));
+        assert!(text.contains("last-attempt-status: exited"));
     }
 
     #[test]

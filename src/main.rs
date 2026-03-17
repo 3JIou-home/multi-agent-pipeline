@@ -4,7 +4,8 @@ mod tui;
 
 use engine::{
     amend_run, automate_run, choose_prune_candidates, default_run_root, delete_run,
-    discover_run_dirs, doctor_report, run_stage_stream, task_flow_stream, Context,
+    discover_run_dirs, doctor_report, run_stage_stream, runtime_check_run, service_check_run,
+    task_flow_stream, Context,
 };
 use std::env;
 use std::io::Write;
@@ -58,6 +59,7 @@ fn real_main() -> Result<ExitCode, String> {
         "show" => command_delegate_run_stage_stream(&ctx, "show", rest),
         "copy" => command_delegate_run_stage_stream(&ctx, "copy", rest),
         "host-probe" => command_delegate_run_stage_stream(&ctx, "host-probe", rest),
+        "runtime-check" | "service-check" => command_runtime_check(&command, rest),
         "start" => command_delegate_run_stage_stream(&ctx, "start", rest),
         "start-next" => command_delegate_run_stage_stream(&ctx, "start-next", rest),
         "start-solvers" => command_delegate_run_stage_stream(&ctx, "start-solvers", rest),
@@ -89,15 +91,20 @@ fn real_main() -> Result<ExitCode, String> {
 fn print_help() {
     println!(
         "agpipe\n\n\
-Open the terminal UI and manage pipelines there.\n\n\
-User-facing commands:\n\
+Run the terminal UI or drive the full pipeline directly from the CLI.\n\n\
+Common commands:\n\
   agpipe\n\
+  agpipe interview-questions --task '...' --workspace /path/to/workspace --output-dir /tmp/agpipe-interview\n\
+  agpipe interview-finalize --task '...' --workspace /path/to/workspace --session-dir /tmp/agpipe-interview/_interviews/<session> --answers-file /tmp/answers.json\n\
+  agpipe create-run --task-file /tmp/agpipe-interview/_interviews/<session>/final-task.md --workspace /path/to/workspace --output-dir /Users/admin/agent-runs\n\
+  agpipe resume /Users/admin/agent-runs/<run-id> --until execution\n\
+  agpipe runtime-check /Users/admin/agent-runs/<run-id> --phase execution\n\
   agpipe doctor /Users/admin/agent-runs/<run-id>\n\
-  agpipe version\n\n\
+  agpipe run --task '...' --workspace /path/to/workspace --output-dir /Users/admin/agent-runs --until review\n\n\
 Notes:\n\
-  - Create, continue, amend, rerun, and delete pipelines from the TUI.\n\
-  - Low-level automation and test commands are available under `agpipe internal ...`.\n\
-  - Run `agpipe internal help` only if you need scripting or debugging.\n"
+  - The direct CLI path is interview -> create-run -> resume -> execution.\n\
+  - `runtime-check` and `service-check` use the same local runtime harness.\n\
+  - `agpipe internal ...` is still available for scripting and debugging.\n"
     );
 }
 
@@ -108,6 +115,8 @@ Low-level automation and debugging commands.\n\n\
 Examples:\n\
   agpipe internal runs /Users/admin/agent-runs --limit 10\n\
   agpipe internal status /Users/admin/agent-runs/<run-id>\n\
+  agpipe internal runtime-check /Users/admin/agent-runs/<run-id> --phase verification\n\
+  agpipe internal service-check /Users/admin/agent-runs/<run-id> --phase verification\n\
   agpipe internal start-next /Users/admin/agent-runs/<run-id>\n\
   agpipe internal resume /Users/admin/agent-runs/<run-id> --until verification\n\
   agpipe internal create-run --task '...' --workspace /path/to/workspace --output-dir /path/to/agent-runs\n\
@@ -142,6 +151,7 @@ fn command_internal(ctx: &Context, args: &[String]) -> Result<ExitCode, String> 
         "show" => command_delegate_run_stage_stream(ctx, "show", rest),
         "copy" => command_delegate_run_stage_stream(ctx, "copy", rest),
         "host-probe" => command_delegate_run_stage_stream(ctx, "host-probe", rest),
+        "runtime-check" | "service-check" => command_runtime_check(command, rest),
         "start" => command_delegate_run_stage_stream(ctx, "start", rest),
         "start-next" => command_delegate_run_stage_stream(ctx, "start-next", rest),
         "start-solvers" => command_delegate_run_stage_stream(ctx, "start-solvers", rest),
@@ -306,6 +316,46 @@ fn command_safe_next(ctx: &Context, args: &[String]) -> Result<ExitCode, String>
         return Ok(ExitCode::from(code as u8));
     }
     Err(format!("Unsupported safe-next-action: {action}"))
+}
+
+fn command_runtime_check(command_name: &str, args: &[String]) -> Result<ExitCode, String> {
+    if args.is_empty() {
+        return Err(format!("{command_name} requires <run_dir>"));
+    }
+    let run_dir = PathBuf::from(&args[0]);
+    let mut phase = "manual".to_string();
+    let mut spec: Option<PathBuf> = None;
+    let mut index = 1usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--phase" => {
+                index += 1;
+                phase.clone_from(args.get(index).ok_or("--phase requires a value")?);
+            }
+            "--spec" => {
+                index += 1;
+                spec = Some(PathBuf::from(
+                    args.get(index).ok_or("--spec requires a value")?,
+                ));
+            }
+            other => return Err(format!("Unexpected argument for {command_name}: {other}")),
+        }
+        index += 1;
+    }
+    let result = if command_name == "service-check" {
+        service_check_run(&run_dir, &phase, spec.as_deref())?
+    } else {
+        runtime_check_run(&run_dir, &phase, spec.as_deref())?
+    };
+    if !result.stdout.trim().is_empty() {
+        print!("{}", result.stdout);
+        std::io::stdout().flush().ok();
+    }
+    if !result.stderr.trim().is_empty() {
+        eprint!("{}", result.stderr);
+        std::io::stderr().flush().ok();
+    }
+    Ok(ExitCode::from(result.code as u8))
 }
 
 fn command_amend(ctx: &Context, args: &[String]) -> Result<ExitCode, String> {

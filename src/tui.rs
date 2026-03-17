@@ -4,7 +4,10 @@ use crate::engine::{
     with_engine_observer, Context, EngineObserver, RunSnapshot, RunTokenSummary,
 };
 use crate::runtime::{self, RuntimeJobState};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -20,7 +23,7 @@ use serde::Deserialize;
 use std::env;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -35,6 +38,7 @@ enum Mode {
     },
     NewRunInput {
         draft: NewRunDraft,
+        task_scroll: u16,
     },
     InterviewInput {
         draft: NewRunDraft,
@@ -44,6 +48,7 @@ enum Mode {
         answers: Vec<String>,
         index: usize,
         buffer: String,
+        answer_scroll: u16,
     },
     PromptReview {
         draft: NewRunDraft,
@@ -124,13 +129,13 @@ impl ArtifactKind {
         }
     }
 
-    fn path(self, run_dir: &Path) -> PathBuf {
+    fn path(self, run: &RunSnapshot) -> PathBuf {
         match self {
-            Self::Summary => run_dir.join("review").join("user-summary.md"),
-            Self::Findings => run_dir.join("verification").join("findings.md"),
-            Self::Augmented => run_dir.join("verification").join("augmented-task.md"),
-            Self::Execution => run_dir.join("execution").join("report.md"),
-            Self::Brief => run_dir.join("brief.md"),
+            Self::Summary => preferred_summary_path(run),
+            Self::Findings => run.run_dir.join("verification").join("findings.md"),
+            Self::Augmented => run.run_dir.join("verification").join("augmented-task.md"),
+            Self::Execution => run.run_dir.join("execution").join("report.md"),
+            Self::Brief => run.run_dir.join("brief.md"),
         }
     }
 
@@ -155,11 +160,49 @@ impl ArtifactKind {
     }
 }
 
+fn preferred_summary_path(run: &RunSnapshot) -> PathBuf {
+    let verification = run.run_dir.join("verification").join("user-summary.md");
+    if let Ok(content) = std::fs::read_to_string(&verification) {
+        if !looks_pending_artifact(&content) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return verification;
+            }
+        }
+    }
+    let review = run.run_dir.join("review").join("user-summary.md");
+    if let Ok(content) = std::fs::read_to_string(&review) {
+        if !looks_pending_artifact(&content) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return review;
+            }
+        }
+    }
+    run.run_dir.join("request.md")
+}
+
+fn summary_title(run: &RunSnapshot) -> &'static str {
+    let path = preferred_summary_path(run);
+    match path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+    {
+        Some("verification") => "Verification Summary",
+        Some("review") => "Review Summary",
+        _ => "Summary",
+    }
+}
+
 #[derive(Clone)]
 struct NewRunDraft {
     task: String,
     workspace: String,
     title: String,
+    task_cursor: usize,
+    workspace_cursor: usize,
+    title_cursor: usize,
     field: NewRunField,
 }
 
@@ -236,17 +279,101 @@ fn default_true() -> bool {
 }
 
 fn parse_embedded_json<T: DeserializeOwned>(text: &str) -> Result<T, String> {
-    let start = text
-        .find('{')
-        .ok_or_else(|| "No JSON object start found in process output.".to_string())?;
-    let end = text
-        .rfind('}')
-        .ok_or_else(|| "No JSON object end found in process output.".to_string())?;
-    if end <= start {
-        return Err("Malformed JSON object boundaries in process output.".to_string());
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escape = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(index);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth == 0 {
+                    continue;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(start_index) = start.take() {
+                        spans.push((start_index, index + 1));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    serde_json::from_str(&text[start..=end])
-        .map_err(|err| format!("Could not parse embedded JSON: {err}"))
+
+    if spans.is_empty() {
+        return Err("No JSON object found in process output.".to_string());
+    }
+
+    let mut last_error = None;
+    for (start, end) in spans.into_iter().rev() {
+        match serde_json::from_str(&text[start..end]) {
+            Ok(payload) => return Ok(payload),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    Err(format!(
+        "Could not parse embedded JSON: {}",
+        last_error
+            .map(|err| err.to_string())
+            .unwrap_or_else(|| "unknown error".to_string())
+    ))
+}
+
+fn parse_job_json<T: DeserializeOwned>(stdout: &str, raw_output: &str) -> Result<T, String> {
+    let stdout = stdout.trim();
+    if !stdout.is_empty() {
+        if let Ok(payload) = parse_embedded_json(stdout) {
+            return Ok(payload);
+        }
+    }
+
+    let raw_output = raw_output.trim();
+    if !raw_output.is_empty() {
+        if let Ok(payload) = parse_embedded_json(raw_output) {
+            return Ok(payload);
+        }
+    }
+
+    let mut errors = Vec::new();
+    if !stdout.is_empty() {
+        if let Err(err) = parse_embedded_json::<T>(stdout) {
+            errors.push(format!("stdout: {err}"));
+        }
+    }
+    if !raw_output.is_empty() && raw_output != stdout {
+        if let Err(err) = parse_embedded_json::<T>(raw_output) {
+            errors.push(format!("process log: {err}"));
+        }
+    }
+    if errors.is_empty() {
+        Err("No JSON payload found in job output.".to_string())
+    } else {
+        Err(errors.join(" | "))
+    }
 }
 
 fn format_token_count(tokens: u64) -> String {
@@ -306,11 +433,16 @@ pub struct App {
     limit: usize,
     runs: Vec<RunSnapshot>,
     selected: usize,
+    wizard_selected: bool,
+    preview_scroll: u16,
+    log_scroll: u16,
+    mouse_capture_enabled: bool,
     mode: Mode,
     notice: String,
     last_output: String,
     last_refresh: Instant,
     job: Option<RunningJob>,
+    wizard_job: Option<RunningJob>,
 }
 
 struct RunningJob {
@@ -331,15 +463,62 @@ struct RunningJob {
     last_heartbeat: Instant,
 }
 
+fn is_rerun_job(job: &RunningJob) -> bool {
+    job.label == "rerun" || job.command_hint == "rerun"
+}
+
+fn rerun_created_run_dir(stdout: &str) -> Option<PathBuf> {
+    for line in stdout.lines() {
+        let candidate = line.trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(candidate);
+        if path.is_absolute() && path.join("plan.json").exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 struct JobResult {
     code: i32,
     stdout: String,
     stderr: String,
 }
 
+struct FinishedJob {
+    kind: JobKind,
+    label: String,
+    run_dir: PathBuf,
+    completed_log_hint: Option<String>,
+    result: JobResult,
+    detached_finish: bool,
+}
+
 struct UiEngineObserver {
     run_dir: PathBuf,
     stream_tx: mpsc::Sender<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TuiPlanSummary {
+    #[serde(default)]
+    pipeline: TuiPipelineSummary,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TuiPipelineSummary {
+    #[serde(default)]
+    stages: Vec<TuiPipelineStageSummary>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TuiPipelineStageSummary {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    kind: String,
 }
 
 impl EngineObserver for UiEngineObserver {
@@ -351,6 +530,14 @@ impl EngineObserver for UiEngineObserver {
         let _ = runtime::append_process_line(&self.run_dir, line);
         let _ = self.stream_tx.send(line.to_string());
     }
+
+    fn stage_changed(&self, stage: &str) {
+        let _ = runtime::update_job_stage(&self.run_dir, Some(stage), None);
+    }
+
+    fn interrupt_run_dir(&self) -> Option<PathBuf> {
+        Some(self.run_dir.clone())
+    }
 }
 
 impl App {
@@ -361,18 +548,24 @@ impl App {
             limit,
             runs,
             selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
             mode: Mode::Normal,
             notice: "Ready".to_string(),
             last_output: String::new(),
             last_refresh: Instant::now(),
             job: None,
+            wizard_job: None,
         };
         sync_runtime_job(&mut app);
+        sync_wizard_job(&mut app);
         Ok(app)
     }
 
     fn refresh(&mut self, ctx: &Context) -> Result<(), String> {
-        let selected_path = self.selected_run().map(|run| run.run_dir.clone());
+        let selected_path = self.runs.get(self.selected).map(|run| run.run_dir.clone());
         self.runs = load_run_snapshots(ctx, &self.root, self.limit)?;
         if let Some(path) = selected_path {
             if let Some(index) = self.runs.iter().position(|run| run.run_dir == path) {
@@ -387,26 +580,69 @@ impl App {
         }
         self.last_refresh = Instant::now();
         sync_runtime_job(self);
+        sync_wizard_job(self);
+        if self.wizard_job().is_none() {
+            self.wizard_selected = false;
+        }
         Ok(())
     }
 
+    fn wizard_job(&self) -> Option<&RunningJob> {
+        self.wizard_job.as_ref()
+    }
+
     fn selected_run(&self) -> Option<&RunSnapshot> {
+        if self.wizard_selected && self.wizard_job().is_some() {
+            return None;
+        }
         self.runs.get(self.selected)
     }
 
     fn move_down(&mut self) {
+        if self.wizard_selected && self.wizard_job().is_some() {
+            self.wizard_selected = false;
+            self.preview_scroll = 0;
+            self.log_scroll = 0;
+            return;
+        }
         if !self.runs.is_empty() {
-            self.selected = (self.selected + 1).min(self.runs.len() - 1);
+            let next = (self.selected + 1).min(self.runs.len() - 1);
+            if next != self.selected {
+                self.selected = next;
+                self.preview_scroll = 0;
+                self.log_scroll = 0;
+            }
         }
     }
 
     fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        if self.wizard_job().is_some() {
+            if self.wizard_selected {
+                return;
+            }
+            if self.selected == 0 {
+                self.wizard_selected = true;
+                self.preview_scroll = 0;
+                self.log_scroll = 0;
+                return;
+            }
+        }
+        let next = self.selected.saturating_sub(1);
+        if next != self.selected {
+            self.selected = next;
+            self.preview_scroll = 0;
+            self.log_scroll = 0;
+        }
     }
 
     fn select_run_by_path(&mut self, run_dir: &Path) {
         if let Some(index) = self.runs.iter().position(|run| run.run_dir == run_dir) {
-            self.selected = index;
+            if self.selected != index {
+                self.selected = index;
+                self.preview_scroll = 0;
+                self.log_scroll = 0;
+            }
+            self.wizard_selected = false;
         }
     }
 }
@@ -483,21 +719,179 @@ impl RunningJob {
     }
 }
 
+fn reconcile_job_stage_with_run(job: &mut RunningJob, run: Option<&RunSnapshot>) {
+    if is_rerun_job(job) {
+        return;
+    }
+    let Some(run) = run else {
+        return;
+    };
+    let next = run.status.next.trim();
+    if next.is_empty() || next == "none" || next == "rerun" {
+        return;
+    }
+    let current = job.log_hint.as_deref().unwrap_or("").trim();
+    if current.is_empty() {
+        job.log_hint = Some(next.to_string());
+        let _ = runtime::update_job_stage(&job.run_dir, Some(next), None);
+        return;
+    }
+    if current == next {
+        return;
+    }
+    let current_state = run.status.stages.get(current).map(String::as_str);
+    if current_state.is_none() || matches!(current_state, Some("done")) {
+        job.log_hint = Some(next.to_string());
+        let _ = runtime::update_job_stage(&job.run_dir, Some(next), None);
+    }
+}
+
+fn run_has_active_job(run_dir: &Path) -> bool {
+    runtime::active_job_state(run_dir).is_some()
+}
+
+fn detach_tracked_job(app: &mut App) {
+    if let Some(job) = app.job.take() {
+        app.notice = format!(
+            "Detached from {}. It continues in the background.",
+            running_job_label(&job)
+        );
+        app.last_output = format!(
+            "Detached from `{}` in {}. The process is still running; reselect that run to monitor it again.",
+            job_stage_label(&job),
+            job.run_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("run")
+        );
+    }
+}
+
+fn ensure_job_slot_for_run(app: &mut App, run_dir: &Path) -> bool {
+    if let Some(job) = app.job.as_ref() {
+        if job.run_dir == run_dir {
+            app.notice =
+                "This run already has an active job. Attached to the existing process.".to_string();
+            return false;
+        }
+        detach_tracked_job(app);
+    }
+    if let Some(state) = runtime::active_job_state(run_dir) {
+        let mut attached = RunningJob::attached(run_dir.to_path_buf(), state);
+        let run = app.runs.iter().find(|run| run.run_dir == run_dir);
+        reconcile_job_stage_with_run(&mut attached, run);
+        app.notice = format!(
+            "Attached to running {} for {}",
+            job_stage_label(&attached),
+            run_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("run")
+        );
+        app.job = Some(attached);
+        return false;
+    }
+    true
+}
+
+fn ensure_wizard_job_slot(app: &mut App, run_dir: &Path) -> bool {
+    if let Some(job) = app.wizard_job.as_ref() {
+        if job.run_dir == run_dir {
+            app.notice = "Stage0 creation is already running. Attached to the existing wizard job."
+                .to_string();
+            return false;
+        }
+    }
+    if let Some(state) = runtime::active_job_state(run_dir) {
+        app.wizard_job = Some(RunningJob::attached(run_dir.to_path_buf(), state));
+        app.notice = "Attached to existing stage0 creation job.".to_string();
+        return false;
+    }
+    true
+}
+
+fn attach_selected_run_job_if_any(app: &mut App) {
+    let Some(selected) = app.selected_run().map(|run| run.run_dir.clone()) else {
+        return;
+    };
+    let Some(state) = runtime::active_job_state(&selected) else {
+        return;
+    };
+    let should_switch = match app.job.as_ref() {
+        Some(job) => job.run_dir != selected,
+        None => true,
+    };
+    if !should_switch {
+        return;
+    }
+    let mut attached = RunningJob::attached(selected.clone(), state);
+    let run = app.runs.iter().find(|run| run.run_dir == selected);
+    reconcile_job_stage_with_run(&mut attached, run);
+    app.notice = format!(
+        "Attached to running {} for {}",
+        job_stage_label(&attached),
+        selected
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("run")
+    );
+    app.job = Some(attached);
+}
+
+fn delete_run_if_safe(app: &mut App, run_dir: &Path) -> Result<bool, String> {
+    if run_has_active_job(run_dir) {
+        app.notice = format!(
+            "Cannot delete {} while it has an active job.",
+            run_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("run")
+        );
+        app.last_output =
+            "Interrupt or wait for the active run to finish before deleting it.".to_string();
+        return Ok(false);
+    }
+    delete_run(run_dir)?;
+    if app
+        .job
+        .as_ref()
+        .map(|job| job.run_dir == run_dir)
+        .unwrap_or(false)
+    {
+        app.job = None;
+    }
+    Ok(true)
+}
+
+fn prune_candidates_without_active_jobs(candidates: Vec<PathBuf>) -> (Vec<PathBuf>, usize) {
+    let mut runnable = Vec::new();
+    let mut skipped = 0usize;
+    for run_dir in candidates {
+        if run_has_active_job(&run_dir) {
+            skipped += 1;
+        } else {
+            runnable.push(run_dir);
+        }
+    }
+    (runnable, skipped)
+}
+
 fn sync_runtime_job(app: &mut App) {
+    attach_selected_run_job_if_any(app);
     if let Some(job) = app.job.as_mut() {
-        if job.attached {
-            if let Some(state) = runtime::active_job_state(&job.run_dir) {
-                job.refresh_from_state(state);
-            } else {
-                app.notice = format!(
-                    "Observed job for {} is no longer running.",
-                    job.run_dir
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or("run")
-                );
-                app.job = None;
-            }
+        if let Some(state) = runtime::active_job_state(&job.run_dir) {
+            job.refresh_from_state(state);
+            let run = app.runs.iter().find(|run| run.run_dir == job.run_dir);
+            reconcile_job_stage_with_run(job, run);
+        } else if job.attached {
+            app.notice = format!(
+                "Observed job for {} is no longer running.",
+                job.run_dir
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("run")
+            );
+            app.job = None;
         }
         return;
     }
@@ -513,10 +907,12 @@ fn sync_runtime_job(app: &mut App) {
     }
     for run_dir in candidates {
         if let Some(state) = runtime::active_job_state(&run_dir) {
-            let attached = RunningJob::attached(run_dir.clone(), state);
+            let mut attached = RunningJob::attached(run_dir.clone(), state);
+            let run = app.runs.iter().find(|run| run.run_dir == run_dir);
+            reconcile_job_stage_with_run(&mut attached, run);
             app.notice = format!(
                 "Attached to running {} for {}",
-                attached.command_hint,
+                job_stage_label(&attached),
                 run_dir
                     .file_name()
                     .and_then(|value| value.to_str())
@@ -528,22 +924,60 @@ fn sync_runtime_job(app: &mut App) {
     }
 }
 
+fn sync_wizard_job(app: &mut App) {
+    let run_dir = ui_job_dir(&app.root);
+    if let Some(job) = app.wizard_job.as_mut() {
+        if let Some(state) = runtime::active_job_state(&job.run_dir) {
+            job.refresh_from_state(state);
+        } else if job.attached {
+            app.notice = "Observed stage0 job is no longer running.".to_string();
+            app.wizard_job = None;
+        }
+        return;
+    }
+    if let Some(state) = runtime::active_job_state(&run_dir) {
+        app.wizard_job = Some(RunningJob::attached(run_dir, state));
+    }
+}
+
 fn default_new_run_draft() -> NewRunDraft {
     NewRunDraft {
         task: String::new(),
         workspace: String::new(),
         title: String::new(),
+        task_cursor: 0,
+        workspace_cursor: 0,
+        title_cursor: 0,
         field: NewRunField::Task,
     }
 }
 
-fn active_new_run_buffer(draft: &mut NewRunDraft) -> &mut String {
-    match draft.field {
-        NewRunField::Task => &mut draft.task,
-        NewRunField::Workspace => &mut draft.workspace,
-        NewRunField::Title => &mut draft.title,
-        NewRunField::Start | NewRunField::Cancel => &mut draft.title,
+fn char_count(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn char_to_byte_index(value: &str, cursor: usize) -> usize {
+    value
+        .char_indices()
+        .nth(cursor)
+        .map(|(index, _)| index)
+        .unwrap_or_else(|| value.len())
+}
+
+fn insert_text_at_cursor(value: &mut String, cursor: &mut usize, text: &str) {
+    let byte_index = char_to_byte_index(value, *cursor);
+    value.insert_str(byte_index, text);
+    *cursor = cursor.saturating_add(text.chars().count());
+}
+
+fn backspace_at_cursor(value: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
     }
+    let start = char_to_byte_index(value, cursor.saturating_sub(1));
+    let end = char_to_byte_index(value, *cursor);
+    value.replace_range(start..end, "");
+    *cursor = cursor.saturating_sub(1);
 }
 
 fn ui_job_dir(root: &Path) -> PathBuf {
@@ -606,8 +1040,7 @@ fn create_run_from_draft(
 }
 
 fn spawn_resume_for_run(ctx: &Context, app: &mut App, run_dir: PathBuf) -> Result<(), String> {
-    if app.job.is_some() {
-        app.notice = "A job is already running.".to_string();
+    if !ensure_job_slot_for_run(app, &run_dir) {
         return Ok(());
     }
     let index = app.runs.iter().position(|run| run.run_dir == run_dir);
@@ -632,11 +1065,10 @@ fn spawn_interview_questions_job(
     app: &mut App,
     draft: NewRunDraft,
 ) -> Result<(), String> {
-    if app.job.is_some() {
-        app.notice = "Another action is already running.".to_string();
+    let run_dir = ui_job_dir(&app.root);
+    if !ensure_wizard_job_slot(app, &run_dir) {
         return Ok(());
     }
-    let run_dir = ui_job_dir(&app.root);
     let label = "interview-questions".to_string();
     let command_hint = "stage0 interview questions".to_string();
     let output_root = app.root.clone();
@@ -664,7 +1096,11 @@ fn spawn_interview_questions_job(
             ];
             task_flow_capture(ctx, "interview-questions", &args)
         },
-    )
+    )?;
+    app.wizard_selected = true;
+    app.preview_scroll = 0;
+    app.log_scroll = 0;
+    Ok(())
 }
 
 fn spawn_interview_finalize_job(
@@ -674,10 +1110,6 @@ fn spawn_interview_finalize_job(
     session_dir: PathBuf,
     answers: Vec<serde_json::Value>,
 ) -> Result<(), String> {
-    if app.job.is_some() {
-        app.notice = "Another action is already running.".to_string();
-        return Ok(());
-    }
     let answers_path = session_dir.join("answers-ui.json");
     std::fs::write(
         &answers_path,
@@ -686,6 +1118,9 @@ fn spawn_interview_finalize_job(
     )
     .map_err(|err| format!("Could not write {}: {err}", answers_path.display()))?;
     let run_dir = ui_job_dir(&app.root);
+    if !ensure_wizard_job_slot(app, &run_dir) {
+        return Ok(());
+    }
     let label = "interview-finalize".to_string();
     let command_hint = "stage0 interview finalize".to_string();
     let draft_for_job = draft.clone();
@@ -717,7 +1152,11 @@ fn spawn_interview_finalize_job(
             ];
             task_flow_capture(ctx, "interview-finalize", &args)
         },
-    )
+    )?;
+    app.wizard_selected = true;
+    app.preview_scroll = 0;
+    app.log_scroll = 0;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -786,7 +1225,7 @@ where
         let _ = runtime::finish_job(&run_dir_for_thread, status, Some(job_result.code), message);
         let _ = completion_tx.send(job_result);
     });
-    app.job = Some(RunningJob::owned(
+    let tracked = RunningJob::owned(
         kind,
         label,
         run_dir.clone(),
@@ -797,7 +1236,12 @@ where
         runtime::process_log_path(&run_dir),
         stream_rx,
         completion_rx,
-    ));
+    );
+    if matches!(tracked.kind, JobKind::RunAction) {
+        app.job = Some(tracked);
+    } else {
+        app.wizard_job = Some(tracked);
+    }
     Ok(())
 }
 
@@ -829,16 +1273,26 @@ pub fn launch(ctx: &Context, root: &Path, limit: usize) -> Result<(), String> {
 fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>, String> {
     enable_raw_mode().map_err(|err| format!("Could not enable raw mode: {err}"))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .map_err(|err| format!("Could not enter alternate screen: {err}"))?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )
+    .map_err(|err| format!("Could not enter alternate screen: {err}"))?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(|err| format!("Could not initialize terminal: {err}"))
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), String> {
     disable_raw_mode().map_err(|err| format!("Could not disable raw mode: {err}"))?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)
-        .map_err(|err| format!("Could not leave alternate screen: {err}"))?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .map_err(|err| format!("Could not leave alternate screen: {err}"))?;
     terminal
         .show_cursor()
         .map_err(|err| format!("Could not restore cursor: {err}"))
@@ -858,16 +1312,26 @@ fn run_app(
             .map_err(|err| format!("Event poll failed: {err}"))?
         {
             let event = event::read().map_err(|err| format!("Event read failed: {err}"))?;
-            if let Event::Key(key) = event {
-                if key.kind == KeyEventKind::Press && handle_key(ctx, app, key)? {
-                    return Ok(());
+            match event {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press && handle_key(ctx, app, key)? {
+                        return Ok(());
+                    }
                 }
+                Event::Paste(text) => handle_paste(app, &text),
+                Event::Mouse(mouse) => {
+                    let size = terminal
+                        .size()
+                        .map_err(|err| format!("Could not inspect terminal size: {err}"))?;
+                    handle_mouse(app, mouse, size);
+                }
+                _ => {}
             }
         }
 
         poll_job(ctx, app)?;
 
-        let refresh_interval = if app.job.is_some() {
+        let refresh_interval = if app.job.is_some() || app.wizard_job.is_some() {
             Duration::from_secs(1)
         } else {
             Duration::from_secs(3)
@@ -892,6 +1356,186 @@ fn handle_key(
         Mode::NewRunInput { .. } => handle_new_run_key(ctx, app, key),
         Mode::InterviewInput { .. } => handle_interview_key(ctx, app, key),
         Mode::PromptReview { .. } => handle_prompt_review_key(ctx, app, key),
+    }
+}
+
+fn set_mouse_capture(enabled: bool) -> Result<(), String> {
+    let mut stdout = io::stdout();
+    if enabled {
+        execute!(stdout, EnableMouseCapture)
+            .map_err(|err| format!("Could not enable mouse capture: {err}"))
+    } else {
+        execute!(stdout, DisableMouseCapture)
+            .map_err(|err| format!("Could not disable mouse capture: {err}"))
+    }
+}
+
+fn toggle_mouse_capture(app: &mut App) -> Result<(), String> {
+    let enabled = !app.mouse_capture_enabled;
+    set_mouse_capture(enabled)?;
+    app.mouse_capture_enabled = enabled;
+    app.notice = if enabled {
+        "Mouse scroll enabled. Terminal text selection is disabled until you press m again."
+            .to_string()
+    } else {
+        "Mouse capture disabled. Terminal text selection works again.".to_string()
+    };
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct NormalModeRects {
+    runs: Rect,
+    preview: Rect,
+    logs: Rect,
+}
+
+fn root_layout(size: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(10),
+            Constraint::Length(15),
+            Constraint::Length(1),
+        ])
+        .split(size)
+        .to_vec()
+}
+
+fn normal_mode_rects(size: Rect) -> NormalModeRects {
+    let layout = root_layout(size);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
+        .split(layout[2]);
+    let details = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(body[1]);
+    NormalModeRects {
+        runs: body[0],
+        preview: details[0],
+        logs: layout[3],
+    }
+}
+
+fn point_in_rect(column: u16, row: u16, rect: Rect) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && column >= rect.x
+        && column < rect.x.saturating_add(rect.width)
+        && row >= rect.y
+        && row < rect.y.saturating_add(rect.height)
+}
+
+fn scroll_up(value: &mut u16, amount: u16) {
+    *value = value.saturating_sub(amount);
+}
+
+fn scroll_down(value: &mut u16, amount: u16) {
+    *value = value.saturating_add(amount);
+}
+
+fn wrapped_line_count(text: &str, content_width: u16) -> usize {
+    let width = content_width.max(1) as usize;
+    if text.is_empty() {
+        return 1;
+    }
+    text.split('\n')
+        .map(|line| {
+            let char_count = line.chars().count().max(1);
+            char_count.div_ceil(width)
+        })
+        .sum()
+}
+
+fn clamp_scroll_for_text(text: &str, area: Rect, requested: u16) -> u16 {
+    let visible_lines = area.height.saturating_sub(2) as usize;
+    if visible_lines == 0 {
+        return 0;
+    }
+    let content_width = area.width.saturating_sub(2);
+    let total_lines = wrapped_line_count(text, content_width);
+    let max_scroll = total_lines.saturating_sub(visible_lines);
+    requested.min(max_scroll as u16)
+}
+
+fn handle_mouse(app: &mut App, mouse: MouseEvent, size: Rect) {
+    if !app.mouse_capture_enabled {
+        return;
+    }
+    match &mut app.mode {
+        Mode::Normal => handle_normal_mouse(app, mouse, size),
+        Mode::ArtifactView { scroll, .. } => {
+            if point_in_rect(mouse.column, mouse.row, centered_rect(88, 86, size)) {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => scroll_down(scroll, 3),
+                    MouseEventKind::ScrollUp => scroll_up(scroll, 3),
+                    _ => {}
+                }
+            }
+        }
+        Mode::PromptReview { scroll, .. } => {
+            if point_in_rect(mouse.column, mouse.row, centered_rect(88, 86, size)) {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => scroll_down(scroll, 3),
+                    MouseEventKind::ScrollUp => scroll_up(scroll, 3),
+                    _ => {}
+                }
+            }
+        }
+        Mode::NewRunInput { task_scroll, .. } => {
+            let popup = new_run_popup_rect(size);
+            let layout = new_run_popup_layout(popup);
+            if point_in_rect(mouse.column, mouse.row, layout[1]) {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => scroll_down(task_scroll, 3),
+                    MouseEventKind::ScrollUp => scroll_up(task_scroll, 3),
+                    _ => {}
+                }
+            }
+        }
+        Mode::InterviewInput { answer_scroll, .. } => {
+            let popup = interview_popup_rect(size);
+            let layout = interview_popup_layout(popup);
+            if point_in_rect(mouse.column, mouse.row, layout[3]) {
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => scroll_down(answer_scroll, 3),
+                    MouseEventKind::ScrollUp => scroll_up(answer_scroll, 3),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_normal_mouse(app: &mut App, mouse: MouseEvent, size: Rect) {
+    let rects = normal_mode_rects(size);
+    match mouse.kind {
+        MouseEventKind::ScrollDown => {
+            if point_in_rect(mouse.column, mouse.row, rects.runs) {
+                app.move_down();
+                attach_selected_run_job_if_any(app);
+            } else if point_in_rect(mouse.column, mouse.row, rects.preview) {
+                scroll_down(&mut app.preview_scroll, 3);
+            } else if point_in_rect(mouse.column, mouse.row, rects.logs) {
+                scroll_down(&mut app.log_scroll, 3);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if point_in_rect(mouse.column, mouse.row, rects.runs) {
+                app.move_up();
+                attach_selected_run_job_if_any(app);
+            } else if point_in_rect(mouse.column, mouse.row, rects.preview) {
+                scroll_up(&mut app.preview_scroll, 3);
+            } else if point_in_rect(mouse.column, mouse.row, rects.logs) {
+                scroll_up(&mut app.log_scroll, 3);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -944,111 +1588,30 @@ fn handle_normal_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
 ) -> Result<bool, String> {
-    if app.job.is_some() {
-        match key.code {
-            _ if key_is_char(key, 'q') => return Ok(true),
-            KeyCode::Esc => {
-                app.notice =
-                    "A job is still running. Use i to interrupt or keep monitoring it.".to_string();
-                return Ok(false);
-            }
-            _ if key_is_char(key, 'i') => {
-                interrupt_job(app)?;
-                return Ok(false);
-            }
-            KeyCode::Down if !matches!(key.code, KeyCode::Char(_)) => {
-                app.move_down();
-                return Ok(false);
-            }
-            _ if key_is_char(key, 'j') => {
-                app.move_down();
-                return Ok(false);
-            }
-            KeyCode::Up if !matches!(key.code, KeyCode::Char(_)) => {
-                app.move_up();
-                return Ok(false);
-            }
-            _ if key_is_char(key, 'k') => {
-                app.move_up();
-                return Ok(false);
-            }
-            _ if key_is_char(key, 'g') => {
-                app.refresh(ctx)?;
-                app.notice = "Refreshed run list".to_string();
-                return Ok(false);
-            }
-            KeyCode::Enter => {
-                if let Some(run) = app.selected_run() {
-                    app.mode = Mode::ArtifactView {
-                        kind: preferred_artifact_kind(run),
-                        scroll: 0,
-                    };
-                }
-                return Ok(false);
-            }
-            _ if key_is_char(key, 'o') => {
-                if let Some(run) = app.selected_run() {
-                    app.mode = Mode::ArtifactView {
-                        kind: preferred_artifact_kind(run),
-                        scroll: 0,
-                    };
-                }
-                return Ok(false);
-            }
-            KeyCode::Char('1') => {
-                app.mode = Mode::ArtifactView {
-                    kind: ArtifactKind::Summary,
-                    scroll: 0,
-                };
-                return Ok(false);
-            }
-            KeyCode::Char('2') => {
-                app.mode = Mode::ArtifactView {
-                    kind: ArtifactKind::Findings,
-                    scroll: 0,
-                };
-                return Ok(false);
-            }
-            KeyCode::Char('3') => {
-                app.mode = Mode::ArtifactView {
-                    kind: ArtifactKind::Augmented,
-                    scroll: 0,
-                };
-                return Ok(false);
-            }
-            KeyCode::Char('4') => {
-                app.mode = Mode::ArtifactView {
-                    kind: ArtifactKind::Execution,
-                    scroll: 0,
-                };
-                return Ok(false);
-            }
-            KeyCode::Char('5') => {
-                app.mode = Mode::ArtifactView {
-                    kind: ArtifactKind::Brief,
-                    scroll: 0,
-                };
-                return Ok(false);
-            }
-            _ => {
-                app.notice =
-                    "An action is still running. Use i to interrupt it, or open artifacts in read-only mode."
-                        .to_string();
-                return Ok(false);
-            }
-        }
-    }
-
     match key.code {
         _ if key.modifiers.contains(KeyModifiers::CONTROL) && key_is_char(key, 'c') => {
             return Ok(true)
         }
         _ if key_is_char(key, 'q') => return Ok(true),
+        _ if key_is_char(key, 'm') => toggle_mouse_capture(app)?,
+        _ if key_is_char(key, 'i') => interrupt_job(app)?,
         KeyCode::Esc => app.notice = "Ready".to_string(),
-        KeyCode::Down => app.move_down(),
-        _ if key_is_char(key, 'j') => app.move_down(),
-        KeyCode::Up => app.move_up(),
-        _ if key_is_char(key, 'k') => app.move_up(),
+        KeyCode::Down => {
+            app.move_down();
+            attach_selected_run_job_if_any(app);
+        }
+        _ if key_is_char(key, 'j') => {
+            app.move_down();
+            attach_selected_run_job_if_any(app);
+        }
+        KeyCode::Up => {
+            app.move_up();
+            attach_selected_run_job_if_any(app);
+        }
+        _ if key_is_char(key, 'k') => {
+            app.move_up();
+            attach_selected_run_job_if_any(app);
+        }
         _ if key_is_char(key, 'g') => {
             app.refresh(ctx)?;
             app.notice = "Refreshed run list".to_string();
@@ -1102,6 +1665,7 @@ fn handle_normal_key(
         _ if key_is_char(key, 'c') => {
             app.mode = Mode::NewRunInput {
                 draft: default_new_run_draft(),
+                task_scroll: 0,
             };
         }
         _ if key_is_char(key, 's') => {
@@ -1110,7 +1674,7 @@ fn handle_normal_key(
         _ if key_is_char(key, 'n') => {
             spawn_action(ctx, app, "start-next", vec!["start-next".to_string()])?
         }
-        _ if key_is_char(key, 'r') => spawn_action(
+        _ if key_is_char(key, 'r') || key_is_char(key, 'w') => spawn_action(
             ctx,
             app,
             "resume",
@@ -1168,6 +1732,99 @@ fn handle_normal_key(
     Ok(false)
 }
 
+fn normalize_single_line_paste(text: &str) -> String {
+    sanitize_terminal_input(text, false)
+}
+
+fn sanitize_multiline_paste(text: &str) -> String {
+    sanitize_terminal_input(text, true)
+}
+
+fn sanitize_terminal_input(text: &str, preserve_newlines: bool) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => skip_terminal_escape(&mut chars),
+            '\r' => {
+                if matches!(chars.peek(), Some('\n')) {
+                    continue;
+                }
+                if preserve_newlines {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            '\n' => {
+                if preserve_newlines {
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+            }
+            '\t' => out.push_str("    "),
+            ch if ch.is_control() => {}
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn skip_terminal_escape<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    match chars.next() {
+        Some('[') => {
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+        }
+        Some(']') | Some('P') | Some('X') | Some('^') | Some('_') => {
+            while let Some(ch) = chars.next() {
+                if ch == '\u{7}' {
+                    break;
+                }
+                if ch == '\u{1b}' && matches!(chars.peek(), Some('\\')) {
+                    let _ = chars.next();
+                    break;
+                }
+            }
+        }
+        Some(_) | None => {}
+    }
+}
+
+fn handle_paste(app: &mut App, text: &str) {
+    match &mut app.mode {
+        Mode::AmendInput { buffer } => buffer.push_str(&sanitize_multiline_paste(text)),
+        Mode::NewRunInput { draft, .. } => match draft.field {
+            NewRunField::Task => {
+                let text = sanitize_multiline_paste(text);
+                insert_text_at_cursor(&mut draft.task, &mut draft.task_cursor, &text);
+            }
+            NewRunField::Workspace => {
+                let text = normalize_single_line_paste(text);
+                insert_text_at_cursor(&mut draft.workspace, &mut draft.workspace_cursor, &text);
+            }
+            NewRunField::Title => {
+                let text = normalize_single_line_paste(text);
+                insert_text_at_cursor(&mut draft.title, &mut draft.title_cursor, &text);
+            }
+            NewRunField::Start | NewRunField::Cancel => {}
+        },
+        Mode::InterviewInput { buffer, .. } => buffer.push_str(&sanitize_multiline_paste(text)),
+        Mode::PromptReview { .. }
+        | Mode::Normal
+        | Mode::ConfirmDelete { .. }
+        | Mode::ConfirmPrune { .. }
+        | Mode::ArtifactView { .. } => {}
+    }
+}
+
 fn handle_amend_key(
     ctx: &Context,
     app: &mut App,
@@ -1212,7 +1869,8 @@ fn handle_amend_key(
             ],
         )?;
         app.notice =
-            "Amendment saved. Press n for the next stage or r to resume the pipeline.".to_string();
+            "Amendment saved. Press n for the next stage or r/w to run the whole pipeline."
+                .to_string();
     }
     Ok(false)
 }
@@ -1224,12 +1882,13 @@ fn handle_new_run_key(
 ) -> Result<bool, String> {
     let mut submit = false;
     let mut cancel = false;
-    if let Mode::NewRunInput { draft } = &mut app.mode {
+    if let Mode::NewRunInput { draft, task_scroll } = &mut app.mode {
         match key.code {
-            KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => cancel = true,
             KeyCode::Esc => cancel = true,
             KeyCode::Enter => match draft.field {
-                NewRunField::Task => draft.task.push('\n'),
+                NewRunField::Task => {
+                    insert_text_at_cursor(&mut draft.task, &mut draft.task_cursor, "\n")
+                }
                 NewRunField::Workspace => draft.field = NewRunField::Title,
                 NewRunField::Title => draft.field = NewRunField::Start,
                 NewRunField::Start => submit = true,
@@ -1238,24 +1897,100 @@ fn handle_new_run_key(
             KeyCode::BackTab => draft.field = draft.field.previous(),
             KeyCode::Tab | KeyCode::Down => draft.field = draft.field.next(),
             KeyCode::Up => draft.field = draft.field.previous(),
+            KeyCode::PageDown => {
+                if matches!(draft.field, NewRunField::Task) {
+                    *task_scroll = task_scroll.saturating_add(6);
+                }
+            }
+            KeyCode::PageUp => {
+                if matches!(draft.field, NewRunField::Task) {
+                    *task_scroll = task_scroll.saturating_sub(6);
+                }
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 match draft.field {
-                    NewRunField::Task => draft.task.clear(),
-                    NewRunField::Workspace => draft.workspace.clear(),
-                    NewRunField::Title => draft.title.clear(),
+                    NewRunField::Task => {
+                        draft.task.clear();
+                        draft.task_cursor = 0;
+                    }
+                    NewRunField::Workspace => {
+                        draft.workspace.clear();
+                        draft.workspace_cursor = 0;
+                    }
+                    NewRunField::Title => {
+                        draft.title.clear();
+                        draft.title_cursor = 0;
+                    }
                     NewRunField::Start | NewRunField::Cancel => {}
                 }
             }
             KeyCode::Backspace => match draft.field {
-                NewRunField::Task | NewRunField::Workspace | NewRunField::Title => {
-                    active_new_run_buffer(draft).pop();
+                NewRunField::Task => backspace_at_cursor(&mut draft.task, &mut draft.task_cursor),
+                NewRunField::Workspace => {
+                    backspace_at_cursor(&mut draft.workspace, &mut draft.workspace_cursor)
+                }
+                NewRunField::Title => {
+                    backspace_at_cursor(&mut draft.title, &mut draft.title_cursor)
                 }
                 NewRunField::Start | NewRunField::Cancel => {}
             },
-            KeyCode::Char(ch) => match draft.field {
-                NewRunField::Task | NewRunField::Workspace | NewRunField::Title => {
-                    active_new_run_buffer(draft).push(ch);
+            KeyCode::Left => match draft.field {
+                NewRunField::Task => draft.task_cursor = draft.task_cursor.saturating_sub(1),
+                NewRunField::Workspace => {
+                    draft.workspace_cursor = draft.workspace_cursor.saturating_sub(1)
                 }
+                NewRunField::Title => draft.title_cursor = draft.title_cursor.saturating_sub(1),
+                NewRunField::Cancel => draft.field = NewRunField::Start,
+                NewRunField::Start => draft.field = NewRunField::Cancel,
+            },
+            KeyCode::Right => match draft.field {
+                NewRunField::Task => {
+                    draft.task_cursor = draft
+                        .task_cursor
+                        .saturating_add(1)
+                        .min(char_count(&draft.task))
+                }
+                NewRunField::Workspace => {
+                    draft.workspace_cursor = draft
+                        .workspace_cursor
+                        .saturating_add(1)
+                        .min(char_count(&draft.workspace))
+                }
+                NewRunField::Title => {
+                    draft.title_cursor = draft
+                        .title_cursor
+                        .saturating_add(1)
+                        .min(char_count(&draft.title))
+                }
+                NewRunField::Start => draft.field = NewRunField::Cancel,
+                NewRunField::Cancel => draft.field = NewRunField::Start,
+            },
+            KeyCode::Home => match draft.field {
+                NewRunField::Task => draft.task_cursor = 0,
+                NewRunField::Workspace => draft.workspace_cursor = 0,
+                NewRunField::Title => draft.title_cursor = 0,
+                NewRunField::Start | NewRunField::Cancel => {}
+            },
+            KeyCode::End => match draft.field {
+                NewRunField::Task => draft.task_cursor = char_count(&draft.task),
+                NewRunField::Workspace => draft.workspace_cursor = char_count(&draft.workspace),
+                NewRunField::Title => draft.title_cursor = char_count(&draft.title),
+                NewRunField::Start | NewRunField::Cancel => {}
+            },
+            KeyCode::Char(ch) => match draft.field {
+                NewRunField::Task => {
+                    insert_text_at_cursor(&mut draft.task, &mut draft.task_cursor, &ch.to_string())
+                }
+                NewRunField::Workspace => insert_text_at_cursor(
+                    &mut draft.workspace,
+                    &mut draft.workspace_cursor,
+                    &ch.to_string(),
+                ),
+                NewRunField::Title => insert_text_at_cursor(
+                    &mut draft.title,
+                    &mut draft.title_cursor,
+                    &ch.to_string(),
+                ),
                 NewRunField::Start | NewRunField::Cancel => {}
             },
             _ => {}
@@ -1267,7 +2002,7 @@ fn handle_new_run_key(
     }
     if submit {
         let draft = match &app.mode {
-            Mode::NewRunInput { draft } => draft.clone(),
+            Mode::NewRunInput { draft, .. } => draft.clone(),
             _ => return Ok(false),
         };
         if draft.task.trim().is_empty() {
@@ -1292,9 +2027,13 @@ fn handle_interview_key(
 ) -> Result<bool, String> {
     let mut cancel = false;
     let mut advance = false;
-    if let Mode::InterviewInput { buffer, .. } = &mut app.mode {
+    if let Mode::InterviewInput {
+        buffer,
+        answer_scroll,
+        ..
+    } = &mut app.mode
+    {
         match key.code {
-            KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => cancel = true,
             KeyCode::Esc => cancel = true,
             KeyCode::Enter | KeyCode::Down => advance = true,
             KeyCode::Up | KeyCode::BackTab => {
@@ -1302,6 +2041,7 @@ fn handle_interview_key(
                     answers,
                     index,
                     buffer,
+                    answer_scroll,
                     ..
                 } = &mut app.mode
                 {
@@ -1309,10 +2049,13 @@ fn handle_interview_key(
                     if *index > 0 {
                         *index -= 1;
                         buffer.clone_from(&answers[*index]);
+                        *answer_scroll = 0;
                     }
                 }
                 return Ok(false);
             }
+            KeyCode::PageDown => *answer_scroll = answer_scroll.saturating_add(6),
+            KeyCode::PageUp => *answer_scroll = answer_scroll.saturating_sub(6),
             KeyCode::Backspace => {
                 buffer.pop();
             }
@@ -1324,6 +2067,7 @@ fn handle_interview_key(
     }
     if cancel {
         app.mode = Mode::Normal;
+        app.wizard_selected = false;
         app.notice = "New pipeline interview cancelled.".to_string();
         return Ok(false);
     }
@@ -1341,6 +2085,7 @@ fn handle_interview_key(
         answers,
         index,
         buffer,
+        answer_scroll,
         ..
     } = &mut app.mode
     {
@@ -1357,6 +2102,7 @@ fn handle_interview_key(
         } else {
             *index += 1;
             buffer.clone_from(&answers[*index]);
+            *answer_scroll = 0;
         }
     }
     if !should_finalize {
@@ -1384,8 +2130,13 @@ fn handle_prompt_review_key(
     {
         match key.code {
             _ if key_is_char(key, 'q') => return Ok(true),
+            _ if key_is_char(key, 'm') => {
+                toggle_mouse_capture(app)?;
+                return Ok(false);
+            }
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
+                app.wizard_selected = false;
                 app.notice = "Prompt review closed. No run was created.".to_string();
                 return Ok(false);
             }
@@ -1432,7 +2183,8 @@ fn handle_prompt_review_key(
                     spawn_resume_for_run(ctx, app, created)?;
                 } else {
                     app.notice =
-                        "Run created. Press n for the next stage or r to resume.".to_string();
+                        "Run created. Press n for the next stage or r/w to run the whole stack."
+                            .to_string();
                     app.last_output = format!(
                         "Created {}\n\nPipeline is ready. Start it from the TUI when you want.",
                         created.display()
@@ -1452,6 +2204,10 @@ fn handle_artifact_view_key(
     if let Mode::ArtifactView { kind, scroll } = app.mode {
         match key.code {
             _ if key_is_char(key, 'q') => return Ok(true),
+            _ if key_is_char(key, 'm') => {
+                toggle_mouse_capture(app)?;
+                return Ok(false);
+            }
             KeyCode::Esc => app.mode = Mode::Normal,
             KeyCode::Down => {
                 next_mode = Some(Mode::ArtifactView {
@@ -1568,11 +2324,14 @@ fn handle_delete_confirm(
         _ if key_is_char(key, 'd') || key_is_char(key, 'x') => {
             if let Some(run) = app.selected_run() {
                 let run_dir = run.run_dir.clone();
-                delete_run(&run_dir)?;
-                app.notice = format!("Deleted {}", run_dir.display());
-                app.last_output.clone_from(&app.notice);
-                app.mode = Mode::Normal;
-                app.refresh(ctx)?;
+                if delete_run_if_safe(app, &run_dir)? {
+                    app.notice = format!("Deleted {}", run_dir.display());
+                    app.last_output.clone_from(&app.notice);
+                    app.mode = Mode::Normal;
+                    app.refresh(ctx)?;
+                } else {
+                    app.mode = Mode::Normal;
+                }
             } else {
                 app.mode = Mode::Normal;
             }
@@ -1586,11 +2345,14 @@ fn handle_delete_confirm(
             ConfirmChoice::Confirm => {
                 if let Some(run) = app.selected_run() {
                     let run_dir = run.run_dir.clone();
-                    delete_run(&run_dir)?;
-                    app.notice = format!("Deleted {}", run_dir.display());
-                    app.last_output.clone_from(&app.notice);
-                    app.mode = Mode::Normal;
-                    app.refresh(ctx)?;
+                    if delete_run_if_safe(app, &run_dir)? {
+                        app.notice = format!("Deleted {}", run_dir.display());
+                        app.last_output.clone_from(&app.notice);
+                        app.mode = Mode::Normal;
+                        app.refresh(ctx)?;
+                    } else {
+                        app.mode = Mode::Normal;
+                    }
                 } else {
                     app.mode = Mode::Normal;
                 }
@@ -1617,11 +2379,16 @@ fn handle_prune_confirm(
         _ if key_is_char(key, 'p') => {
             let candidates =
                 choose_prune_candidates(&app.root, DEFAULT_KEEP, Some(DEFAULT_PRUNE_DAYS))?;
+            let (candidates, skipped) = prune_candidates_without_active_jobs(candidates);
             let count = candidates.len();
             for run_dir in candidates {
                 delete_run(&run_dir)?;
             }
-            app.notice = format!("Pruned {count} run(s)");
+            app.notice = if skipped == 0 {
+                format!("Pruned {count} run(s)")
+            } else {
+                format!("Pruned {count} run(s); skipped {skipped} active run(s)")
+            };
             app.last_output = format!(
                 "Deleted runs older than {DEFAULT_PRUNE_DAYS} days while keeping the newest {DEFAULT_KEEP}."
             );
@@ -1637,11 +2404,16 @@ fn handle_prune_confirm(
             ConfirmChoice::Confirm => {
                 let candidates =
                     choose_prune_candidates(&app.root, DEFAULT_KEEP, Some(DEFAULT_PRUNE_DAYS))?;
+                let (candidates, skipped) = prune_candidates_without_active_jobs(candidates);
                 let count = candidates.len();
                 for run_dir in candidates {
                     delete_run(&run_dir)?;
                 }
-                app.notice = format!("Pruned {count} run(s)");
+                app.notice = if skipped == 0 {
+                    format!("Pruned {count} run(s)")
+                } else {
+                    format!("Pruned {count} run(s); skipped {skipped} active run(s)")
+                };
                 app.last_output = format!(
                     "Deleted runs older than {DEFAULT_PRUNE_DAYS} days while keeping the newest {DEFAULT_KEEP}."
                 );
@@ -1667,14 +2439,7 @@ fn spawn_action(
             return Ok(());
         }
     };
-    if app.job.is_some() {
-        app.notice = "Another action is already running.".to_string();
-        return Ok(());
-    }
-    if let Some(state) = runtime::active_job_state(&run_dir) {
-        app.job = Some(RunningJob::attached(run_dir.clone(), state));
-        app.notice =
-            "This run already has an active job. Attached to the existing process.".to_string();
+    if !ensure_job_slot_for_run(app, &run_dir) {
         return Ok(());
     }
     let label_text = label.to_string();
@@ -1684,17 +2449,18 @@ fn spawn_action(
         "resume" => "resume until verification".to_string(),
         other => other.to_string(),
     };
+    let log_hint = app
+        .selected_run()
+        .and_then(|run| infer_log_hint(label, run));
+    let action_label = log_hint.clone().unwrap_or_else(|| label.to_string());
     app.notice = format!(
-        "Running {label} for {}",
+        "Running {action_label} for {}",
         run_dir
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("run")
     );
     app.last_output.clear();
-    let log_hint = app
-        .selected_run()
-        .and_then(|run| infer_log_hint(label, run));
     let args_for_log = args.join(" ");
     let run_dir_for_job = run_dir.clone();
     let label_for_job = label_text.clone();
@@ -1765,9 +2531,9 @@ fn spawn_action(
     )
 }
 
-fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
+fn poll_tracked_job(job: &mut RunningJob, runs: &[RunSnapshot]) -> Option<FinishedJob> {
     let mut finished = None;
-    if let Some(job) = app.job.as_mut() {
+    {
         if let Some(rx) = job.stream_rx.as_ref() {
             while rx.try_recv().is_ok() {}
         }
@@ -1775,38 +2541,71 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
         if !fresh_lines.is_empty() {
             job.stream_lines = fresh_lines;
         }
-        if job.last_heartbeat.elapsed() >= Duration::from_secs(1) {
-            let status = if let Some(run) = app.runs.iter().find(|run| run.run_dir == job.run_dir) {
-                if job_stalled(run, job) {
-                    "stalled"
-                } else {
-                    "running"
-                }
-            } else {
-                "running"
-            };
-            let _ = runtime::touch_job(&job.run_dir, status);
-            job.last_heartbeat = Instant::now();
-        }
 
         let mut completion = None;
+        let mut completion_channel_closed = false;
         if let Some(rx) = job.completion_rx.as_ref() {
-            if let Ok(result) = rx.try_recv() {
-                completion = Some(result);
+            match rx.try_recv() {
+                Ok(result) => completion = Some(result),
+                Err(TryRecvError::Disconnected) => completion_channel_closed = true,
+                Err(TryRecvError::Empty) => {}
             }
-        } else if runtime::active_job_state(&job.run_dir).is_none() {
-            finished = Some((
-                job.kind.clone(),
-                job.label.clone(),
-                job.run_dir.clone(),
-                job.log_hint.clone(),
-                JobResult {
-                    code: 1,
-                    stdout: String::new(),
-                    stderr: String::new(),
-                },
-                true,
-            ));
+        }
+        if completion.is_none() {
+            if let Some(state) = runtime::load_job_state(&job.run_dir) {
+                if state.is_active() {
+                    job.refresh_from_state(state.clone());
+                    let run = runs.iter().find(|run| run.run_dir == job.run_dir);
+                    reconcile_job_stage_with_run(job, run);
+                }
+                if state.exit_code.is_some() || !state.is_active() {
+                    let code = state.exit_code.unwrap_or(match state.status.as_str() {
+                        "completed" => 0,
+                        "interrupted" => 130,
+                        _ => 1,
+                    });
+                    completion = Some(JobResult {
+                        code,
+                        stdout: String::new(),
+                        stderr: state.message.unwrap_or_default(),
+                    });
+                }
+            } else if (job.completion_rx.is_none() || completion_channel_closed)
+                && runtime::active_job_state(&job.run_dir).is_none()
+            {
+                finished = Some((
+                    job.kind.clone(),
+                    job.label.clone(),
+                    job.run_dir.clone(),
+                    job.log_hint.clone(),
+                    JobResult {
+                        code: 1,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    },
+                    true,
+                ));
+            }
+        }
+        if completion.is_none() && job.last_heartbeat.elapsed() >= Duration::from_secs(1) {
+            let state = runtime::load_job_state(&job.run_dir);
+            if state
+                .as_ref()
+                .map(|item| item.is_active() && (item.pid > 0 || item.pgid > 0))
+                .unwrap_or(false)
+            {
+                let status = if let Some(run) = runs.iter().find(|run| run.run_dir == job.run_dir) {
+                    if job_stalled(run, job) {
+                        "stalled"
+                    } else {
+                        "running"
+                    }
+                } else {
+                    "running"
+                };
+                let _ = runtime::touch_job(&job.run_dir, status);
+            }
+            job.last_heartbeat = Instant::now();
         }
         if let Some(result) = completion {
             finished = Some((
@@ -1819,8 +2618,28 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
             ));
         }
     }
+    finished.map(
+        |(kind, label, run_dir, completed_log_hint, result, detached_finish)| FinishedJob {
+            kind,
+            label,
+            run_dir,
+            completed_log_hint,
+            result,
+            detached_finish,
+        },
+    )
+}
 
-    if let Some((kind, label, run_dir, completed_log_hint, result, detached_finish)) = finished {
+fn handle_finished_job(ctx: &Context, app: &mut App, finished: FinishedJob) -> Result<(), String> {
+    let FinishedJob {
+        kind,
+        label,
+        run_dir,
+        completed_log_hint,
+        result,
+        detached_finish,
+    } = finished;
+    {
         let output_lines = runtime::tail_process_log(&run_dir, 80);
         let raw_output = output_lines.join("\n");
         let exit_code = result.code;
@@ -1847,10 +2666,21 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
             130 => format!("{label} interrupted"),
             code => format!("{label} failed with exit code {code}"),
         };
-        app.job = None;
         match kind {
             JobKind::RunAction => {
                 app.refresh(ctx)?;
+                if exit_code == 0 && label == "rerun" {
+                    if let Some(created) = rerun_created_run_dir(&result.stdout) {
+                        app.select_run_by_path(&created);
+                        app.notice = format!(
+                            "Follow-up run created: {}",
+                            created
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or("run")
+                        );
+                    }
+                }
                 if let Some(updated) = app.runs.iter_mut().find(|item| item.run_dir == run_dir) {
                     let (log_title, log_lines) = contextual_log_excerpt(
                         &run_dir,
@@ -1864,7 +2694,7 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
             }
             JobKind::InterviewQuestions { draft } => {
                 if exit_code == 0 {
-                    match parse_embedded_json::<InterviewQuestionsPayload>(&raw_output) {
+                    match parse_job_json::<InterviewQuestionsPayload>(&result.stdout, &raw_output) {
                         Ok(payload) => {
                             if payload.questions.is_empty() {
                                 let created =
@@ -1872,7 +2702,7 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
                                 app.refresh(ctx)?;
                                 app.select_run_by_path(&created);
                                 app.notice =
-                                    "Run created. Press n for the next stage or r to resume."
+                                    "Run created. Press n for the next stage or r/w to run the whole stack."
                                         .to_string();
                                 app.last_output = format!(
                                     "Created {}\n\nThe pipeline has not been started yet.",
@@ -1888,17 +2718,24 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
                                     questions,
                                     index: 0,
                                     buffer: String::new(),
+                                    answer_scroll: 0,
                                 };
                                 app.notice = "Stage0 interview questions are ready.".to_string();
                             }
                         }
                         Err(err) => {
-                            app.mode = Mode::NewRunInput { draft };
+                            app.mode = Mode::NewRunInput {
+                                draft,
+                                task_scroll: 0,
+                            };
                             app.notice = format!("Could not parse interview questions JSON: {err}");
                         }
                     }
                 } else {
-                    app.mode = Mode::NewRunInput { draft };
+                    app.mode = Mode::NewRunInput {
+                        draft,
+                        task_scroll: 0,
+                    };
                 }
             }
             JobKind::InterviewFinalize {
@@ -1907,7 +2744,7 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
                 answers,
             } => {
                 if exit_code == 0 {
-                    match parse_embedded_json::<InterviewFinalizePayload>(&raw_output) {
+                    match parse_job_json::<InterviewFinalizePayload>(&result.stdout, &raw_output) {
                         Ok(payload) => {
                             app.mode = Mode::PromptReview {
                                 draft,
@@ -1940,12 +2777,16 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
                                     .collect(),
                                 index: 0,
                                 buffer: String::new(),
+                                answer_scroll: 0,
                             };
                             app.notice = format!("Could not parse interview finalize JSON: {err}");
                         }
                     }
                 } else {
-                    app.mode = Mode::NewRunInput { draft };
+                    app.mode = Mode::NewRunInput {
+                        draft,
+                        task_scroll: 0,
+                    };
                 }
             }
         }
@@ -1953,8 +2794,38 @@ fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
     Ok(())
 }
 
+fn poll_job(ctx: &Context, app: &mut App) -> Result<(), String> {
+    let run_finished = app
+        .job
+        .as_mut()
+        .and_then(|job| poll_tracked_job(job, &app.runs));
+    if run_finished.is_some() {
+        app.job = None;
+    }
+    if let Some(finished) = run_finished {
+        handle_finished_job(ctx, app, finished)?;
+    }
+
+    let wizard_finished = app
+        .wizard_job
+        .as_mut()
+        .and_then(|job| poll_tracked_job(job, &app.runs));
+    if wizard_finished.is_some() {
+        app.wizard_job = None;
+    }
+    if let Some(finished) = wizard_finished {
+        handle_finished_job(ctx, app, finished)?;
+    }
+    Ok(())
+}
+
 fn interrupt_job(app: &mut App) -> Result<(), String> {
-    let Some(job) = app.job.as_mut() else {
+    let job = if app.wizard_selected {
+        app.wizard_job.as_mut().or(app.job.as_mut())
+    } else {
+        app.job.as_mut().or(app.wizard_job.as_mut())
+    };
+    let Some(job) = job else {
         app.notice = "No running action to interrupt.".to_string();
         return Ok(());
     };
@@ -1985,16 +2856,7 @@ fn interrupt_job(app: &mut App) -> Result<(), String> {
 
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let size = frame.size();
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Length(1),
-            Constraint::Min(10),
-            Constraint::Length(15),
-            Constraint::Length(1),
-        ])
-        .split(size);
+    let layout = root_layout(size);
 
     draw_header(frame, layout[0], app);
     draw_status_bar(frame, layout[1], app);
@@ -2004,23 +2866,35 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 
     match &app.mode {
         Mode::AmendInput { buffer } => draw_amend_popup(frame, size, buffer),
-        Mode::NewRunInput { draft } => draw_new_run_popup(frame, size, draft),
+        Mode::NewRunInput { draft, task_scroll } => {
+            draw_new_run_popup(frame, size, draft, *task_scroll);
+            if let Some((x, y)) = new_run_cursor_position(size, draft, *task_scroll) {
+                frame.set_cursor(x, y);
+            }
+        }
         Mode::InterviewInput {
             goal_summary,
             questions,
             answers,
             index,
             buffer,
+            answer_scroll,
             ..
-        } => draw_interview_popup(
-            frame,
-            size,
-            goal_summary,
-            questions,
-            answers,
-            *index,
-            buffer,
-        ),
+        } => {
+            draw_interview_popup(
+                frame,
+                size,
+                goal_summary,
+                questions,
+                answers,
+                *index,
+                buffer,
+                *answer_scroll,
+            );
+            if let Some((x, y)) = interview_cursor_position(size, buffer, *answer_scroll) {
+                frame.set_cursor(x, y);
+            }
+        }
         Mode::PromptReview {
             final_task_path,
             scroll,
@@ -2051,10 +2925,18 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
 }
 
 fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let running = app
-        .job
-        .as_ref()
-        .map(|job| format!(" | running: {}", running_job_label(job)))
+    let running_job = if app.wizard_selected {
+        app.wizard_job.as_ref().or(app.job.as_ref())
+    } else {
+        app.job.as_ref().or(app.wizard_job.as_ref())
+    };
+    let running = running_job
+        .map(|job| {
+            format!(
+                " | running: {}",
+                running_job_display_label(app.selected_run(), job)
+            )
+        })
         .unwrap_or_default();
     let lines = vec![
         Line::from(vec![Span::styled(
@@ -2071,16 +2953,19 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 
 fn footer_shortcuts(app: &App) -> &'static str {
     match app.mode {
-        Mode::ArtifactView { .. } => "q quit  Esc close  j/k scroll  PgUp/PgDn scroll  [ ] switch",
+        Mode::ArtifactView { .. } => {
+            "q quit  Esc close  j/k scroll  PgUp/PgDn scroll  [ ] switch  m mouse-select/scroll"
+        }
         Mode::ConfirmDelete { .. } => "Esc cancel  Enter apply  Left/Right switch",
         Mode::ConfirmPrune { .. } => "Esc cancel  Enter apply  Left/Right switch",
         Mode::AmendInput { .. } => "Esc cancel  Enter save+rewind",
-        Mode::NewRunInput { .. } => "Tab switch fields  Enter edit/apply  Esc cancel",
-        Mode::InterviewInput { .. } => "Enter next  Up previous  Esc cancel",
-        Mode::PromptReview { .. } => "Enter apply  Tab switch action  j/k scroll  Esc cancel",
-        Mode::Normal if app.job.is_some() => "q quit  Esc clear  i interrupt  j/k move  Enter open",
+        Mode::NewRunInput { .. } => "Tab switch fields  Enter edit/apply  PgUp/PgDn scroll  Esc cancel",
+        Mode::InterviewInput { .. } => "Enter next  Up previous  PgUp/PgDn scroll  Esc cancel",
+        Mode::PromptReview { .. } => {
+            "Enter apply  Tab switch action  j/k scroll  m mouse-select/scroll  Esc cancel"
+        }
         Mode::Normal => {
-            "q quit  Esc clear  j/k move  Enter open  c create  n next  r resume  a amend"
+            "q quit  Esc clear  j/k move  m mouse-select/scroll  Enter open  c create  n next  r/w run-all  a amend  i interrupt"
         }
     }
 }
@@ -2092,7 +2977,17 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let text = if let Some(run) = app.selected_run() {
+    let text = if app.wizard_selected {
+        if let Some(job) = app.wizard_job() {
+            format!(
+                "run=creating-pipeline | stage0={} | elapsed={}s | status=running",
+                job.command_hint,
+                job.started_at.elapsed().as_secs()
+            )
+        } else {
+            "No run selected".to_string()
+        }
+    } else if let Some(run) = app.selected_run() {
         let run_name = run
             .run_dir
             .file_name()
@@ -2104,23 +2999,37 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             .map(|job| {
                 if job.run_dir == run.run_dir {
                     if job_stalled(run, job) {
-                        format!(" | running={} | stalled", running_job_label(job))
+                        format!(
+                            " | running={} | stalled",
+                            running_job_display_label(Some(run), job)
+                        )
                     } else {
-                        format!(" | running={}", running_job_label(job))
+                        format!(" | running={}", running_job_display_label(Some(run), job))
                     }
                 } else {
                     format!(" | background={}", running_job_label(job))
                 }
             })
             .unwrap_or_default();
+        let wizard = app
+            .wizard_job()
+            .map(|job| format!(" | wizard={}", running_job_label(job)))
+            .unwrap_or_default();
         format!(
-            "run={run_name} | health={} | goal={} | next={} | host={}{}{}",
+            "run={run_name} | health={} | verification={} | verdict={} | next={}{} | host={}{}{}{}",
             run.doctor.health,
+            ui_verification_state(run),
             ui_goal_state(run),
             run.doctor.next,
+            run.doctor
+                .last_attempt
+                .as_ref()
+                .map(|attempt| format!(" | last={}({})", attempt.stage, attempt.status))
+                .unwrap_or_default(),
             run.doctor.host_probe,
             status_bar_tokens(&run.token_summary),
-            running
+            running,
+            wizard
         )
     } else {
         "No run selected".to_string()
@@ -2130,55 +3039,78 @@ fn draw_status_bar(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-fn draw_body(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let chunks = Layout::default()
+fn draw_body(frame: &mut ratatui::Frame<'_>, _area: Rect, app: &App) {
+    let size = frame.size();
+    let layout = root_layout(size);
+    let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
-        .split(area);
-    draw_runs(frame, chunks[0], app);
-    draw_details(frame, chunks[1], app);
+        .split(layout[2]);
+    let rects = normal_mode_rects(size);
+    draw_runs(frame, rects.runs, app);
+    draw_details(frame, body[1], app);
 }
 
 fn draw_runs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let items: Vec<ListItem<'_>> = if app.runs.is_empty() {
-        vec![ListItem::new("No runs found.")]
+    let mut items: Vec<ListItem<'_>> = Vec::new();
+    if let Some(job) = app.wizard_job() {
+        let line1 = "Creating Pipeline".to_string();
+        let line2 = format!("stage0 | step={}", job.command_hint);
+        let line3 = if job_stalled_without_run(job) {
+            format!(
+                "status=running | elapsed={}s | stalled",
+                job.started_at.elapsed().as_secs()
+            )
+        } else {
+            format!(
+                "status=running | elapsed={}s",
+                job.started_at.elapsed().as_secs()
+            )
+        };
+        items.push(ListItem::new(vec![
+            Line::from(line1),
+            Line::from(line2),
+            Line::from(line3),
+        ]));
+    }
+    if app.runs.is_empty() && items.is_empty() {
+        items.push(ListItem::new("No runs found."));
     } else {
-        app.runs
-            .iter()
-            .map(|run| {
-                let run_name = run
-                    .run_dir
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("run");
-                let running = app
-                    .job
-                    .as_ref()
-                    .filter(|job| job.run_dir == run.run_dir)
-                    .map(|job| {
-                        if job_stalled(run, job) {
-                            format!(" | running={} | stalled", running_job_label(job))
-                        } else {
-                            format!(" | running={}", running_job_label(job))
-                        }
-                    })
-                    .unwrap_or_default();
-                let line1 = run_name.to_string();
-                let line2 = format!(
-                    "health={} | next={} | goal={}{}",
-                    run.doctor.health,
-                    run.doctor.next,
-                    ui_goal_state(run),
-                    running
-                );
-                ListItem::new(vec![Line::from(line1), Line::from(line2)])
-            })
-            .collect()
-    };
+        items.extend(app.runs.iter().map(|run| {
+            let run_name = run
+                .run_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("run");
+            let running = app
+                .job
+                .as_ref()
+                .filter(|job| job.run_dir == run.run_dir)
+                .map(|job| {
+                    if job_stalled(run, job) {
+                        format!(
+                            " | running={} | stalled",
+                            running_job_display_label(Some(run), job)
+                        )
+                    } else {
+                        format!(" | running={}", running_job_display_label(Some(run), job))
+                    }
+                })
+                .unwrap_or_default();
+            let line1 = run_name.to_string();
+            let (line2, base_line3) = run_list_detail_lines(run);
+            let line3 = format!("{base_line3}{running}");
+            ListItem::new(vec![
+                Line::from(line1),
+                Line::from(line2),
+                Line::from(line3),
+            ])
+        }));
+    }
     let list = List::new(items)
         .block(
             Block::default()
-                .title("Runs (health | next | goal)")
+                .title("Runs (health | next | verify | verdict)")
                 .borders(Borders::ALL),
         )
         .highlight_style(
@@ -2189,8 +3121,15 @@ fn draw_runs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         )
         .highlight_symbol(">> ");
     let mut state = ListState::default();
-    if !app.runs.is_empty() {
-        state.select(Some(app.selected));
+    if !app.runs.is_empty() || app.wizard_job().is_some() {
+        let selection = if app.wizard_selected && app.wizard_job().is_some() {
+            0
+        } else if app.wizard_job().is_some() {
+            app.selected.saturating_add(1)
+        } else {
+            app.selected
+        };
+        state.select(Some(selection));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
@@ -2201,34 +3140,33 @@ fn draw_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(area);
     if app.selected_run().is_none() {
-        if let Some(job) = &app.job {
-            if matches!(job.kind, JobKind::RunAction) {
-                // Fall through to the generic details path below for normal run actions.
-            } else {
-                let preview_text = format!(
+        if let Some(job) = app.wizard_job() {
+            let preview_text = format!(
                 "Creating a new pipeline.\n\nCurrent step: {}\nElapsed: {}s\n\nThe run list will update only after stage0 finishes building the final task prompt and create-run succeeds.\n\nUse the lower pane for process output. Press `i` to interrupt if this stays stuck.",
                 job.command_hint,
                 job.started_at.elapsed().as_secs(),
             );
-                let detail_text = format!(
+            let detail_text = format!(
                 "Wizard state: stage0\nProcess: {}\nJob dir: {}\n\nCurrent behavior:\n- no new run exists yet\n- interview artifacts are being written under _interviews/\n- the new run appears only after interview-finalize completes",
                 job.command_hint,
                 job.run_dir.display(),
             );
-                let preview = Paragraph::new(preview_text)
-                    .block(
-                        Block::default()
-                            .title("Creating Pipeline")
-                            .borders(Borders::ALL),
-                    )
-                    .wrap(Wrap { trim: false });
-                let detail = Paragraph::new(detail_text)
-                    .block(Block::default().title("Activity").borders(Borders::ALL))
-                    .wrap(Wrap { trim: false });
-                frame.render_widget(preview, vertical[0]);
-                frame.render_widget(detail, vertical[1]);
-                return;
-            }
+            let preview_scroll =
+                clamp_scroll_for_text(&preview_text, vertical[0], app.preview_scroll);
+            let preview = Paragraph::new(preview_text)
+                .block(
+                    Block::default()
+                        .title("Creating Pipeline")
+                        .borders(Borders::ALL),
+                )
+                .scroll((preview_scroll, 0))
+                .wrap(Wrap { trim: false });
+            let detail = Paragraph::new(detail_text)
+                .block(Block::default().title("Activity").borders(Borders::ALL))
+                .wrap(Wrap { trim: false });
+            frame.render_widget(preview, vertical[0]);
+            frame.render_widget(detail, vertical[1]);
+            return;
         }
     }
     let lower = Layout::default()
@@ -2240,12 +3178,22 @@ fn draw_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
             let mut lines = vec![
                 format!("Run: {}", run.run_dir.display()),
                 format!("Health: {}", run.doctor.health),
-                format!("Goal: {}", ui_goal_state(run)),
+                format!("Verification: {}", ui_verification_state(run)),
+                format!("Verdict: {}", ui_goal_state(run)),
                 format!("Next: {}", run.doctor.next),
                 format!("Safe action: {}", run.doctor.safe_next_action),
                 format!("Host probe: {}", run.doctor.host_probe),
                 format!("Tokens: {}", run_token_summary_line(&run.token_summary)),
             ];
+            if let Some(attempt) = &run.doctor.last_attempt {
+                lines.push(format!(
+                    "Last attempt: {} via {} -> {}",
+                    attempt.stage, attempt.label, attempt.status
+                ));
+                if !attempt.message.trim().is_empty() {
+                    lines.push(format!("Last attempt detail: {}", attempt.message));
+                }
+            }
             if let Some(drift) = &run.doctor.host_drift {
                 lines.push(format!("Host drift: {drift}"));
             }
@@ -2279,7 +3227,19 @@ fn draw_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     ));
                 }
             }
+            if let Some(job) = app.wizard_job() {
+                lines.push(String::new());
+                lines.push(format!(
+                    "Background job: {} for creating-pipeline",
+                    running_job_label(job)
+                ));
+            }
             let (preview_title, preview_text) = live_preview(app, run);
+            let preview_title = if preview_title == "Summary" {
+                summary_title(run).to_string()
+            } else {
+                preview_title
+            };
             let action_text = action_panel_text(app, Some(run));
             (lines.join("\n"), action_text, preview_title, preview_text)
         } else {
@@ -2290,8 +3250,10 @@ fn draw_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 "No substantive artifact is available yet.".to_string(),
             )
         };
+    let preview_scroll = clamp_scroll_for_text(&preview_text, vertical[0], app.preview_scroll);
     let preview = Paragraph::new(preview_text)
         .block(Block::default().title(preview_title).borders(Borders::ALL))
+        .scroll((preview_scroll, 0))
         .wrap(Wrap { trim: false });
     let detail = Paragraph::new(detail_text)
         .block(Block::default().title("Run Facts").borders(Borders::ALL))
@@ -2305,7 +3267,28 @@ fn draw_details(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_logs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let (title, content) = if let Some(job) = &app.job {
+    let (title, content) = if let Some(job) = app.wizard_job().filter(|_| app.wizard_selected) {
+        let persisted = runtime::tail_process_log(&job.run_dir, 20);
+        let mut lines = vec![
+            format!("Stage0: {}", job.command_hint),
+            format!("Job dir: {}", job.run_dir.display()),
+            String::new(),
+        ];
+        if !job.stream_lines.is_empty() {
+            lines.push("Process output:".to_string());
+            lines.extend(job.stream_lines.iter().cloned());
+            lines.push(String::new());
+        }
+        if persisted.is_empty() {
+            lines.push("Waiting for fresh stage0 output.".to_string());
+        } else {
+            lines.extend(persisted);
+        }
+        (
+            format!("Running: {}", running_job_label(job)),
+            lines.join("\n"),
+        )
+    } else if let Some(job) = &app.job {
         if let Some(run) = app.selected_run() {
             if job.run_dir == run.run_dir {
                 let (log_title, log_lines) = live_log_excerpt(run, job);
@@ -2316,14 +3299,17 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                     .unwrap_or("run");
                 let mut lines = vec![
                     format!(
-                        "Process: {}{}",
-                        job.command_hint,
+                        "Stage: {}{}",
+                        job_display_label(Some(run), job),
                         if job.attached { " (attached)" } else { "" }
                     ),
                     format!("Run: {run_name}"),
                     format!("Log source: {log_title}"),
                     String::new(),
                 ];
+                if let Some(launcher) = job_launcher_label(job) {
+                    lines.insert(1, format!("Launcher: {launcher}"));
+                }
                 if !job.stream_lines.is_empty() {
                     lines.push("Process output:".to_string());
                     lines.extend(job.stream_lines.iter().cloned());
@@ -2338,7 +3324,7 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
                 }
                 lines.extend(log_lines);
                 (
-                    format!("Running: {}", running_job_label(job)),
+                    format!("Running: {}", running_job_display_label(Some(run), job)),
                     lines.join("\n"),
                 )
             } else {
@@ -2410,8 +3396,10 @@ fn draw_logs(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
     } else {
         ("Logs".to_string(), "No log files yet.".to_string())
     };
+    let scroll = clamp_scroll_for_text(&content, area, app.log_scroll);
     let logs = Paragraph::new(content)
         .block(Block::default().title(title).borders(Borders::ALL))
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(logs, area);
 }
@@ -2429,20 +3417,128 @@ fn job_stalled_without_run(job: &RunningJob) -> bool {
     modified < SystemTime::now() - Duration::from_secs(15)
 }
 
+fn pipeline_kind_is_solver(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "solver" | "research" | "analysis" | "researcher"
+    )
+}
+
+fn solver_batch_stage_ids(run: &RunSnapshot) -> Vec<String> {
+    let plan_path = run.run_dir.join("plan.json");
+    let Ok(text) = std::fs::read_to_string(plan_path) else {
+        return Vec::new();
+    };
+    let Ok(plan) = serde_json::from_str::<TuiPlanSummary>(&text) else {
+        return Vec::new();
+    };
+    plan.pipeline
+        .stages
+        .into_iter()
+        .filter(|stage| pipeline_kind_is_solver(&stage.kind))
+        .map(|stage| stage.id)
+        .filter(|id| {
+            run.doctor
+                .stages
+                .get(id)
+                .or_else(|| run.status.stages.get(id))
+                .map(|state| state != "done")
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+fn parallel_solver_batch_ids(run: &RunSnapshot, job: &RunningJob) -> Vec<String> {
+    if is_rerun_job(job) {
+        return Vec::new();
+    }
+    if !(job.command_hint == "start-solvers" || job.command_hint.starts_with("resume")) {
+        return Vec::new();
+    }
+    let ids = solver_batch_stage_ids(run);
+    if ids.len() > 1 {
+        ids
+    } else {
+        Vec::new()
+    }
+}
+
+fn job_stage_label(job: &RunningJob) -> String {
+    if is_rerun_job(job) {
+        "follow-up run".to_string()
+    } else if let Some(stage) = &job.log_hint {
+        stage.clone()
+    } else {
+        job.label.clone()
+    }
+}
+
+fn job_launcher_label(job: &RunningJob) -> Option<String> {
+    if is_rerun_job(job) {
+        return Some(job.command_hint.clone());
+    }
+    let stage = job_stage_label(job);
+    if job.command_hint == stage {
+        None
+    } else {
+        Some(job.command_hint.clone())
+    }
+}
+
 fn running_job_label(job: &RunningJob) -> String {
     let elapsed = job.started_at.elapsed().as_secs();
-    if let Some(stage) = &job.log_hint {
-        format!("{stage} ({elapsed}s)")
-    } else {
-        format!("{} ({elapsed}s)", job.label)
+    format!("{} ({elapsed}s)", job_stage_label(job))
+}
+
+fn job_display_label(run: Option<&RunSnapshot>, job: &RunningJob) -> String {
+    if let Some(run) = run {
+        if !parallel_solver_batch_ids(run, job).is_empty() {
+            return "solvers (parallel)".to_string();
+        }
     }
+    job_stage_label(job)
+}
+
+fn running_job_display_label(run: Option<&RunSnapshot>, job: &RunningJob) -> String {
+    let elapsed = job.started_at.elapsed().as_secs();
+    format!("{} ({elapsed}s)", job_display_label(run, job))
 }
 
 fn live_preview(app: &App, run: &RunSnapshot) -> (String, String) {
     if let Some(job) = &app.job {
         if job.run_dir == run.run_dir {
-            let stage = job.log_hint.as_deref().unwrap_or("current-stage");
-            let live_path = run.run_dir.join("logs").join(format!("{stage}.last.md"));
+            if is_rerun_job(job) {
+                return (
+                    if job_stalled(run, job) {
+                        "Live status (stalled)".to_string()
+                    } else {
+                        "Live status".to_string()
+                    },
+                    format!(
+                        "Creating a follow-up run from this verified source run.\n\nLauncher command: {}\nElapsed: {}s\n\nSource run state:\n- Verification: {}\n- Verdict: {}\n- Safe action: {}\n\nThe source run itself is not re-executing pipeline stages. A new follow-up run directory will appear separately and will become selected after creation completes.\n\n{}",
+                        job.command_hint,
+                        job.started_at.elapsed().as_secs(),
+                        ui_verification_state(run),
+                        ui_goal_state(run),
+                        run.doctor.safe_next_action,
+                        if job_stalled(run, job) {
+                            "No fresh output detected for the follow-up creation job. Press `i` to interrupt if it stays stuck."
+                        } else {
+                            "Waiting for follow-up run creation output."
+                        },
+                    ),
+                );
+            }
+            let stage = job_display_label(Some(run), job);
+            let batch_ids = parallel_solver_batch_ids(run, job);
+            let launcher = job_launcher_label(job)
+                .map(|value| format!("\nLauncher command: {value}"))
+                .unwrap_or_default();
+            let live_log_stage = job.log_hint.as_deref().unwrap_or(stage.as_str());
+            let live_path = run
+                .run_dir
+                .join("logs")
+                .join(format!("{live_log_stage}.last.md"));
             if is_fresh_for_job(&live_path, job) {
                 if let Ok(content) = std::fs::read_to_string(&live_path) {
                     let trimmed = content.trim();
@@ -2458,10 +3554,15 @@ fn live_preview(app: &App, run: &RunSnapshot) -> (String, String) {
                     "Live status".to_string()
                 },
                 format!(
-                    "Stage `{stage}` is currently running.\n\nLauncher command: {}\nElapsed: {}s\n\nCurrent next field: {}\nGoal status: {}\nSafe action: {}\n\n{}\n\nUse the lower log pane for live agent output.",
-                    job.command_hint,
+                    "Stage `{stage}` is currently running.{launcher}\nElapsed: {}s\n{}\nCurrent next field: {}\nVerification stage: {}\nVerification verdict: {}\nSafe action: {}\n\n{}\n\nUse the lower log pane for live agent output.",
                     job.started_at.elapsed().as_secs(),
+                    if batch_ids.is_empty() {
+                        String::new()
+                    } else {
+                        format!("Parallel batch stages: {}\n", batch_ids.join(", "))
+                    },
                     run.doctor.next,
+                    ui_verification_state(run),
                     ui_goal_state(run),
                     run.doctor.safe_next_action,
                     if job_stalled(run, job) {
@@ -2477,26 +3578,37 @@ fn live_preview(app: &App, run: &RunSnapshot) -> (String, String) {
 }
 
 fn live_log_excerpt(run: &RunSnapshot, job: &RunningJob) -> (String, Vec<String>) {
-    let stage = job.log_hint.as_deref().unwrap_or("current-stage");
-    let last_path = run.run_dir.join("logs").join(format!("{stage}.last.md"));
-    if !is_fresh_for_job(&last_path, job) {
-        return (
-            format!("Waiting for {stage}"),
-            vec![
-                format!("No fresh live output yet for stage `{stage}`."),
-                "The previous .last.md belongs to an older attempt and is being ignored."
-                    .to_string(),
-                format!("Launcher command: {}", job.command_hint),
-                format!("Elapsed: {}s", job.started_at.elapsed().as_secs()),
-            ],
-        );
+    let stage = job_display_label(Some(run), job);
+    let batch_ids = parallel_solver_batch_ids(run, job);
+    let live_log_stage = job.log_hint.as_deref().unwrap_or(stage.as_str());
+    if !stage_has_fresh_live_log(run, job, live_log_stage) {
+        let mut lines = vec![
+            format!("No fresh live output yet for stage `{stage}`."),
+            "No fresh stage log was written after this attempt started.".to_string(),
+        ];
+        if let Some(launcher) = job_launcher_label(job) {
+            lines.push(format!("Launcher command: {launcher}"));
+        }
+        if !batch_ids.is_empty() {
+            lines.push(format!("Parallel batch stages: {}", batch_ids.join(", ")));
+        }
+        lines.push(format!("Elapsed: {}s", job.started_at.elapsed().as_secs()));
+        return (format!("Waiting for {stage}"), lines);
     }
-    contextual_log_excerpt(
+    let (title, mut lines) = contextual_log_excerpt(
         &run.run_dir,
         job.log_hint.as_deref(),
         Some(&run.status.next),
         12,
-    )
+    );
+    if !batch_ids.is_empty() {
+        lines.insert(
+            0,
+            format!("Parallel batch stages: {}", batch_ids.join(", ")),
+        );
+        lines.insert(1, String::new());
+    }
+    (title, lines)
 }
 
 fn is_fresh_for_job(path: &Path, job: &RunningJob) -> bool {
@@ -2507,6 +3619,26 @@ fn is_fresh_for_job(path: &Path, job: &RunningJob) -> bool {
         return false;
     };
     modified >= job.started_wallclock
+}
+
+fn stage_has_fresh_live_log(run: &RunSnapshot, job: &RunningJob, stage: &str) -> bool {
+    let logs_dir = run.run_dir.join("logs");
+    let trimmed = stage.trim();
+    if trimmed.is_empty() || trimmed == "none" || trimmed == "rerun" {
+        return is_fresh_for_job(&runtime::process_log_path(&run.run_dir), job);
+    }
+    if [
+        format!("{trimmed}.last.md"),
+        format!("{trimmed}.stdout.log"),
+        format!("{trimmed}.stderr.log"),
+    ]
+    .into_iter()
+    .map(|candidate| logs_dir.join(candidate))
+    .any(|path| is_fresh_for_job(&path, job))
+    {
+        return true;
+    }
+    is_fresh_for_job(&runtime::process_log_path(&run.run_dir), job)
 }
 
 fn job_stalled(run: &RunSnapshot, job: &RunningJob) -> bool {
@@ -2590,20 +3722,21 @@ fn draw_amend_popup(frame: &mut ratatui::Frame<'_>, area: Rect, buffer: &str) {
     frame.render_widget(paragraph, popup);
 }
 
-fn draw_new_run_popup(frame: &mut ratatui::Frame<'_>, area: Rect, draft: &NewRunDraft) {
-    let popup = centered_rect(78, 44, area);
+fn draw_new_run_popup(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    draft: &NewRunDraft,
+    requested_task_scroll: u16,
+) {
+    let popup = new_run_popup_rect(area);
     frame.render_widget(Clear, popup);
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Length(5),
-            Constraint::Length(5),
-            Constraint::Length(3),
-            Constraint::Length(3),
-        ])
-        .split(popup);
+    let layout = new_run_popup_layout(popup);
+    let task_scroll = text_scroll_for_cursor(
+        layout[1],
+        &draft.task,
+        draft.task_cursor,
+        requested_task_scroll,
+    );
     let field_name = match draft.field {
         NewRunField::Task => "Task",
         NewRunField::Workspace => "Workspace",
@@ -2634,7 +3767,7 @@ fn draw_new_run_popup(frame: &mut ratatui::Frame<'_>, area: Rect, draft: &NewRun
         Span::styled(" Cancel ", cancel_style),
     ]);
     let header = Paragraph::new(format!(
-        "Create a new pipeline.\n\nFill the task, set an explicit workspace, then start stage0 interview.\n\nActive field: {field_name}"
+        "Create a new pipeline.\nFill the task, set the workspace, then start stage0.\nActive field: {field_name}"
     ))
     .block(Block::default().title("New Pipeline").borders(Borders::ALL))
     .wrap(Wrap { trim: false });
@@ -2648,6 +3781,7 @@ fn draw_new_run_popup(frame: &mut ratatui::Frame<'_>, area: Rect, draft: &NewRun
                 draft.task.as_str()
             },
             matches!(draft.field, NewRunField::Task),
+            task_scroll,
         ),
         layout[1],
     );
@@ -2660,6 +3794,7 @@ fn draw_new_run_popup(frame: &mut ratatui::Frame<'_>, area: Rect, draft: &NewRun
                 draft.workspace.as_str()
             },
             matches!(draft.field, NewRunField::Workspace),
+            0,
         ),
         layout[2],
     );
@@ -2672,11 +3807,12 @@ fn draw_new_run_popup(frame: &mut ratatui::Frame<'_>, area: Rect, draft: &NewRun
                 draft.title.as_str()
             },
             matches!(draft.field, NewRunField::Title),
+            0,
         ),
         layout[3],
     );
     frame.render_widget(
-        Paragraph::new("Tab switches fields. Enter edits/applies. Esc cancels.")
+        Paragraph::new("Tab switch  Enter edit/apply  PgUp/PgDn scroll  Esc cancel")
             .block(Block::default().borders(Borders::ALL)),
         layout[4],
     );
@@ -2688,6 +3824,7 @@ fn draw_new_run_popup(frame: &mut ratatui::Frame<'_>, area: Rect, draft: &NewRun
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_interview_popup(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -2696,19 +3833,17 @@ fn draw_interview_popup(
     answers: &[String],
     index: usize,
     buffer: &str,
+    requested_answer_scroll: u16,
 ) {
-    let popup = centered_rect(82, 56, area);
+    let popup = interview_popup_rect(area);
     frame.render_widget(Clear, popup);
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Length(7),
-            Constraint::Length(10),
-            Constraint::Min(10),
-            Constraint::Length(8),
-        ])
-        .split(popup);
+    let layout = interview_popup_layout(popup);
+    let answer_scroll = text_scroll_for_cursor(
+        layout[3],
+        buffer,
+        char_count(buffer),
+        requested_answer_scroll,
+    );
     let question = questions.get(index);
     let progress = format!("Question {}/{}", index + 1, questions.len());
     let answered = if answers.is_empty() {
@@ -2724,7 +3859,7 @@ fn draw_interview_popup(
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "{progress}\nUse Up to revisit the previous answer.\nEnter saves and continues. Esc cancels."
+            "{progress}\nUse Up for the previous answer. Enter saves and continues."
         ))
         .block(Block::default().title("Interview").borders(Borders::ALL))
         .wrap(Wrap { trim: false }),
@@ -2739,6 +3874,7 @@ fn draw_interview_popup(
                 goal_summary
             },
             false,
+            0,
         ),
         layout[1],
     );
@@ -2759,6 +3895,7 @@ fn draw_interview_popup(
                     .unwrap_or("<done>")
             ),
             false,
+            0,
         ),
         layout[2],
     );
@@ -2771,6 +3908,7 @@ fn draw_interview_popup(
                 buffer
             },
             true,
+            answer_scroll,
         ),
         layout[3],
     );
@@ -2783,9 +3921,152 @@ fn draw_interview_popup(
                 answered.as_str()
             },
             false,
+            0,
         ),
         layout[4],
     );
+}
+
+fn new_run_popup_rect(area: Rect) -> Rect {
+    centered_rect_with_min(area, 90, 80, 84, 19)
+}
+
+fn new_run_popup_layout(popup: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Min(4),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Length(3),
+        ])
+        .split(popup)
+        .to_vec()
+}
+
+fn interview_popup_rect(area: Rect) -> Rect {
+    centered_rect_with_min(area, 90, 85, 90, 20)
+}
+
+fn interview_popup_layout(popup: Rect) -> Vec<Rect> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(4),
+            Constraint::Length(5),
+            Constraint::Min(4),
+            Constraint::Length(3),
+        ])
+        .split(popup)
+        .to_vec()
+}
+
+fn block_inner_area(area: Rect) -> Rect {
+    Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    }
+}
+
+fn text_cursor_row_col(value: &str, width: usize, cursor: usize) -> (usize, usize) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let mut row = 0usize;
+    let mut col = 0usize;
+    for ch in value.chars().take(cursor) {
+        if ch == '\n' {
+            row = row.saturating_add(1);
+            col = 0;
+            continue;
+        }
+        if col >= width {
+            row = row.saturating_add(col / width);
+            col %= width;
+        }
+        if col + 1 > width {
+            row = row.saturating_add(1);
+            col = 0;
+        }
+        col += 1;
+    }
+    if col >= width {
+        row = row.saturating_add(col / width);
+        col %= width;
+    }
+    (row, col)
+}
+
+fn text_scroll_for_cursor(area: Rect, value: &str, cursor: usize, requested: u16) -> u16 {
+    let inner = block_inner_area(area);
+    if inner.width == 0 || inner.height == 0 {
+        return 0;
+    }
+    let width = inner.width as usize;
+    let visible_rows = inner.height as usize;
+    let (row, _) = text_cursor_row_col(value, width, cursor);
+    let total_lines = wrapped_line_count(value, inner.width);
+    let max_scroll = total_lines.saturating_sub(visible_rows);
+    let min_scroll = row.saturating_sub(visible_rows.saturating_sub(1));
+    requested.max(min_scroll as u16).min(max_scroll as u16)
+}
+
+fn text_cursor_position(area: Rect, value: &str, cursor: usize, scroll: u16) -> Option<(u16, u16)> {
+    let inner = block_inner_area(area);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+    let width = inner.width as usize;
+    let max_row = inner.height.saturating_sub(1) as usize;
+    let (row, col) = text_cursor_row_col(value, width, cursor);
+    let row = row.saturating_sub(scroll as usize).min(max_row);
+    let col = col.min(inner.width.saturating_sub(1) as usize);
+    Some((
+        inner.x.saturating_add(col as u16),
+        inner.y.saturating_add(row as u16),
+    ))
+}
+
+fn new_run_cursor_position(
+    area: Rect,
+    draft: &NewRunDraft,
+    requested_task_scroll: u16,
+) -> Option<(u16, u16)> {
+    let popup = new_run_popup_rect(area);
+    let layout = new_run_popup_layout(popup);
+    match draft.field {
+        NewRunField::Task => {
+            let scroll = text_scroll_for_cursor(
+                layout[1],
+                &draft.task,
+                draft.task_cursor,
+                requested_task_scroll,
+            );
+            text_cursor_position(layout[1], &draft.task, draft.task_cursor, scroll)
+        }
+        NewRunField::Workspace => {
+            text_cursor_position(layout[2], &draft.workspace, draft.workspace_cursor, 0)
+        }
+        NewRunField::Title => text_cursor_position(layout[3], &draft.title, draft.title_cursor, 0),
+        NewRunField::Start | NewRunField::Cancel => None,
+    }
+}
+
+fn interview_cursor_position(
+    area: Rect,
+    buffer: &str,
+    requested_answer_scroll: u16,
+) -> Option<(u16, u16)> {
+    let popup = interview_popup_rect(area);
+    let layout = interview_popup_layout(popup);
+    let cursor = char_count(buffer);
+    let scroll = text_scroll_for_cursor(layout[3], buffer, cursor, requested_answer_scroll);
+    text_cursor_position(layout[3], buffer, cursor, scroll)
 }
 
 fn draw_prompt_review_popup(
@@ -2852,7 +4133,7 @@ fn draw_prompt_review_popup(
             Span::raw("  "),
             Span::styled(" Create Run ", create_style),
             Span::raw("   "),
-            Span::styled(" Create + Start ", start_style),
+            Span::styled(" Create + Run All ", start_style),
             Span::raw("   "),
             Span::styled(" Cancel ", cancel_style),
         ]))
@@ -2861,7 +4142,7 @@ fn draw_prompt_review_popup(
     );
 }
 
-fn field_block(title: &str, value: &str, active: bool) -> Paragraph<'static> {
+fn field_block(title: &str, value: &str, active: bool, scroll: u16) -> Paragraph<'static> {
     let block = if active {
         Block::default()
             .title(title.to_string())
@@ -2874,6 +4155,7 @@ fn field_block(title: &str, value: &str, active: bool) -> Paragraph<'static> {
     };
     Paragraph::new(value.to_string())
         .block(block)
+        .scroll((scroll, 0))
         .wrap(Wrap { trim: false })
 }
 
@@ -2882,21 +4164,27 @@ fn action_panel_text(app: &App, run: Option<&RunSnapshot>) -> String {
         if let Some(run) = run {
             if job.run_dir == run.run_dir {
                 return format!(
-                    "Primary\n- i interrupt current stage\n- Enter open preferred artifact\n- 1 Summary  2 Findings  3 Augmented  4 Execution  5 Brief\n\nCurrent\n- running: {}\n- next: {}\n- safe action: {}\n",
-                    running_job_label(job),
+                    "Primary\n- i interrupt current stage\n- j/k switch runs\n- Enter open preferred artifact\n- 1 Summary  2 Findings  3 Augmented  4 Execution  5 Brief\n\nBackground-capable\n- c create another pipeline\n- x delete only inactive runs\n- p prune skips active runs\n\nCurrent\n- running: {}\n- next: {}\n- safe action: {}\n",
+                    running_job_display_label(Some(run), job),
                     run.doctor.next,
                     run.doctor.safe_next_action
                 );
             }
         }
         return format!(
-            "Background job\n- {}\n- Press i to interrupt\n- j/k move between runs\n- Enter open artifacts for the selected run\n",
+            "Background job\n- {}\n- i interrupt tracked job\n- j/k move between runs\n- c create another pipeline\n- n next stage on the selected inactive run\n- r/w run the whole stack on the selected inactive run\n- y rerun\n- h/u refresh helpers\n- x delete only inactive runs\n- p prune skips active runs\n- Enter open artifacts for the selected run\n",
+            running_job_label(job)
+        );
+    }
+    if let Some(job) = app.wizard_job() {
+        return format!(
+            "Wizard\n- i interrupt stage0 creation\n- j/k move between runs\n- c create another pipeline after this one finishes\n\nCurrent\n- running: {}\n",
             running_job_label(job)
         );
     }
     if let Some(run) = run {
         format!(
-            "Primary\n- n next stage\n- r resume pipeline\n- a amend and rewind\n- Enter open preferred artifact\n\nSecondary\n- y rerun\n- h refresh host probe\n- u refresh prompts\n- x delete run\n- p prune runs\n\nCurrent\n- next: {}\n- safe action: {}\n",
+            "Primary\n- n next stage\n- r/w run whole stack\n- a amend and rewind\n- Enter open preferred artifact\n\nSecondary\n- y rerun\n- h refresh host probe\n- u refresh prompts\n- x delete run\n- p prune runs\n\nCurrent\n- next: {}\n- safe action: {}\n- solver fan-out uses parallel start-solvers when applicable\n",
             run.doctor.next,
             run.doctor.safe_next_action
         )
@@ -2967,9 +4255,16 @@ fn draw_artifact_popup(
     } else {
         "No run selected.".to_string()
     };
+    let label = if matches!(kind, ArtifactKind::Summary) {
+        app.selected_run()
+            .map(summary_title)
+            .unwrap_or_else(|| kind.label())
+    } else {
+        kind.label()
+    };
     let title = format!(
         "{}  scroll j/k PgUp/PgDn  switch [ ] or 1..5  Esc close",
-        kind.label()
+        label
     );
     let paragraph = Paragraph::new(content)
         .block(Block::default().title(title).borders(Borders::ALL))
@@ -2981,6 +4276,7 @@ fn draw_artifact_popup(
 fn preferred_artifact_kind(run: &RunSnapshot) -> ArtifactKind {
     match run.preview_label.as_str() {
         "Summary" => ArtifactKind::Summary,
+        "Request" => ArtifactKind::Summary,
         "Findings" => ArtifactKind::Findings,
         "Augmented" => ArtifactKind::Augmented,
         "Execution" => ArtifactKind::Execution,
@@ -2990,7 +4286,7 @@ fn preferred_artifact_kind(run: &RunSnapshot) -> ArtifactKind {
 }
 
 fn artifact_content(run: &RunSnapshot, kind: ArtifactKind) -> String {
-    let path = kind.path(&run.run_dir);
+    let path = kind.path(run);
     match std::fs::read_to_string(&path) {
         Ok(content) if !content.trim().is_empty() => {
             if looks_pending_artifact(&content) {
@@ -3032,7 +4328,9 @@ fn looks_pending_artifact(content: &str) -> bool {
 
 fn artifact_ready_hint(kind: ArtifactKind) -> &'static str {
     match kind {
-        ArtifactKind::Summary => "This artifact is generated after the review stage completes.",
+        ArtifactKind::Summary => {
+            "This view prefers verification summary, falls back to review summary, and only then to the seeded request or follow-up task."
+        }
         ArtifactKind::Findings => {
             "This artifact is generated after the verification stage completes."
         }
@@ -3085,6 +4383,26 @@ fn ui_goal_state(run: &RunSnapshot) -> String {
     }
 }
 
+fn ui_verification_state(run: &RunSnapshot) -> String {
+    run.doctor
+        .stages
+        .get("verification")
+        .or_else(|| run.status.stages.get("verification"))
+        .cloned()
+        .unwrap_or_else(|| "missing".to_string())
+}
+
+fn run_list_detail_lines(run: &RunSnapshot) -> (String, String) {
+    (
+        format!("health={} | next={}", run.doctor.health, run.doctor.next),
+        format!(
+            "verify={} | verdict={}",
+            ui_verification_state(run),
+            ui_goal_state(run)
+        ),
+    )
+}
+
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -3105,13 +4423,61 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     horizontal[1]
 }
 
+fn centered_rect_with_min(
+    area: Rect,
+    percent_x: u16,
+    percent_y: u16,
+    min_width: u16,
+    min_height: u16,
+) -> Rect {
+    let max_width = area.width.saturating_sub(2).max(1);
+    let max_height = area.height.saturating_sub(2).max(1);
+    let width = (((area.width as u32) * (percent_x as u32)) / 100)
+        .max(min_width as u32)
+        .min(max_width as u32) as u16;
+    let height = (((area.height as u32) * (percent_y as u32)) / 100)
+        .max(min_height as u32)
+        .min(max_height as u32) as u16;
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{key_is_char, parse_embedded_json, ui_goal_state, InterviewQuestionsPayload};
-    use crate::engine::{DoctorPayload, RunSnapshot, RunTokenSummary, StatusPayload};
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use super::{
+        block_inner_area, default_new_run_draft, delete_run_if_safe, ensure_job_slot_for_run,
+        handle_finished_job, handle_mouse, handle_new_run_key, handle_normal_key, handle_paste,
+        interview_cursor_position, interview_popup_layout, interview_popup_rect, job_display_label,
+        key_is_char, live_log_excerpt, live_preview, new_run_cursor_position, new_run_popup_layout,
+        new_run_popup_rect, normal_mode_rects, parse_embedded_json, poll_job,
+        preferred_summary_path, rerun_created_run_dir, run_list_detail_lines, running_job_label,
+        summary_title, text_scroll_for_cursor, ui_goal_state, ui_verification_state, App,
+        ArtifactKind, FinishedJob, InterviewQuestionsPayload, JobKind, JobResult, Mode,
+        NewRunDraft, NewRunField, RunningJob,
+    };
+    use crate::engine::{Context, DoctorPayload, RunSnapshot, RunTokenSummary, StatusPayload};
+    use crate::runtime;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
     use std::collections::BTreeMap;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("agpipe-tui-test-{name}-{unique}"));
+        fs::create_dir_all(&path).expect("create temp dir");
+        path
+    }
 
     fn sample_run(goal: &str, next: &str, verification: &str) -> RunSnapshot {
         RunSnapshot {
@@ -3153,6 +4519,22 @@ mod tests {
         }
     }
 
+    fn test_context() -> Context {
+        Context {
+            repo_root: PathBuf::from("/tmp/agpipe-test-repo"),
+            codex_bin: "codex".to_string(),
+            stage0_backend: "codex".to_string(),
+            stage_backend: "codex".to_string(),
+            openai_api_base: "https://api.openai.com/v1".to_string(),
+            openai_api_key: None,
+            openai_model: "gpt-5".to_string(),
+            openai_prompt_cache_key_prefix: "agpipe-stage0-v1".to_string(),
+            openai_prompt_cache_retention: None,
+            openai_store: false,
+            openai_background: false,
+        }
+    }
+
     #[test]
     fn ui_goal_state_hides_pending_verification_before_late_stages() {
         let run = sample_run("pending-verification", "review", "pending");
@@ -3172,14 +4554,40 @@ mod tests {
     }
 
     #[test]
+    fn ui_verification_state_reports_stage_status() {
+        let run = sample_run("partial", "rerun", "done");
+        assert_eq!(ui_verification_state(&run), "done");
+    }
+
+    #[test]
+    fn ui_verification_state_falls_back_to_status_snapshot() {
+        let mut run = sample_run("partial", "rerun", "done");
+        run.doctor.stages.remove("verification");
+
+        assert_eq!(ui_verification_state(&run), "done");
+    }
+
+    #[test]
+    fn run_list_detail_lines_keep_verification_and_verdict_visible() {
+        let run = sample_run("partial", "rerun", "done");
+
+        let (line2, line3) = run_list_detail_lines(&run);
+
+        assert_eq!(line2, "health=healthy | next=rerun");
+        assert_eq!(line3, "verify=done | verdict=partial");
+    }
+
+    #[test]
     fn key_aliases_work_in_cyrillic_layout_for_global_shortcuts() {
         let quit_key = KeyEvent::new(KeyCode::Char('й'), KeyModifiers::NONE);
         let next_key = KeyEvent::new(KeyCode::Char('т'), KeyModifiers::NONE);
         let resume_key = KeyEvent::new(KeyCode::Char('к'), KeyModifiers::NONE);
+        let whole_stack_key = KeyEvent::new(KeyCode::Char('ц'), KeyModifiers::NONE);
 
         assert!(key_is_char(quit_key, 'q'));
         assert!(key_is_char(next_key, 'n'));
         assert!(key_is_char(resume_key, 'r'));
+        assert!(key_is_char(whole_stack_key, 'w'));
     }
 
     #[test]
@@ -3192,5 +4600,1318 @@ mod tests {
         assert_eq!(payload.session_dir, "/tmp/session");
         assert_eq!(payload.goal_summary, "goal");
         assert!(payload.questions.is_empty());
+    }
+
+    #[test]
+    fn parse_embedded_json_prefers_last_complete_object_in_noisy_log() {
+        let payload = parse_embedded_json::<InterviewQuestionsPayload>(
+            "noise\n{\n  \"goal_summary\": \"first\",\n  \"questions\": []\n}\n{\ntokens used\n  \"goal_summary\": \"broken\"\n}\n{\n  \"goal_summary\": \"final\",\n  \"questions\": [\n    {\n      \"id\": \"scope\",\n      \"question\": \"Need scope?\",\n      \"why\": \"Needed for execution.\",\n      \"required\": true\n    }\n  ],\n  \"session_dir\": \"/tmp/final\"\n}\n",
+        )
+        .expect("embedded json should parse last valid object");
+
+        assert_eq!(payload.session_dir, "/tmp/final");
+        assert_eq!(payload.goal_summary, "final");
+        assert_eq!(payload.questions.len(), 1);
+        assert_eq!(payload.questions[0].id, "scope");
+    }
+
+    #[test]
+    fn handle_finished_interview_questions_uses_stdout_when_process_log_has_no_json() {
+        let ctx = test_context();
+        let session_dir = temp_dir("interview-stdout-session");
+        let run_dir = temp_dir("interview-stdout-run");
+        fs::create_dir_all(run_dir.join("runtime")).expect("create runtime dir");
+        fs::write(
+            run_dir.join("runtime").join("process.log"),
+            "Starting stage0 interview questions\n",
+        )
+        .expect("write process log");
+        let draft = NewRunDraft {
+            task: "Fix the pipeline".to_string(),
+            workspace: "/tmp/workspace".to_string(),
+            title: String::new(),
+            task_cursor: 0,
+            workspace_cursor: 0,
+            title_cursor: 0,
+            field: NewRunField::Task,
+        };
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: Vec::new(),
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        handle_finished_job(
+            &ctx,
+            &mut app,
+            FinishedJob {
+                kind: JobKind::InterviewQuestions {
+                    draft: draft.clone(),
+                },
+                label: "interview-questions".to_string(),
+                run_dir,
+                completed_log_hint: None,
+                result: JobResult {
+                    code: 0,
+                    stdout: format!(
+                        "{{\n  \"session_dir\": \"{}\",\n  \"goal_summary\": \"Need one answer\",\n  \"questions\": [{{\n    \"id\": \"scope\",\n    \"question\": \"Run verification too?\",\n    \"why\": \"Needed for the downstream plan.\",\n    \"required\": true\n  }}]\n}}\n",
+                        session_dir.display()
+                    ),
+                    stderr: String::new(),
+                },
+                detached_finish: false,
+            },
+        )
+        .expect("handle finished interview questions");
+
+        match &app.mode {
+            Mode::InterviewInput {
+                goal_summary,
+                questions,
+                ..
+            } => {
+                assert_eq!(goal_summary, "Need one answer");
+                assert_eq!(questions.len(), 1);
+                assert_eq!(questions[0].id, "scope");
+            }
+            _ => panic!("expected interview input mode"),
+        }
+
+        let _ = fs::remove_dir_all(session_dir);
+    }
+
+    #[test]
+    fn new_run_cursor_starts_at_task_field_origin_when_empty() {
+        let draft = NewRunDraft {
+            task: String::new(),
+            workspace: "/tmp/workspace".to_string(),
+            title: String::new(),
+            task_cursor: 0,
+            workspace_cursor: "/tmp/workspace".chars().count(),
+            title_cursor: 0,
+            field: NewRunField::Task,
+        };
+        let area = Rect::new(0, 0, 120, 40);
+        let popup = new_run_popup_rect(area);
+        let layout = new_run_popup_layout(popup);
+        let inner = block_inner_area(layout[1]);
+
+        let cursor = new_run_cursor_position(area, &draft, 0);
+
+        assert_eq!(cursor, Some((inner.x, inner.y)));
+    }
+
+    #[test]
+    fn text_scroll_for_cursor_allows_manual_scroll_beyond_cursor_row() {
+        let area = Rect::new(0, 0, 40, 8);
+        let value = (0..20)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let scroll = text_scroll_for_cursor(area, &value, 0, 50);
+
+        assert!(
+            scroll > 0,
+            "expected scroll to remain possible for long text"
+        );
+    }
+
+    #[test]
+    fn interview_cursor_moves_with_multiline_answer() {
+        let area = Rect::new(0, 0, 120, 40);
+        let base = interview_cursor_position(area, "first line", 0);
+        let multiline = interview_cursor_position(area, "first line\nsecond", 0);
+
+        assert!(multiline.unwrap().1 > base.unwrap().1);
+        assert!(multiline.unwrap().0 <= base.unwrap().0);
+    }
+
+    #[test]
+    fn popup_layouts_leave_space_for_fields_on_small_terminals() {
+        let small = Rect::new(0, 0, 80, 24);
+        let new_run = new_run_popup_layout(new_run_popup_rect(small));
+        let interview = interview_popup_layout(interview_popup_rect(small));
+
+        assert!(new_run[1].height >= 4);
+        assert!(new_run[2].height >= 3);
+        assert!(new_run[3].height >= 3);
+        assert!(interview[3].height >= 4);
+        assert!(interview[4].height >= 3);
+    }
+
+    #[test]
+    fn selected_run_is_hidden_while_stage0_wizard_is_selected() {
+        let app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![sample_run("pending-verification", "intake", "pending")],
+            selected: 0,
+            wizard_selected: true,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: Some(RunningJob {
+                kind: JobKind::InterviewQuestions {
+                    draft: default_new_run_draft(),
+                },
+                label: "interview-questions".to_string(),
+                run_dir: PathBuf::from("/tmp/.agpipe-ui"),
+                log_hint: None,
+                command_hint: "stage0 interview questions".to_string(),
+                started_at: Instant::now() - Duration::from_secs(2),
+                started_wallclock: SystemTime::now() - Duration::from_secs(2),
+                pid: 1,
+                pgid: 1,
+                process_log: PathBuf::from("/tmp/.agpipe-ui/process.log"),
+                stream_rx: None,
+                completion_rx: None,
+                stream_lines: Vec::new(),
+                attached: false,
+                last_heartbeat: Instant::now(),
+            }),
+        };
+
+        assert!(app.selected_run().is_none());
+        assert!(app.wizard_job().is_some());
+    }
+
+    #[test]
+    fn move_down_from_wizard_selection_returns_to_first_run() {
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![sample_run("pending-verification", "intake", "pending")],
+            selected: 0,
+            wizard_selected: true,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: Some(RunningJob {
+                kind: JobKind::InterviewQuestions {
+                    draft: default_new_run_draft(),
+                },
+                label: "interview-questions".to_string(),
+                run_dir: PathBuf::from("/tmp/.agpipe-ui"),
+                log_hint: None,
+                command_hint: "stage0 interview questions".to_string(),
+                started_at: Instant::now() - Duration::from_secs(2),
+                started_wallclock: SystemTime::now() - Duration::from_secs(2),
+                pid: 1,
+                pgid: 1,
+                process_log: PathBuf::from("/tmp/.agpipe-ui/process.log"),
+                stream_rx: None,
+                completion_rx: None,
+                stream_lines: Vec::new(),
+                attached: false,
+                last_heartbeat: Instant::now(),
+            }),
+        };
+
+        app.move_down();
+
+        assert!(!app.wizard_selected);
+        assert!(app.selected_run().is_some());
+    }
+
+    #[test]
+    fn spawn_stage0_job_keeps_existing_run_job_attached() {
+        let ctx = test_context();
+        let run_dir = temp_dir("keep-run-job");
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let run_job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "execution".to_string(),
+            run_dir: run_dir.clone(),
+            log_hint: Some("execution".to_string()),
+            command_hint: "resume until verification".to_string(),
+            started_at: Instant::now() - Duration::from_secs(9),
+            started_wallclock: SystemTime::now() - Duration::from_secs(9),
+            pid: 1,
+            pgid: 1,
+            process_log: run_dir.join("runtime").join("process.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+        let mut app = App {
+            root: temp_dir("keep-run-job-root"),
+            limit: 20,
+            runs: vec![sample_run(
+                "pending-verification",
+                "verification",
+                "pending",
+            )],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(run_job),
+            wizard_job: None,
+        };
+        let wizard_run_dir = super::ui_job_dir(&app.root);
+
+        super::spawn_engine_job(
+            &ctx,
+            &mut app,
+            JobKind::InterviewQuestions {
+                draft: default_new_run_draft(),
+            },
+            "interview-questions".to_string(),
+            wizard_run_dir,
+            None,
+            "stage0 interview questions".to_string(),
+            |_ctx| {
+                Ok(crate::engine::CommandResult {
+                    code: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            },
+        )
+        .expect("spawn stage0 job");
+
+        assert_eq!(
+            app.job.as_ref().map(|job| job.run_dir.clone()),
+            Some(run_dir.clone())
+        );
+        assert!(app.wizard_job().is_some());
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(&app.root);
+    }
+
+    #[test]
+    fn live_log_excerpt_uses_fresh_stdout_when_last_md_is_missing() {
+        let run_dir = temp_dir("live-log-stdout");
+        fs::create_dir_all(run_dir.join("logs")).expect("create logs");
+        fs::write(
+            run_dir.join("logs").join("execution.stdout.log"),
+            "line one\nline two\n",
+        )
+        .expect("write stdout log");
+        let mut run = sample_run("pending-verification", "execution", "pending");
+        run.run_dir.clone_from(&run_dir);
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "start-next".to_string(),
+            run_dir: run_dir.clone(),
+            log_hint: Some("execution".to_string()),
+            command_hint: "start-next".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+
+        let (title, lines) = live_log_excerpt(&run, &job);
+
+        assert_eq!(title, "execution.stdout.log");
+        assert!(lines.iter().any(|line| line.contains("line one")));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn running_job_label_prefers_stage_name_over_launcher_command() {
+        let run = sample_run("pending-verification", "intake", "pending");
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "start-next".to_string(),
+            run_dir: run.run_dir.clone(),
+            log_hint: Some("intake".to_string()),
+            command_hint: "start-next".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run.run_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+
+        let label = running_job_label(&job);
+
+        assert!(label.starts_with("intake ("));
+    }
+
+    #[test]
+    fn job_display_label_uses_parallel_solver_batch_label() {
+        let run_dir = temp_dir("parallel-solver-label");
+        fs::write(
+            run_dir.join("plan.json"),
+            r#"{
+  "pipeline": {
+    "stages": [
+      {"id": "intake", "kind": "intake"},
+      {"id": "solver-a", "kind": "solver"},
+      {"id": "solver-b", "kind": "research"},
+      {"id": "review", "kind": "review"}
+    ]
+  }
+}"#,
+        )
+        .expect("write plan");
+        let mut run = sample_run("pending-verification", "solver-a", "pending");
+        run.run_dir.clone_from(&run_dir);
+        run.doctor
+            .stages
+            .insert("solver-a".to_string(), "pending".to_string());
+        run.doctor
+            .stages
+            .insert("solver-b".to_string(), "pending".to_string());
+        run.status
+            .stages
+            .insert("solver-a".to_string(), "pending".to_string());
+        run.status
+            .stages
+            .insert("solver-b".to_string(), "pending".to_string());
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "resume".to_string(),
+            run_dir: run_dir.clone(),
+            log_hint: Some("solver-a".to_string()),
+            command_hint: "resume until verification".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+
+        assert_eq!(job_display_label(Some(&run), &job), "solvers (parallel)");
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn live_log_excerpt_uses_stage_name_and_separate_launcher_line() {
+        let run = sample_run("pending-verification", "intake", "pending");
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "start-next".to_string(),
+            run_dir: run.run_dir.clone(),
+            log_hint: Some("intake".to_string()),
+            command_hint: "start-next".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run.run_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+
+        let (title, lines) = live_log_excerpt(&run, &job);
+
+        assert_eq!(title, "Waiting for intake");
+        assert!(lines
+            .iter()
+            .any(|line| line == "Launcher command: start-next"));
+        assert!(lines
+            .iter()
+            .any(|line| line == "No fresh live output yet for stage `intake`."));
+    }
+
+    #[test]
+    fn preferred_summary_path_uses_verification_summary_when_available() {
+        let run_dir = temp_dir("preferred-summary");
+        fs::create_dir_all(run_dir.join("review")).expect("create review dir");
+        fs::create_dir_all(run_dir.join("verification")).expect("create verification dir");
+        fs::write(
+            run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nReview summary.\n",
+        )
+        .expect("write review summary");
+        fs::write(
+            run_dir.join("verification").join("user-summary.md"),
+            "# Verification Summary\n\nVerification summary.\n",
+        )
+        .expect("write verification summary");
+        let mut run = sample_run("partial", "rerun", "done");
+        run.run_dir.clone_from(&run_dir);
+
+        let path = preferred_summary_path(&run);
+
+        assert!(path.ends_with("verification/user-summary.md"));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn preferred_summary_path_falls_back_to_request_when_summaries_are_missing() {
+        let run_dir = temp_dir("preferred-request");
+        fs::write(
+            run_dir.join("request.md"),
+            "# Follow-up Task\n\nFinish the preserved-path smoke.\n",
+        )
+        .expect("write request");
+        let mut run = sample_run("pending-verification", "intake", "pending");
+        run.run_dir.clone_from(&run_dir);
+
+        let path = preferred_summary_path(&run);
+
+        assert!(path.ends_with("request.md"));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn summary_title_uses_review_when_verification_summary_is_still_placeholder() {
+        let run_dir = temp_dir("summary-title-review");
+        fs::create_dir_all(run_dir.join("review")).expect("create review dir");
+        fs::create_dir_all(run_dir.join("verification")).expect("create verification dir");
+        fs::write(
+            run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nReview summary.\n",
+        )
+        .expect("write review summary");
+        fs::write(
+            run_dir.join("verification").join("user-summary.md"),
+            "# Verification Summary\n\nPending localized verification summary.\n",
+        )
+        .expect("write verification placeholder");
+        let mut run = sample_run("pending-verification", "verification", "pending");
+        run.run_dir.clone_from(&run_dir);
+
+        assert_eq!(summary_title(&run), "Review Summary");
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn summary_title_uses_verification_when_verification_summary_is_ready() {
+        let run_dir = temp_dir("summary-title-verification");
+        fs::create_dir_all(run_dir.join("review")).expect("create review dir");
+        fs::create_dir_all(run_dir.join("verification")).expect("create verification dir");
+        fs::write(
+            run_dir.join("review").join("user-summary.md"),
+            "# User Summary\n\nReview summary.\n",
+        )
+        .expect("write review summary");
+        fs::write(
+            run_dir.join("verification").join("user-summary.md"),
+            "# Verification Summary\n\nVerification summary.\n",
+        )
+        .expect("write verification summary");
+        let mut run = sample_run("partial", "rerun", "done");
+        run.run_dir.clone_from(&run_dir);
+
+        assert_eq!(summary_title(&run), "Verification Summary");
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn rerun_created_run_dir_parses_first_existing_run_path() {
+        let created = temp_dir("rerun-created");
+        fs::write(created.join("plan.json"), "{}\n").expect("write plan");
+
+        let parsed = rerun_created_run_dir(&format!(
+            "{}\n\nNew run status:\n\nnext: intake\n",
+            created.display()
+        ));
+
+        assert_eq!(parsed, Some(created.clone()));
+
+        let _ = fs::remove_dir_all(created);
+    }
+
+    #[test]
+    fn live_preview_for_rerun_explains_source_run_is_not_reexecuting() {
+        let run = sample_run("partial", "rerun", "done");
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "rerun".to_string(),
+            run_dir: run.run_dir.clone(),
+            log_hint: None,
+            command_hint: "rerun".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run.run_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+        let app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(job),
+            wizard_job: None,
+        };
+
+        let (title, text) = live_preview(&app, &app.runs[0]);
+
+        assert_eq!(title, "Live status");
+        assert!(text.contains("Creating a follow-up run"));
+        assert!(text.contains("The source run itself is not re-executing pipeline stages."));
+    }
+
+    #[test]
+    fn mouse_wheel_over_logs_scrolls_logs_without_changing_selected_run() {
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![
+                sample_run("partial", "rerun", "done"),
+                sample_run("pending-verification", "verification", "pending"),
+            ],
+            selected: 1,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+        let rects = normal_mode_rects(Rect::new(0, 0, 120, 40));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: rects.logs.x.saturating_add(2),
+                row: rects.logs.y.saturating_add(2),
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        );
+
+        assert_eq!(app.selected, 1);
+        assert_eq!(app.log_scroll, 3);
+    }
+
+    #[test]
+    fn ensure_job_slot_for_run_detaches_background_job_for_other_run() {
+        let run_a_dir = temp_dir("detach-bg-a");
+        let run_b_dir = temp_dir("detach-bg-b");
+        let mut run_a = sample_run("partial", "rerun", "done");
+        run_a.run_dir.clone_from(&run_a_dir);
+        let mut run_b = sample_run("pending-verification", "intake", "pending");
+        run_b.run_dir.clone_from(&run_b_dir);
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "verification".to_string(),
+            run_dir: run_a_dir.clone(),
+            log_hint: Some("verification".to_string()),
+            command_hint: "start-next".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run_a_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run_a, run_b],
+            selected: 1,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(job),
+            wizard_job: None,
+        };
+
+        let ready = ensure_job_slot_for_run(&mut app, &run_b_dir);
+
+        assert!(ready);
+        assert!(app.job.is_none());
+        assert!(app.notice.contains("Detached"));
+
+        let _ = fs::remove_dir_all(run_a_dir);
+        let _ = fs::remove_dir_all(run_b_dir);
+    }
+
+    #[test]
+    fn handle_normal_key_allows_create_while_background_job_is_running() {
+        let ctx = test_context();
+        let run_a_dir = temp_dir("create-bg-a");
+        let run_b_dir = temp_dir("create-bg-b");
+        let mut run_a = sample_run("partial", "rerun", "done");
+        run_a.run_dir.clone_from(&run_a_dir);
+        let mut run_b = sample_run("pending-verification", "review", "pending");
+        run_b.run_dir.clone_from(&run_b_dir);
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let job = RunningJob {
+            kind: JobKind::RunAction,
+            label: "solver-a".to_string(),
+            run_dir: run_a_dir.clone(),
+            log_hint: Some("solver-a".to_string()),
+            command_hint: "start-next".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run_a_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run_a, run_b],
+            selected: 1,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(job),
+            wizard_job: None,
+        };
+
+        let _ = handle_normal_key(
+            &ctx,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        );
+
+        assert!(matches!(app.mode, Mode::NewRunInput { .. }));
+
+        let _ = fs::remove_dir_all(run_a_dir);
+        let _ = fs::remove_dir_all(run_b_dir);
+    }
+
+    #[test]
+    fn handle_normal_key_switches_to_selected_runs_active_job() {
+        let ctx = test_context();
+        let run_a_dir = temp_dir("switch-bg-a");
+        let run_b_dir = temp_dir("switch-bg-b");
+        fs::create_dir_all(run_b_dir.join("runtime")).expect("create runtime dir");
+        runtime::start_job(&run_b_dir, "review", Some("review"), "start-next", 1, 1)
+            .expect("start runtime job");
+
+        let mut run_a = sample_run("partial", "rerun", "done");
+        run_a.run_dir.clone_from(&run_a_dir);
+        let mut run_b = sample_run("pending-verification", "review", "pending");
+        run_b.run_dir.clone_from(&run_b_dir);
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let background = RunningJob {
+            kind: JobKind::RunAction,
+            label: "solver-a".to_string(),
+            run_dir: run_a_dir.clone(),
+            log_hint: Some("solver-a".to_string()),
+            command_hint: "start-next".to_string(),
+            started_at: Instant::now() - Duration::from_secs(5),
+            started_wallclock: SystemTime::now() - Duration::from_secs(5),
+            pid: 1,
+            pgid: 1,
+            process_log: run_a_dir.join(".runtime-job.log"),
+            stream_rx: Some(stream_rx),
+            completion_rx: Some(completion_rx),
+            stream_lines: Vec::new(),
+            attached: true,
+            last_heartbeat: Instant::now(),
+        };
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run_a, run_b],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(background),
+            wizard_job: None,
+        };
+
+        let _ = handle_normal_key(
+            &ctx,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        );
+
+        assert_eq!(app.selected, 1);
+        assert_eq!(
+            app.job.as_ref().map(|job| job.run_dir.clone()),
+            Some(run_b_dir.clone())
+        );
+
+        let _ = runtime::finish_job(&run_b_dir, "completed", Some(0), None);
+        let _ = fs::remove_dir_all(run_a_dir);
+        let _ = fs::remove_dir_all(run_b_dir);
+    }
+
+    #[test]
+    fn delete_run_if_safe_refuses_active_run() {
+        let run_dir = temp_dir("delete-active");
+        runtime::start_job(&run_dir, "resume", Some("intake"), "resume", 1, 1)
+            .expect("start runtime job");
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: Vec::new(),
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        let deleted = delete_run_if_safe(&mut app, &run_dir).expect("safe delete check");
+
+        assert!(!deleted);
+        assert!(run_dir.exists());
+        assert!(app.notice.contains("Cannot delete"));
+
+        let _ = runtime::finish_job(&run_dir, "completed", Some(0), None);
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn poll_job_clears_owned_job_when_runtime_state_is_already_completed() {
+        let ctx = test_context();
+        let run_dir = temp_dir("owned-job-runtime-completed");
+        runtime::start_pending_job(&run_dir, "start-next", Some("intake"), "start-next")
+            .expect("start pending runtime job");
+        runtime::finish_job(&run_dir, "completed", Some(0), None).expect("finish runtime job");
+
+        let mut run = sample_run("pending-verification", "solver-a", "pending");
+        run.run_dir.clone_from(&run_dir);
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel::<super::JobResult>();
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(RunningJob {
+                kind: JobKind::RunAction,
+                label: "start-next".to_string(),
+                run_dir: run_dir.clone(),
+                log_hint: Some("intake".to_string()),
+                command_hint: "start-next".to_string(),
+                started_at: Instant::now() - Duration::from_secs(5),
+                started_wallclock: SystemTime::now() - Duration::from_secs(5),
+                pid: 0,
+                pgid: 0,
+                process_log: run_dir.join("runtime").join("process.log"),
+                stream_rx: Some(stream_rx),
+                completion_rx: Some(completion_rx),
+                stream_lines: Vec::new(),
+                attached: false,
+                last_heartbeat: Instant::now(),
+            }),
+            wizard_job: None,
+        };
+
+        poll_job(&ctx, &mut app).expect("poll job");
+
+        assert!(app.job.is_none());
+        assert!(app.notice.contains("completed"));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn poll_job_reconciles_stale_resume_stage_with_current_next_stage() {
+        let ctx = test_context();
+        let run_dir = temp_dir("resume-stage-reconcile");
+        runtime::start_job(
+            &run_dir,
+            "resume",
+            Some("intake"),
+            "resume until verification",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start runtime job");
+
+        let mut run = sample_run("pending-verification", "solver-a", "pending");
+        run.run_dir.clone_from(&run_dir);
+        run.status
+            .stages
+            .insert("intake".to_string(), "done".to_string());
+        run.status
+            .stages
+            .insert("solver-a".to_string(), "pending".to_string());
+        run.doctor
+            .stages
+            .insert("intake".to_string(), "done".to_string());
+        run.doctor
+            .stages
+            .insert("solver-a".to_string(), "pending".to_string());
+
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel::<super::JobResult>();
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(RunningJob {
+                kind: JobKind::RunAction,
+                label: "resume".to_string(),
+                run_dir: run_dir.clone(),
+                log_hint: Some("intake".to_string()),
+                command_hint: "resume until verification".to_string(),
+                started_at: Instant::now() - Duration::from_secs(5),
+                started_wallclock: SystemTime::now() - Duration::from_secs(5),
+                pid: std::process::id() as i32,
+                pgid: std::process::id() as i32,
+                process_log: run_dir.join("runtime").join("process.log"),
+                stream_rx: Some(stream_rx),
+                completion_rx: Some(completion_rx),
+                stream_lines: Vec::new(),
+                attached: false,
+                last_heartbeat: Instant::now(),
+            }),
+            wizard_job: None,
+        };
+
+        poll_job(&ctx, &mut app).expect("poll job");
+
+        assert_eq!(
+            app.job.as_ref().and_then(|job| job.log_hint.as_deref()),
+            Some("solver-a")
+        );
+        assert_eq!(
+            runtime::load_job_state(&run_dir)
+                .and_then(|state| state.stage)
+                .as_deref(),
+            Some("solver-a")
+        );
+
+        let _ = runtime::finish_job(&run_dir, "completed", Some(0), None);
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn poll_job_keeps_owned_job_when_runtime_state_is_temporarily_missing() {
+        let ctx = test_context();
+        let run_dir = temp_dir("owned-job-missing-runtime-state");
+        let mut run = sample_run("pending-verification", "solver-a", "pending");
+        run.run_dir.clone_from(&run_dir);
+
+        let (_stream_tx, stream_rx) = mpsc::channel();
+        let (_completion_tx, completion_rx) = mpsc::channel::<super::JobResult>();
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: Some(RunningJob {
+                kind: JobKind::RunAction,
+                label: "resume".to_string(),
+                run_dir: run_dir.clone(),
+                log_hint: Some("solver-a".to_string()),
+                command_hint: "resume until verification".to_string(),
+                started_at: Instant::now() - Duration::from_secs(2),
+                started_wallclock: SystemTime::now() - Duration::from_secs(2),
+                pid: 0,
+                pgid: 0,
+                process_log: run_dir.join("runtime").join("process.log"),
+                stream_rx: Some(stream_rx),
+                completion_rx: Some(completion_rx),
+                stream_lines: Vec::new(),
+                attached: false,
+                last_heartbeat: Instant::now(),
+            }),
+            wizard_job: None,
+        };
+
+        poll_job(&ctx, &mut app).expect("poll job");
+
+        assert!(
+            app.job.is_some(),
+            "owned job should not be cleared without completion"
+        );
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn handle_paste_keeps_multiline_task_text_in_new_run_input() {
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![sample_run("pending-verification", "intake", "pending")],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::NewRunInput {
+                draft: NewRunDraft {
+                    task: String::new(),
+                    workspace: "/tmp/workspace".to_string(),
+                    title: String::new(),
+                    task_cursor: 0,
+                    workspace_cursor: "/tmp/workspace".chars().count(),
+                    title_cursor: 0,
+                    field: NewRunField::Task,
+                },
+                task_scroll: 0,
+            },
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        handle_paste(
+            &mut app,
+            "# Fix Qwen Analysis IR Failure\n\nLLM_FREECAD_GOAL_MODE=qwen_only\n",
+        );
+
+        match &app.mode {
+            Mode::NewRunInput { draft, .. } => {
+                assert!(draft.task.contains("Fix Qwen Analysis IR Failure"));
+                assert!(draft.task.contains("qwen_only"));
+                assert!(draft.task.contains('\n'));
+            }
+            _ => panic!("expected new run input mode"),
+        }
+    }
+
+    #[test]
+    fn handle_paste_strips_terminal_escape_sequences_from_task_text() {
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![sample_run("pending-verification", "intake", "pending")],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::NewRunInput {
+                draft: NewRunDraft {
+                    task: String::new(),
+                    workspace: "/tmp/workspace".to_string(),
+                    title: String::new(),
+                    task_cursor: 0,
+                    workspace_cursor: "/tmp/workspace".chars().count(),
+                    title_cursor: 0,
+                    field: NewRunField::Task,
+                },
+                task_scroll: 0,
+            },
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        handle_paste(
+            &mut app,
+            "- no e\u{1b}]11;rgb:0000/0000/0000\u{1b}\\xplicit `--template`\n",
+        );
+
+        match &app.mode {
+            Mode::NewRunInput { draft, .. } => {
+                assert_eq!(draft.task, "- no explicit `--template`\n");
+                assert!(!draft.task.contains('\u{1b}'));
+            }
+            _ => panic!("expected new run input mode"),
+        }
+    }
+
+    #[test]
+    fn new_run_input_treats_q_as_text_not_cancel() {
+        let ctx = test_context();
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![sample_run("pending-verification", "intake", "pending")],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::NewRunInput {
+                draft: NewRunDraft {
+                    task: String::new(),
+                    workspace: "/tmp/workspace".to_string(),
+                    title: String::new(),
+                    task_cursor: 0,
+                    workspace_cursor: "/tmp/workspace".chars().count(),
+                    title_cursor: 0,
+                    field: NewRunField::Task,
+                },
+                task_scroll: 0,
+            },
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        handle_new_run_key(
+            &ctx,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .expect("handle q");
+
+        match &app.mode {
+            Mode::NewRunInput { draft, .. } => assert_eq!(draft.task, "q"),
+            _ => panic!("expected new run input mode"),
+        }
+    }
+
+    #[test]
+    fn new_run_input_moves_cursor_left_and_inserts_in_place() {
+        let ctx = test_context();
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![sample_run("pending-verification", "intake", "pending")],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::NewRunInput {
+                draft: NewRunDraft {
+                    task: "abcd".to_string(),
+                    workspace: "/tmp/workspace".to_string(),
+                    title: String::new(),
+                    task_cursor: 4,
+                    workspace_cursor: "/tmp/workspace".chars().count(),
+                    title_cursor: 0,
+                    field: NewRunField::Task,
+                },
+                task_scroll: 0,
+            },
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        handle_new_run_key(
+            &ctx,
+            &mut app,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+        )
+        .expect("move cursor left");
+        handle_new_run_key(
+            &ctx,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        )
+        .expect("insert at cursor");
+
+        match &app.mode {
+            Mode::NewRunInput { draft, .. } => {
+                assert_eq!(draft.task, "abcXd");
+                assert_eq!(draft.task_cursor, 4);
+            }
+            _ => panic!("expected new run input mode"),
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_over_preview_scrolls_request_without_changing_selected_run() {
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![
+                sample_run("pending-verification", "intake", "pending"),
+                sample_run("partial", "rerun", "done"),
+            ],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::Normal,
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+        let rects = normal_mode_rects(Rect::new(0, 0, 120, 40));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: rects.preview.x.saturating_add(2),
+                row: rects.preview.y.saturating_add(2),
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        );
+
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.preview_scroll, 3);
+        assert_eq!(app.log_scroll, 0);
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_artifact_view_request_popup() {
+        let run = sample_run("pending-verification", "intake", "pending");
+        let mut app = App {
+            root: PathBuf::from("/tmp"),
+            limit: 20,
+            runs: vec![run],
+            selected: 0,
+            wizard_selected: false,
+            preview_scroll: 0,
+            log_scroll: 0,
+            mouse_capture_enabled: true,
+            mode: Mode::ArtifactView {
+                kind: ArtifactKind::Summary,
+                scroll: 0,
+            },
+            notice: String::new(),
+            last_output: String::new(),
+            last_refresh: Instant::now(),
+            job: None,
+            wizard_job: None,
+        };
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 40,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            },
+            Rect::new(0, 0, 120, 40),
+        );
+
+        match app.mode {
+            Mode::ArtifactView { scroll, .. } => assert_eq!(scroll, 3),
+            _ => panic!("artifact view should remain active"),
+        }
     }
 }

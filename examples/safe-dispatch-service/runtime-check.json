@@ -1,0 +1,231 @@
+{
+  "version": 1,
+  "mode": "workflow",
+  "workdir": "examples/safe-dispatch-service",
+  "env": {
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONUNBUFFERED": "1"
+  },
+  "prepare_commands": [
+    "python3 -c \"from pathlib import Path; [compile(Path(path).read_text(encoding='utf-8'), path, 'exec') for path in ('app.py', 'client.py', 'console.py')]\""
+  ],
+  "scenarios": [
+    {
+      "id": "dispatch-core",
+      "description": "Run the console service through health, queueing, planning, and summary flows.",
+      "kind": "pty",
+      "command": "python3 console.py",
+      "rows": 40,
+      "cols": 120,
+      "expect_exit_code": 0,
+      "steps": [
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "dispatch>",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "health"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "status=ok",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "queue_size=0",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "seed-default-batch"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "accepted_count=5",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "queued=5",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "plan-tight-budget"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "accepted=ops-hotfix,support-chat",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "deferred_count=3",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "reason.manual_review=1",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "reason.over_capacity=2",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "summary"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "queue_size=5",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "last_plan.accepted=2",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "quit"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "bye",
+          "timeout_secs": 3
+        }
+      ]
+    },
+    {
+      "id": "dispatch-guardrails",
+      "description": "Verify duplicate-id rejection and invalid-plan validation inside the console service.",
+      "kind": "pty",
+      "command": "python3 console.py",
+      "rows": 40,
+      "cols": 120,
+      "expect_exit_code": 0,
+      "steps": [
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "dispatch>",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "seed-default-batch"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "accepted_count=5",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "duplicate-default-task"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "status=409",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "code=duplicate_task_id",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "duplicate_id=ops-hotfix",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "invalid-plan"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "status=400",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "code=invalid_number",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "field=capacity_minutes",
+          "timeout_secs": 3
+        },
+        {
+          "kind": "pty_send_text",
+          "text": "quit"
+        },
+        {
+          "kind": "pty_send_keys",
+          "keys": [
+            "enter"
+          ]
+        },
+        {
+          "kind": "pty_wait_contains",
+          "pattern": "bye",
+          "timeout_secs": 3
+        }
+      ]
+    }
+  ]
+}

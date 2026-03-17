@@ -210,10 +210,17 @@ export AGPIPE_STAGE0_BACKEND=responses
 export AGPIPE_STAGE_BACKEND=responses-readonly
 ```
 
+Force the deterministic local stage0 fallback:
+
+```bash
+export AGPIPE_STAGE0_BACKEND=local
+```
+
 Important runtime behavior:
 
 - `execution` stays on Codex because it needs live tool use in the real workspace
 - `responses-readonly` is intended for intake, research, review, and some verification work
+- stage0 keeps the public CLI contract even when the configured backend is unavailable: `interview-questions` and `interview-finalize` write real artifacts plus `*.fallback.json` provenance before handing off to `create-run`
 - Responses requests use structured outputs instead of best-effort embedded JSON parsing
 - terminal response states are fail-closed: `failed`, `incomplete`, `cancelled`, and timeout states are surfaced as errors
 - create requests use idempotency keys
@@ -332,7 +339,7 @@ Important hotkeys:
 - `o` or `Enter`: open the selected artifact
 - `c`: create a new run
 - `n`: run `start-next`
-- `r`: resume until verification
+- `r` or `w`: run the whole stack until verification
 - `a`: append an amendment and rewind
 - `y`: create a follow-up rerun
 - `h`: capture a fresh host probe

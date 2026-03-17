@@ -54,16 +54,27 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
+    run_agpipe_with_env(args, codex_bin, &[])
+}
+
+fn run_agpipe_with_env<I, S>(args: I, codex_bin: &Path, extra_env: &[(&str, &str)]) -> Output
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let args_vec: Vec<String> = args
         .into_iter()
         .map(|value| value.as_ref().to_string())
         .collect();
-    let output = Command::new(agpipe_bin())
+    let mut command = Command::new(agpipe_bin());
+    command
         .current_dir(repo_root())
         .env("AGPIPE_CODEX_BIN", codex_bin)
-        .args(&args_vec)
-        .output()
-        .expect("run agpipe");
+        .args(&args_vec);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run agpipe");
     if !output.status.success() {
         panic!(
             "agpipe {:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -99,6 +110,152 @@ fn token_sum(path: &Path) -> usize {
         .lines()
         .filter_map(|line| line.trim().parse::<usize>().ok())
         .sum()
+}
+
+#[test]
+fn agpipe_cli_help_lists_direct_core_commands() {
+    let disabled_codex = PathBuf::from("/usr/bin/false");
+
+    let output = run_agpipe(["--help"], &disabled_codex);
+    let text = stdout_text(&output);
+
+    assert!(text.contains("interview-questions"));
+    assert!(text.contains("interview-finalize"));
+    assert!(text.contains("create-run"));
+    assert!(text.contains("resume"));
+    assert!(text.contains("runtime-check"));
+    assert!(text.contains("direct CLI path is interview -> create-run -> resume -> execution"));
+}
+
+#[test]
+fn agpipe_cli_stage0_local_fallback_preserves_contract_and_create_run_handoff() {
+    let workspace = temp_dir("cli-stage0-local-workspace");
+    let output_root = temp_dir("cli-stage0-local-output");
+    let cache_root = temp_dir("cli-stage0-local-cache");
+    let disabled_codex = PathBuf::from("/usr/bin/false");
+    let task = "Полностью проверить pipeline, сохранить реальные stage0 artifacts и не сужать цель до scaffold-only proof.";
+
+    let questions_output = run_agpipe_with_env(
+        [
+            "interview-questions",
+            "--task",
+            task,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--output-dir",
+            output_root.to_str().unwrap(),
+            "--language",
+            "ru",
+            "--max-questions",
+            "2",
+        ],
+        &disabled_codex,
+        &[("AGPIPE_STAGE0_BACKEND", "local")],
+    );
+    let questions_json: Value =
+        serde_json::from_str(stdout_text(&questions_output).trim()).expect("parse questions");
+    let session_dir = questions_json
+        .get("session_dir")
+        .and_then(|value| value.as_str())
+        .expect("session dir");
+    let question_items = questions_json
+        .get("questions")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let answers: Vec<Value> = question_items
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.get("id").and_then(|value| value.as_str()).unwrap_or("q"),
+                "question": item.get("question").and_then(|value| value.as_str()).unwrap_or(""),
+                "answer": "Сохранить target-workspace live proof path."
+            })
+        })
+        .collect();
+    let answers_path = PathBuf::from(session_dir).join("answers-ui.json");
+    write_text(
+        &answers_path,
+        &serde_json::to_string_pretty(&answers).expect("encode answers"),
+    );
+
+    let finalize_output = run_agpipe_with_env(
+        [
+            "interview-finalize",
+            "--task",
+            task,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--session-dir",
+            session_dir,
+            "--answers-file",
+            answers_path.to_str().unwrap(),
+            "--language",
+            "ru",
+        ],
+        &disabled_codex,
+        &[("AGPIPE_STAGE0_BACKEND", "local")],
+    );
+    let finalized: InterviewFinalizePayload =
+        serde_json::from_str(stdout_text(&finalize_output).trim()).expect("parse finalize");
+    let final_task = fs::read_to_string(&finalized.final_task_path).expect("read final task");
+    assert!(final_task.contains("не сужать цель"));
+
+    let create_output = run_agpipe_with_env(
+        [
+            "create-run",
+            "--task-file",
+            &finalized.final_task_path,
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--output-dir",
+            output_root.to_str().unwrap(),
+            "--prompt-format",
+            "compact",
+            "--summary-language",
+            "ru",
+            "--intake-research",
+            "research-first",
+            "--stage-research",
+            "local-first",
+            "--execution-network",
+            "fetch-if-needed",
+            "--cache-root",
+            cache_root.to_str().unwrap(),
+            "--cache-policy",
+            "reuse",
+            "--interview-session",
+            &finalized.session_dir,
+        ],
+        &disabled_codex,
+        &[("AGPIPE_STAGE0_BACKEND", "local")],
+    );
+    let run_dir = PathBuf::from(stdout_text(&create_output).trim());
+    assert!(run_dir.exists());
+    assert!(run_dir
+        .join("interview")
+        .join("logs")
+        .join("interview-questions.fallback.json")
+        .exists());
+    assert!(run_dir
+        .join("interview")
+        .join("logs")
+        .join("interview-finalize.fallback.json")
+        .exists());
+    assert!(run_dir.join("interview").join("final-task.md").exists());
+    assert!(fs::read_to_string(
+        run_dir
+            .join("interview")
+            .join("logs")
+            .join("interview-questions.fallback.json")
+    )
+    .expect("read fallback metadata")
+    .contains("\"effective_backend\": \"local\""));
+
+    let _ = fs::remove_dir_all(run_dir);
+    let _ = fs::remove_dir_all(output_root);
+    let _ = fs::remove_dir_all(workspace);
+    let _ = fs::remove_dir_all(cache_root);
 }
 
 #[test]
@@ -186,6 +343,300 @@ fn agpipe_cli_hello_world_python_completes_without_codex_and_creates_runnable_sc
         fs::read_to_string(run_dir.join("verification").join("goal-status.json"))
             .expect("read goal status");
     assert!(verification_goal.contains("\"goal_complete\": true"));
+}
+
+#[test]
+fn agpipe_cli_service_check_runs_a_real_local_service_with_multiple_inputs() {
+    let workspace = temp_dir("service-check-workspace");
+    let output_root = temp_dir("service-check-output");
+    let disabled_codex = PathBuf::from("/usr/bin/false");
+
+    let created = run_agpipe(
+        [
+            "internal",
+            "create-run",
+            "--task",
+            "Поднять локальный HTTP сервис и прогнать несколько сценариев с разными входными данными.",
+            "--workspace",
+            &workspace.display().to_string(),
+            "--output-dir",
+            &output_root.display().to_string(),
+            "--prompt-format",
+            "compact",
+        ],
+        &disabled_codex,
+    );
+    let run_dir = PathBuf::from(stdout_text(&created).trim());
+    assert!(run_dir.exists(), "expected {}", run_dir.display());
+
+    write_text(
+        &workspace.join("server.py"),
+        r#"import json
+import os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+PORT = int(os.environ.get("PORT", "18081"))
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == "/echo":
+            value = parse_qs(parsed.query).get("value", [""])[0]
+            body = json.dumps({"value": value}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_error(404)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+HTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+"#,
+    );
+
+    let port = "18081";
+    let health_command = "python3 -c \"import os, urllib.request; port=os.environ['PORT']; print(urllib.request.urlopen('http://127.0.0.1:%s/health' % port).read().decode())\"";
+    let echo_alpha = "python3 -c \"import json, os, urllib.request; port=os.environ['PORT']; data=json.load(urllib.request.urlopen('http://127.0.0.1:%s/echo?value=alpha' % port)); print(data['value'])\"";
+    let echo_beta = "python3 -c \"import json, os, urllib.request; port=os.environ['PORT']; data=json.load(urllib.request.urlopen('http://127.0.0.1:%s/echo?value=beta' % port)); print(data['value'])\"";
+    let service_spec = json!({
+        "version": 1,
+        "mode": "process",
+        "workdir": ".",
+        "env": {
+            "PORT": port,
+        },
+        "start_command": "python3 server.py",
+        "ready_command": health_command,
+        "ready_timeout_secs": 10,
+        "ready_interval_ms": 200,
+        "scenarios": [
+            {
+                "id": "health",
+                "command": health_command,
+                "expect_exit_code": 0,
+                "expect_stdout_contains": ["ok"],
+            },
+            {
+                "id": "echo-alpha",
+                "command": echo_alpha,
+                "expect_exit_code": 0,
+                "expect_stdout_contains": ["alpha"],
+            },
+            {
+                "id": "echo-beta",
+                "command": echo_beta,
+                "expect_exit_code": 0,
+                "expect_stdout_contains": ["beta"],
+            }
+        ]
+    });
+    write_text(
+        &workspace.join(".agpipe").join("runtime-check.json"),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&service_spec).expect("serialize service spec")
+        ),
+    );
+
+    let check = run_agpipe(
+        [
+            "internal",
+            "runtime-check",
+            &run_dir.display().to_string(),
+            "--phase",
+            "verification",
+        ],
+        &disabled_codex,
+    );
+    let check_stdout = stdout_text(&check);
+    assert!(
+        check_stdout.contains("Runtime check passed"),
+        "unexpected runtime-check output:\n{}",
+        check_stdout
+    );
+
+    let summary_path = run_dir
+        .join("runtime")
+        .join("runtime-check")
+        .join("verification")
+        .join("summary.json");
+    let summary: Value = serde_json::from_str(
+        &fs::read_to_string(&summary_path).expect("read runtime-check summary"),
+    )
+    .expect("parse runtime-check summary");
+    assert_eq!(summary["status"], "passed");
+    assert_eq!(summary["ready_status"], "passed");
+    assert_eq!(
+        summary["scenarios"]
+            .as_array()
+            .expect("scenarios array")
+            .len(),
+        3
+    );
+
+    let summary_md = fs::read_to_string(
+        run_dir
+            .join("runtime")
+            .join("runtime-check")
+            .join("verification")
+            .join("summary.md"),
+    )
+    .expect("read runtime-check summary md");
+    assert!(summary_md.contains("echo-alpha"));
+    assert!(summary_md.contains("echo-beta"));
+}
+
+#[test]
+fn agpipe_cli_runtime_check_can_drive_a_tui_over_pty() {
+    let workspace = temp_dir("runtime-check-tui-workspace");
+    let output_root = temp_dir("runtime-check-tui-output");
+    let disabled_codex = PathBuf::from("/usr/bin/false");
+
+    let created = run_agpipe(
+        [
+            "internal",
+            "create-run",
+            "--task",
+            "Собрать терминальный интерфейс и прогнать его end-to-end через PTY.",
+            "--workspace",
+            &workspace.display().to_string(),
+            "--output-dir",
+            &output_root.display().to_string(),
+            "--prompt-format",
+            "compact",
+        ],
+        &disabled_codex,
+    );
+    let run_dir = PathBuf::from(stdout_text(&created).trim());
+    assert!(run_dir.exists(), "expected {}", run_dir.display());
+
+    write_text(
+        &workspace.join("menu.py"),
+        r#"import sys
+import termios
+import tty
+
+fd = sys.stdin.fileno()
+old = termios.tcgetattr(fd)
+try:
+    tty.setraw(fd)
+    sys.stdout.write("Main Menu\r\nPress 1 to select, q to quit\r\n")
+    sys.stdout.flush()
+    while True:
+        ch = sys.stdin.read(1)
+        if ch == "1":
+            sys.stdout.write("\r\nSelected: 1\r\n")
+            sys.stdout.flush()
+        elif ch.lower() == "q":
+            sys.stdout.write("\r\nBye\r\n")
+            sys.stdout.flush()
+            break
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+"#,
+    );
+
+    let runtime_spec = json!({
+        "version": 1,
+        "mode": "workflow",
+        "workdir": ".",
+        "scenarios": [
+            {
+                "id": "tui-menu",
+                "kind": "pty",
+                "command": "python3 menu.py",
+                "rows": 30,
+                "cols": 100,
+                "expect_exit_code": 0,
+                "steps": [
+                    {
+                        "kind": "pty_wait_contains",
+                        "pattern": "Main Menu",
+                        "timeout_secs": 3
+                    },
+                    {
+                        "kind": "pty_send_text",
+                        "text": "1"
+                    },
+                    {
+                        "kind": "pty_wait_contains",
+                        "pattern": "Selected: 1",
+                        "timeout_secs": 3
+                    },
+                    {
+                        "kind": "pty_send_text",
+                        "text": "q"
+                    },
+                    {
+                        "kind": "pty_wait_contains",
+                        "pattern": "Bye",
+                        "timeout_secs": 3
+                    }
+                ]
+            }
+        ]
+    });
+    write_text(
+        &workspace.join(".agpipe").join("runtime-check.json"),
+        &format!(
+            "{}\n",
+            serde_json::to_string_pretty(&runtime_spec).expect("serialize runtime spec")
+        ),
+    );
+
+    let check = run_agpipe(
+        [
+            "internal",
+            "runtime-check",
+            &run_dir.display().to_string(),
+            "--phase",
+            "verification",
+        ],
+        &disabled_codex,
+    );
+    let check_stdout = stdout_text(&check);
+    assert!(
+        check_stdout.contains("Runtime check passed"),
+        "unexpected runtime-check output:\n{}",
+        check_stdout
+    );
+
+    let summary_path = run_dir
+        .join("runtime")
+        .join("runtime-check")
+        .join("verification")
+        .join("summary.json");
+    let summary: Value =
+        serde_json::from_str(&fs::read_to_string(&summary_path).expect("read runtime summary"))
+            .expect("parse runtime summary");
+    assert_eq!(summary["status"], "passed");
+    assert_eq!(summary["scenarios"][0]["status"], "passed");
+
+    let screen_path = run_dir
+        .join("runtime")
+        .join("runtime-check")
+        .join("verification")
+        .join("scenarios")
+        .join("tui-menu")
+        .join("screen.txt");
+    let screen = fs::read_to_string(&screen_path).expect("read pty screen");
+    assert!(screen.contains("Selected: 1"));
+    assert!(screen.contains("Bye"));
 }
 
 fn mock_codex_script(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
