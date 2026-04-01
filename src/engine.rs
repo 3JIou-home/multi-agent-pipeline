@@ -9,10 +9,12 @@ use std::env;
 use std::ffi::CStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,10 +22,20 @@ const ROLE_MAP_REF: &str = "references/agency-role-map.md";
 const REVIEW_RUBRIC_REF: &str = "references/review-rubric.md";
 const VERIFICATION_RUBRIC_REF: &str = "references/verification-rubric.md";
 const DECOMPOSITION_RULES_REF: &str = "references/decomposition-rules.md";
+const MCP_PLAN_REF: &str = "references/mcp-plan.md";
+const MCP_PROVISION_RECORD_REF: &str = "runtime/mcp-provision.json";
+const MCP_USAGE_LOG_REF: &str = "runtime/mcp-usage.jsonl";
+const REFERENCE_ASSET_RELS: [&str; 4] = [
+    ROLE_MAP_REF,
+    REVIEW_RUBRIC_REF,
+    VERIFICATION_RUBRIC_REF,
+    DECOMPOSITION_RULES_REF,
+];
 const EMBEDDED_ROLE_MAP: &str = include_str!("../references/agency-role-map.md");
 const EMBEDDED_REVIEW_RUBRIC: &str = include_str!("../references/review-rubric.md");
 const EMBEDDED_VERIFICATION_RUBRIC: &str = include_str!("../references/verification-rubric.md");
 const EMBEDDED_DECOMPOSITION_RULES: &str = include_str!("../references/decomposition-rules.md");
+static WRITE_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CACHE_AREAS: [&str; 6] = [
     "research",
     "downloads",
@@ -35,8 +47,12 @@ const CACHE_AREAS: [&str; 6] = [
 const STAGE_RESULTS_AREA: &str = "stage-results";
 const REVIEWER_STACK: [&str; 3] = [
     "testing/testing-reality-checker.md",
+    "engineering/engineering-code-reviewer.md",
     "testing/testing-test-results-analyzer.md",
-    "support/support-executive-summary-generator.md",
+];
+const BACKEND_CLI_REVIEWER_STACK: [&str; 2] = [
+    "testing/testing-reality-checker.md",
+    "engineering/engineering-code-reviewer.md",
 ];
 const ANGLE_SEQUENCE: [&str; 3] = ["implementation-first", "architecture-first", "risk-first"];
 const RESEARCH_ANGLE_SEQUENCE: [&str; 3] = ["breadth-first", "evidence-first", "risk-first"];
@@ -45,15 +61,19 @@ const AI_REVIEWER_STACK: [&str; 3] = [
     "testing/testing-tool-evaluator.md",
     "testing/testing-test-results-analyzer.md",
 ];
+const AUDIT_IMPROVE_REVIEWER_STACK: [&str; 2] = [
+    "testing/testing-reality-checker.md",
+    "engineering/engineering-code-reviewer.md",
+];
 const RESEARCH_REVIEWER_STACK: [&str; 3] = [
     "testing/testing-reality-checker.md",
+    "testing/testing-evidence-collector.md",
     "testing/testing-tool-evaluator.md",
-    "support/support-analytics-reporter.md",
 ];
 const DOCS_REVIEWER_STACK: [&str; 3] = [
     "engineering/engineering-technical-writer.md",
     "testing/testing-reality-checker.md",
-    "support/support-executive-summary-generator.md",
+    "testing/testing-evidence-collector.md",
 ];
 const PLACEHOLDER_PREFIXES: [&str; 3] = ["pending ", "fill this file", "fill this"];
 const RESPONSES_DOC_MAX_CHARS_PER_DOC: usize = 20_000;
@@ -66,6 +86,8 @@ const RUNTIME_CHECK_SPEC_REF: &str = ".agpipe/runtime-check.json";
 const RUNTIME_CHECK_LEGACY_SPEC_REF: &str = "agpipe.runtime-check.json";
 const SERVICE_CHECK_SPEC_REF: &str = ".agpipe/service-check.json";
 const SERVICE_CHECK_LEGACY_SPEC_REF: &str = "agpipe.service-check.json";
+const ACTIVE_STAGE_STALL_WARN_SECS: u64 = 90;
+const ACTIVE_STAGE_STALL_BROKEN_SECS: u64 = 300;
 
 #[derive(Debug, Clone)]
 pub struct Context {
@@ -244,6 +266,8 @@ pub struct DoctorPayload {
     #[serde(default)]
     pub safe_next_action: String,
     #[serde(default)]
+    pub fix_actions: Vec<String>,
+    #[serde(default)]
     pub last_attempt: Option<RuntimeAttemptPayload>,
     #[serde(default)]
     pub issues: Vec<DoctorIssue>,
@@ -294,6 +318,7 @@ pub struct RunSnapshot {
     pub doctor: DoctorPayload,
     pub status: StatusPayload,
     pub token_summary: RunTokenSummary,
+    pub solver_stage_ids: Vec<String>,
     pub preview_label: String,
     pub preview: String,
     pub log_title: String,
@@ -374,6 +399,92 @@ struct SolverRole {
     role: String,
     #[serde(default)]
     angle: String,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct McpSelection {
+    #[serde(default = "default_true")]
+    auto_select: bool,
+    #[serde(default)]
+    rationale: Vec<String>,
+    #[serde(default)]
+    servers: Vec<McpServerPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct McpServerPlan {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    stages: Vec<String>,
+    #[serde(default)]
+    purposes: Vec<String>,
+    #[serde(default)]
+    usage_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct McpProvisionRecord {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    codex_home: String,
+    #[serde(default)]
+    config_path: String,
+    #[serde(default)]
+    configured: Vec<String>,
+    #[serde(default)]
+    already_present: Vec<String>,
+    #[serde(default)]
+    skipped: Vec<String>,
+    #[serde(default)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct McpUsageRecord {
+    #[serde(default)]
+    recorded_at: String,
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    stage_kind: String,
+    #[serde(default)]
+    backend: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    selected: Vec<String>,
+    #[serde(default)]
+    available: Vec<String>,
+    #[serde(default)]
+    declared_used: Vec<String>,
+    #[serde(default)]
+    declared_not_used: Vec<String>,
+    #[serde(default)]
+    observed_mentions: Vec<String>,
+    #[serde(default)]
+    note_present: bool,
+    #[serde(default)]
+    artifact_path: String,
+    #[serde(default)]
+    note_path: String,
+    #[serde(default)]
+    note_md: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AgencyRoleDoc {
+    requested_role: String,
+    relative_path: String,
+    full_path: PathBuf,
+    title: String,
+    description: String,
+    content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -626,6 +737,8 @@ struct Plan {
     #[serde(default)]
     validation_commands: Vec<String>,
     #[serde(default)]
+    mcp: McpSelection,
+    #[serde(default)]
     references: BTreeMap<String, String>,
     #[serde(default)]
     pipeline: PipelineConfig,
@@ -848,6 +961,7 @@ struct InterviewQuestion {
     required: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct InterviewQuestionsPayload {
     #[serde(default)]
@@ -875,6 +989,14 @@ enum StageBackendKind {
     LocalTemplate(LocalTemplateKind),
 }
 
+fn stage_backend_label(backend: StageBackendKind) -> &'static str {
+    match backend {
+        StageBackendKind::Codex => "codex",
+        StageBackendKind::Responses => "responses",
+        StageBackendKind::LocalTemplate(_) => "local-template",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Stage0BackendMode {
     Codex,
@@ -885,6 +1007,7 @@ enum Stage0BackendMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalTemplateKind {
     HelloWorldPython,
+    ExecutionReadyBackendCliIntake,
 }
 
 #[derive(Debug, Clone)]
@@ -899,12 +1022,16 @@ struct ResponsesIntakePayload {
     brief_md: String,
     #[serde(default)]
     plan_json: Value,
+    #[serde(default)]
+    mcp_usage_md: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct ResponsesSolverPayload {
     #[serde(default)]
     result_md: String,
+    #[serde(default)]
+    mcp_usage_md: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -915,6 +1042,8 @@ struct ResponsesReviewPayload {
     scorecard_json: Value,
     #[serde(default)]
     user_summary_md: String,
+    #[serde(default)]
+    mcp_usage_md: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -929,6 +1058,8 @@ struct ResponsesVerificationPayload {
     augmented_task_md: String,
     #[serde(default)]
     goal_status_json: Value,
+    #[serde(default)]
+    mcp_usage_md: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -979,6 +1110,7 @@ struct RerunArgs {
     title: Option<String>,
     output_dir: Option<PathBuf>,
     prompt_source: Option<String>,
+    note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1116,6 +1248,34 @@ pub fn default_run_root() -> PathBuf {
     PathBuf::from("agent-runs")
 }
 
+fn plan_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("plan.json")
+}
+
+fn plan_snapshot_path(run_dir: &Path) -> PathBuf {
+    crate::runtime::runtime_dir(run_dir).join("plan.snapshot.json")
+}
+
+pub fn run_has_plan_artifact(run_dir: &Path) -> bool {
+    plan_path(run_dir).exists() || plan_snapshot_path(run_dir).exists()
+}
+
+pub fn read_plan_artifact_text(run_dir: &Path) -> Result<String, String> {
+    let primary = plan_path(run_dir);
+    if primary.exists() {
+        return read_text(&primary);
+    }
+    let snapshot = plan_snapshot_path(run_dir);
+    if snapshot.exists() {
+        return read_text(&snapshot);
+    }
+    Err(format!(
+        "Could not read {} or {}.",
+        primary.display(),
+        snapshot.display()
+    ))
+}
+
 pub fn discover_run_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
     if !root.exists() {
         return Ok(Vec::new());
@@ -1124,7 +1284,7 @@ pub fn discover_run_dirs(root: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|err| format!("Could not read {}: {err}", root.display()))?
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join("plan.json").exists())
+        .filter(|path| path.is_dir() && run_has_plan_artifact(path))
         .collect();
     runs.sort();
     runs.reverse();
@@ -1136,18 +1296,65 @@ fn read_text(path: &Path) -> Result<String, String> {
 }
 
 fn write_text(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
+    let parent = path.parent().map(PathBuf::from);
+    if let Some(parent) = parent.as_ref() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
     }
-    fs::write(path, format!("{}\n", content.trim_end()))
-        .map_err(|err| format!("Could not write {}: {err}", path.display()))
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let sequence = WRITE_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = if let Some(parent) = parent.as_ref() {
+        let filename = path
+            .file_name()
+            .and_then(|item| item.to_str())
+            .unwrap_or("artifact");
+        parent.join(format!(
+            ".{filename}.tmp-{}-{sequence}-{suffix}",
+            std::process::id()
+        ))
+    } else {
+        path.with_extension(format!(
+            "tmp-{}-{sequence}-{suffix}",
+            std::process::id()
+        ))
+    };
+    fs::write(&tmp, format!("{}\n", content.trim_end()))
+        .map_err(|err| format!("Could not write {}: {err}", tmp.display()))?;
+    if let Some(parent) = parent.as_ref() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    }
+    fs::rename(&tmp, path).map_err(|err| {
+        format!(
+            "Could not move {} to {}: {err}",
+            tmp.display(),
+            path.display()
+        )
+    })
 }
 
 fn write_json<T: Serialize>(path: &Path, payload: &T) -> Result<(), String> {
     let content = serde_json::to_string_pretty(payload)
         .map_err(|err| format!("Could not serialize {}: {err}", path.display()))?;
     write_text(path, &content)
+}
+
+fn append_jsonl<T: Serialize>(path: &Path, payload: &T) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    }
+    let line = serde_json::to_string(payload)
+        .map_err(|err| format!("Could not serialize {}: {err}", path.display()))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("Could not open {}: {err}", path.display()))?;
+    writeln!(file, "{line}").map_err(|err| format!("Could not append {}: {err}", path.display()))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
@@ -1343,8 +1550,379 @@ fn walk_tree(
     Ok(out)
 }
 
-fn role_matrix(task_kind: &str) -> Vec<&'static str> {
+fn discover_agency_agents_dir_for_repo_root(repo_root: &Path) -> Option<PathBuf> {
+    if let Ok(path) = env::var("AGENCY_AGENTS_DIR") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let parent = repo_root.parent()?;
+    let sibling = parent.parent().unwrap_or(parent).join("agency-agents");
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    if let Ok(home) = env::var("HOME") {
+        let home_catalog = PathBuf::from(home).join("agency-agents");
+        if home_catalog.exists() {
+            return Some(home_catalog);
+        }
+    }
+    None
+}
+
+fn frontmatter_field(markdown: &str, field: &str) -> Option<String> {
+    let mut lines = markdown.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix(&format!("{field}:")) {
+            return Some(strip_matching_quotes(value.trim()).to_string());
+        }
+    }
+    None
+}
+
+fn resolve_agency_role_path(agency_root: &Path, role: &str) -> Option<PathBuf> {
+    let requested = strip_matching_quotes(role.trim())
+        .trim_matches('`')
+        .trim()
+        .trim_start_matches("./")
+        .to_string();
+    if requested.is_empty() {
+        return None;
+    }
+    let mut exact_candidates = vec![requested.clone()];
+    if !requested.ends_with(".md") {
+        exact_candidates.push(format!("{requested}.md"));
+    }
+    for relative in &exact_candidates {
+        let candidate = agency_root.join(relative);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let target_file_name = exact_candidates.iter().find_map(|candidate| {
+        Path::new(candidate)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_string())
+    })?;
+    let mut matches = walk_tree(agency_root, 6, &[".git", ".github", "scripts"]).ok()?;
+    matches.sort();
+    let mut basename_match = None;
+    for path in matches {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(agency_root)
+            .ok()
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+        if exact_candidates
+            .iter()
+            .any(|candidate| relative == *candidate || relative.ends_with(&format!("/{candidate}")))
+        {
+            return Some(path);
+        }
+        if basename_match.is_none()
+            && path.file_name().and_then(|value| value.to_str()) == Some(target_file_name.as_str())
+        {
+            basename_match = Some(path);
+        }
+    }
+    basename_match
+}
+
+fn load_agency_role_doc(ctx: &Context, role: &str) -> Option<AgencyRoleDoc> {
+    let agency_root = discover_agency_agents_dir(ctx)?;
+    let full_path = resolve_agency_role_path(&agency_root, role)?;
+    let content = read_text(&full_path).ok()?;
+    let relative_path = full_path
+        .strip_prefix(&agency_root)
+        .ok()
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| full_path.to_string_lossy().replace('\\', "/"));
+    Some(AgencyRoleDoc {
+        requested_role: role.to_string(),
+        relative_path,
+        full_path,
+        title: frontmatter_field(&content, "name").unwrap_or_default(),
+        description: frontmatter_field(&content, "description").unwrap_or_default(),
+        content,
+    })
+}
+
+fn load_agency_role_docs(ctx: &Context, roles: &[String]) -> Vec<AgencyRoleDoc> {
+    let mut seen = BTreeSet::new();
+    let mut docs = Vec::new();
+    for role in roles {
+        let Some(doc) = load_agency_role_doc(ctx, role) else {
+            continue;
+        };
+        if seen.insert(doc.relative_path.clone()) {
+            docs.push(doc);
+        }
+    }
+    docs
+}
+
+fn agency_role_catalog_summary(ctx: &Context) -> Option<String> {
+    let agency_root = discover_agency_agents_dir(ctx)?;
+    let mut files = walk_tree(&agency_root, 6, &[".git", ".github", "scripts"]).ok()?;
+    files.sort();
+    let mut entries = Vec::new();
+    for path in files {
+        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok(content) = read_text(&path) else {
+            continue;
+        };
+        let Some(name) = frontmatter_field(&content, "name") else {
+            continue;
+        };
+        let Some(description) = frontmatter_field(&content, "description") else {
+            continue;
+        };
+        let relative = path
+            .strip_prefix(&agency_root)
+            .ok()
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| path.to_string_lossy().replace('\\', "/"));
+        entries.push(format!("- `{relative}`: {name} — {description}"));
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "# Agency Role Catalog\n\nCatalog root: `{}`\n\nAvailable role documents:\n{}",
+        agency_root.display(),
+        entries.join("\n")
+    ))
+}
+
+fn is_signal_boundary_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn signal_requires_word_boundary(signal: &str) -> bool {
+    matches!(signal, "ui" | "ai" | "ml" | "ci" | "cd")
+}
+
+fn text_contains_signal(text: &str, signal: &str) -> bool {
+    if signal.is_empty() {
+        return false;
+    }
+    if !signal_requires_word_boundary(signal) {
+        return text.contains(signal);
+    }
+    text.match_indices(signal).any(|(start, matched)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + matched.len()..].chars().next();
+        let before_ok = before
+            .map(|ch| !is_signal_boundary_char(ch))
+            .unwrap_or(true);
+        let after_ok = after.map(|ch| !is_signal_boundary_char(ch)).unwrap_or(true);
+        before_ok && after_ok
+    })
+}
+
+fn count_signals(text: &str, signals: &[&str]) -> usize {
+    signals
+        .iter()
+        .filter(|signal| text_contains_signal(text, signal))
+        .count()
+}
+
+fn task_requests_code_review(task: &str) -> bool {
+    let text = task.to_lowercase();
+    let review_intent = count_signals(
+        &text,
+        &[
+            "code review",
+            "review the code",
+            "review code",
+            "review the repo",
+            "review repository",
+            "review project",
+            "audit the code",
+            "code audit",
+            "ревью",
+            "ревью кода",
+            "проведи ревью",
+            "сделай ревью",
+            "аудит кода",
+            "проведи аудит кода",
+            "проверь код",
+            "проверь репозиторий",
+        ],
+    ) > 0;
+    if !review_intent {
+        return false;
+    }
+    count_signals(
+        &text,
+        &[
+            "code",
+            "repo",
+            "repository",
+            "workspace",
+            "file",
+            "files",
+            "код",
+            "репо",
+            "файл",
+            "файлы",
+            ".py",
+            ".rs",
+            ".ts",
+            ".js",
+            ".go",
+            ".java",
+            ".kt",
+            ".swift",
+            ".php",
+            ".rb",
+        ],
+    ) > 0
+        || text.contains("~/")
+        || text.contains("/users/")
+}
+
+fn task_requests_cli_entrypoint(task_kind: &str, task: &str) -> bool {
+    if task_kind != "backend" {
+        return false;
+    }
+    let text = task.to_lowercase();
+    [
+        "cli",
+        "command line",
+        "console",
+        "script",
+        "скрипт",
+        "entrypoint",
+        "entry point",
+        "main.py",
+        "stdout",
+        "print",
+        "prints",
+        "печата",
+        "вывод",
+        "hello world",
+    ]
+    .iter()
+    .any(|signal| text_contains_signal(&text, signal))
+}
+
+fn task_requests_precise_local_contract(task: &str) -> bool {
+    let text = task.to_lowercase();
+    [
+        "stdout",
+        "exact",
+        "exactly",
+        "deterministic",
+        "print",
+        "prints",
+        "output",
+        "readme",
+        "run command",
+        "печата",
+        "ровно",
+        "точно",
+        "детермин",
+        "вывод",
+        "readme.md",
+    ]
+    .iter()
+    .any(|signal| text_contains_signal(&text, signal))
+}
+
+fn task_is_trivial_local_cli_contract(
+    task_kind: &str,
+    complexity: &str,
+    task: &str,
+    workspace: Option<&Path>,
+) -> bool {
+    if task_kind != "backend" || complexity != "low" {
+        return false;
+    }
+    if !task_requests_cli_entrypoint(task_kind, task) || !task_requests_precise_local_contract(task)
+    {
+        return false;
+    }
+    match workspace {
+        Some(path) => !path.exists() || workspace_looks_greenfield(path),
+        None => true,
+    }
+}
+
+fn task_requests_readme(task: &str) -> bool {
+    let text = task.to_lowercase();
+    text_contains_signal(&text, "readme") || text_contains_signal(&text, "readme.md")
+}
+
+fn stack_signals_are_empty(signals: &StackSignals) -> bool {
+    !signals.package_json
+        && !signals.pyproject_toml
+        && !signals.pytest_suite
+        && !signals.go_mod
+        && !signals.cargo_toml
+        && !signals.makefile
+        && !signals.terraform
+}
+
+fn workspace_looks_greenfield(workspace: &Path) -> bool {
+    if !workspace.exists() {
+        return true;
+    }
+    let files = walk_tree(
+        workspace,
+        2,
+        &[
+            ".git",
+            "node_modules",
+            ".venv",
+            "venv",
+            "__pycache__",
+            "target",
+            "build",
+            "dist",
+        ],
+    )
+    .unwrap_or_default();
+    let visible_files = files
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(|name| !name.starts_with('.'))
+                .unwrap_or(false)
+        })
+        .take(3)
+        .count();
+    visible_files <= 2
+}
+
+fn role_matrix(task_kind: &str, task: &str) -> Vec<&'static str> {
     match task_kind {
+        "review" => vec![
+            "engineering/engineering-code-reviewer.md",
+            "testing/testing-reality-checker.md",
+            "testing/testing-test-results-analyzer.md",
+        ],
+        "audit-improve" => vec![
+            "engineering/engineering-backend-architect.md",
+            "engineering/engineering-technical-writer.md",
+            "testing/testing-tool-evaluator.md",
+        ],
         "ai" => vec![
             "engineering/engineering-ai-engineer.md",
             "engineering/engineering-backend-architect.md",
@@ -1355,11 +1933,21 @@ fn role_matrix(task_kind: &str) -> Vec<&'static str> {
             "design/design-ui-designer.md",
             "design/design-ux-architect.md",
         ],
-        "backend" => vec![
-            "engineering/engineering-backend-architect.md",
-            "engineering/engineering-senior-developer.md",
-            "engineering/engineering-devops-automator.md",
-        ],
+        "backend" => {
+            if task_requests_cli_entrypoint(task_kind, task) {
+                vec![
+                    "engineering/engineering-rapid-prototyper.md",
+                    "engineering/engineering-technical-writer.md",
+                    "engineering/engineering-backend-architect.md",
+                ]
+            } else {
+                vec![
+                    "engineering/engineering-senior-developer.md",
+                    "engineering/engineering-backend-architect.md",
+                    "engineering/engineering-devops-automator.md",
+                ]
+            }
+        }
         "fullstack" => vec![
             "engineering/engineering-senior-developer.md",
             "engineering/engineering-frontend-developer.md",
@@ -1377,13 +1965,13 @@ fn role_matrix(task_kind: &str) -> Vec<&'static str> {
         ],
         "docs" => vec![
             "engineering/engineering-technical-writer.md",
+            "testing/testing-evidence-collector.md",
             "support/support-executive-summary-generator.md",
-            "project-management/project-management-studio-operations.md",
         ],
         "research" => vec![
             "product/product-trend-researcher.md",
+            "testing/testing-evidence-collector.md",
             "testing/testing-tool-evaluator.md",
-            "support/support-analytics-reporter.md",
         ],
         "skill" => vec![
             "skill-creator",
@@ -1400,141 +1988,212 @@ fn role_matrix(task_kind: &str) -> Vec<&'static str> {
 
 fn infer_task_kind(task: &str) -> String {
     let text = task.to_lowercase();
-    let count = |words: &[&str]| words.iter().filter(|word| text.contains(**word)).count();
-    let ai_hits = count(&[
-        "ai",
-        "ml",
-        "llm",
-        "llama",
-        "lama",
-        "fine-tune",
-        "finetune",
-        "train model",
-        "rag",
-        "embedding",
-        "inference",
-        "telegram",
-        "freecad",
-        "нейросет",
-        "модель",
-        "дообуч",
-        "обуч",
-        "телеграм",
-    ]);
-    let frontend_hits = count(&[
-        "frontend",
-        "ui",
-        "ux",
-        "css",
-        "html",
-        "react",
-        "vue",
-        "page",
-        "component",
-        "фронтенд",
-        "интерфейс",
-        "страница",
-        "компонент",
-        "верстк",
-    ]);
-    let backend_hits = count(&[
-        "backend",
-        "api",
-        "database",
-        "service",
-        "queue",
-        "worker",
-        "python",
-        "питон",
-        "script",
-        "скрипт",
-        "cli",
-        "command line",
-        "console",
-        "fastapi",
-        "flask",
-        "django",
-        "sql",
-        "бэкенд",
-        "бекенд",
-        "сервис",
-        "база данных",
-        "очеред",
-    ]);
+    if task_requests_code_review(task) {
+        return "review".to_string();
+    }
+    if task_is_verification_seed_follow_up(task) || task_requests_audit_improve_follow_up(task) {
+        return "audit-improve".to_string();
+    }
+    let ai_hits = count_signals(
+        &text,
+        &[
+            "ai",
+            "ml",
+            "llm",
+            "llama",
+            "lama",
+            "fine-tune",
+            "finetune",
+            "train model",
+            "rag",
+            "embedding",
+            "inference",
+            "telegram",
+            "freecad",
+            "нейросет",
+            "модель",
+            "дообуч",
+            "обуч",
+            "телеграм",
+        ],
+    );
+    let frontend_hits = count_signals(
+        &text,
+        &[
+            "frontend",
+            "ui",
+            "ux",
+            "css",
+            "html",
+            "react",
+            "vue",
+            "page",
+            "component",
+            "фронтенд",
+            "интерфейс",
+            "страница",
+            "компонент",
+            "верстк",
+        ],
+    );
+    let backend_hits = count_signals(
+        &text,
+        &[
+            "backend",
+            "api",
+            "database",
+            "service",
+            "queue",
+            "worker",
+            "python",
+            "питон",
+            "script",
+            "скрипт",
+            "cli",
+            "command line",
+            "console",
+            "fastapi",
+            "flask",
+            "django",
+            "sql",
+            "бэкенд",
+            "бекенд",
+            "сервис",
+            "база данных",
+            "очеред",
+        ],
+    );
+    let security_hits = count_signals(
+        &text,
+        &[
+            "security",
+            "vulnerability",
+            "auth",
+            "secret",
+            "token",
+            "compliance",
+            "audit",
+            "безопас",
+            "уязвим",
+            "аудит",
+            "секрет",
+            "токен",
+            "авторизац",
+        ],
+    );
+    let infra_hits = count_signals(
+        &text,
+        &[
+            "deploy",
+            "docker",
+            "kubernetes",
+            "terraform",
+            "ansible",
+            "ci",
+            "cd",
+            "infra",
+            "деплой",
+            "инфра",
+            "инфраструктур",
+            "контейнер",
+            "k8s",
+        ],
+    );
+    let docs_hits = count_signals(
+        &text,
+        &[
+            "docs",
+            "documentation",
+            "documented",
+            "official docs",
+            "reference",
+            "readme",
+            "guide",
+            "summary",
+            "spec",
+            "документац",
+            "гайд",
+            "резюме",
+            "спек",
+            "описан",
+            "официальн",
+            "справк",
+        ],
+    );
+    let research_hits = count_signals(
+        &text,
+        &[
+            "compare",
+            "evaluate",
+            "research",
+            "recommend",
+            "choose",
+            "options",
+            "analysis",
+            "analyze",
+            "report",
+            "review",
+            "overview",
+            "findings",
+            "technology",
+            "technologies",
+            "landscape",
+            "trend",
+            "сравн",
+            "оцен",
+            "исслед",
+            "рекомен",
+            "выбор",
+            "вариант",
+            "анализ",
+            "отч",
+            "обзор",
+            "разбор",
+            "вывод",
+            "находк",
+            "технолог",
+            "ландшафт",
+            "тренд",
+        ],
+    );
+    let non_implementation_request = !task_requests_workspace_changes(task);
 
-    if count(&["skill", "prompt", "codex", "скил", "промт", "кодекс"]) >= 2 {
+    if count_signals(
+        &text,
+        &["skill", "prompt", "codex", "скил", "промт", "кодекс"],
+    ) >= 2
+    {
         return "skill".to_string();
+    }
+    if non_implementation_request {
+        if docs_hits >= 2 && docs_hits >= research_hits && docs_hits >= backend_hits {
+            return "docs".to_string();
+        }
+        if research_hits >= 2 && research_hits >= infra_hits && research_hits >= backend_hits {
+            return "research".to_string();
+        }
+        if research_hits >= 1
+            && frontend_hits == 0
+            && backend_hits == 0
+            && infra_hits == 0
+            && security_hits == 0
+        {
+            return "research".to_string();
+        }
     }
     if ai_hits >= 2 {
         return "ai".to_string();
     }
-    if count(&[
-        "security",
-        "vulnerability",
-        "auth",
-        "secret",
-        "token",
-        "compliance",
-        "audit",
-        "безопас",
-        "уязвим",
-        "аудит",
-        "секрет",
-        "токен",
-        "авторизац",
-    ]) >= 2
-    {
+    if security_hits >= 2 {
         return "security".to_string();
     }
-    if count(&[
-        "deploy",
-        "docker",
-        "kubernetes",
-        "terraform",
-        "ansible",
-        "ci",
-        "cd",
-        "infra",
-        "деплой",
-        "инфра",
-        "инфраструктур",
-        "контейнер",
-        "k8s",
-    ]) >= 2
-    {
+    if infra_hits >= 2 {
         return "infra".to_string();
     }
-    if count(&[
-        "docs",
-        "documentation",
-        "readme",
-        "guide",
-        "summary",
-        "spec",
-        "документац",
-        "гайд",
-        "резюме",
-        "спек",
-        "описан",
-    ]) >= 2
-    {
+    if docs_hits >= 2 {
         return "docs".to_string();
     }
-    if count(&[
-        "compare",
-        "evaluate",
-        "research",
-        "recommend",
-        "choose",
-        "options",
-        "сравн",
-        "оцен",
-        "исслед",
-        "рекомен",
-        "выбор",
-        "вариант",
-    ]) >= 2
-    {
+    if research_hits >= 2 {
         return "research".to_string();
     }
     if frontend_hits > 0 && backend_hits > 0 {
@@ -1609,18 +2268,745 @@ fn infer_complexity(task: &str) -> String {
     }
 }
 
+fn task_prefers_context7(task_kind: &str, task: &str) -> bool {
+    if task_is_trivial_local_cli_contract(task_kind, "low", task, None) {
+        return false;
+    }
+    let text = task.to_lowercase();
+    matches!(
+        task_kind,
+        "backend" | "frontend" | "fullstack" | "ai" | "docs"
+    ) && [
+        "sdk",
+        "framework",
+        "library",
+        "dependency",
+        "package",
+        "version",
+        "upgrade",
+        "migrate",
+        "migration",
+        "integrat",
+        "api",
+        "docs",
+        "documentation",
+        "spec",
+        "protocol",
+        "typescript",
+        "python",
+        "rust",
+        "react",
+        "next.js",
+        "fastapi",
+        "django",
+        "flask",
+        "cargo",
+        "npm",
+        "pip",
+        "библиот",
+        "зависим",
+        "документац",
+        "верси",
+        "миграц",
+        "интеграц",
+        "протокол",
+        "sdk",
+        "api",
+    ]
+    .iter()
+    .any(|signal| text_contains_signal(&text, signal))
+}
+
+fn context7_api_key_available() -> bool {
+    env::var("CONTEXT7_API_KEY")
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false)
+}
+
+fn task_prefers_exa(task_kind: &str, task: &str) -> bool {
+    if task_kind == "audit-improve" {
+        return false;
+    }
+    let text = task.to_lowercase();
+    matches!(task_kind, "research" | "docs")
+        || [
+            "research",
+            "analy",
+            "analysis",
+            "compare",
+            "comparison",
+            "evaluate",
+            "recommend",
+            "choose",
+            "search",
+            "lookup",
+            "survey",
+            "landscape",
+            "trend",
+            "market",
+            "latest",
+            "technology",
+            "technologies",
+            "tooling",
+            "исслед",
+            "анализ",
+            "сравн",
+            "оцен",
+            "рекомен",
+            "подбери",
+            "найди",
+            "технолог",
+            "рынок",
+            "последн",
+            "актуальн",
+        ]
+        .iter()
+        .any(|signal| text_contains_signal(&text, signal))
+}
+
+fn task_should_enable_fetch_mcp(task_kind: &str, task: &str) -> bool {
+    if task_kind == "audit-improve" {
+        return false;
+    }
+    if task_is_trivial_local_cli_contract(task_kind, "low", task, None) {
+        return false;
+    }
+    matches!(task_kind, "research" | "docs")
+        || task_prefers_context7(task_kind, task)
+        || task_prefers_exa(task_kind, task)
+}
+
+fn workspace_is_git_repo(workspace: &Path) -> bool {
+    if workspace.join(".git").exists() {
+        return true;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn task_should_enable_git_mcp(task_kind: &str, workspace: Option<&Path>) -> bool {
+    matches!(task_kind, "review" | "audit-improve")
+        && workspace.map(workspace_is_git_repo).unwrap_or(false)
+}
+
+fn task_should_enable_memory_mcp(task_kind: &str, complexity: &str, solver_count: usize) -> bool {
+    solver_count > 1
+        || complexity != "low"
+        || matches!(
+            task_kind,
+            "research" | "docs" | "review" | "audit-improve" | "ai" | "backend" | "fullstack"
+        )
+}
+
+fn dedupe_strings(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut ordered = Vec::new();
+    for item in items {
+        if item.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(item.clone()) {
+            ordered.push(item);
+        }
+    }
+    ordered
+}
+
+fn infer_mcp_selection(
+    task_kind: &str,
+    complexity: &str,
+    task: &str,
+    solver_count: usize,
+    workspace: Option<&Path>,
+) -> McpSelection {
+    let trivial_local_cli = task_is_trivial_local_cli_contract(task_kind, complexity, task, workspace);
+    let mut rationale = Vec::new();
+    let mut servers = Vec::new();
+    let mut stage_scope = vec![
+        "intake".to_string(),
+        "solver".to_string(),
+        "review".to_string(),
+        "verification".to_string(),
+    ];
+    if default_pipeline_includes_execution(task_kind, task) {
+        stage_scope.insert(3, "execution".to_string());
+    }
+
+    if task_prefers_context7(task_kind, task) && !trivial_local_cli && context7_api_key_available() {
+        let mut context7_stages = vec![
+            "intake".to_string(),
+            "solver".to_string(),
+            "review".to_string(),
+        ];
+        if matches!(task_kind, "docs") || task_is_analysis_only(task) {
+            context7_stages.push("verification".to_string());
+        }
+        rationale.push(
+            "Selected `context7` because the task looks documentation, SDK, framework, or version sensitive."
+                .to_string(),
+        );
+        servers.push(McpServerPlan {
+            name: "context7".to_string(),
+            mode: "readonly".to_string(),
+            stages: context7_stages,
+            purposes: vec![
+                "official docs".to_string(),
+                "version-aware API reference".to_string(),
+            ],
+            usage_hint: "Prefer Context7 for official library, framework, protocol, and version-specific docs before generic web browsing.".to_string(),
+        });
+    } else if task_prefers_context7(task_kind, task) && !trivial_local_cli {
+        rationale.push(
+            "Skipped `context7` because `CONTEXT7_API_KEY` is not available; falling back to official `fetch` plus normal browsing and local context."
+                .to_string(),
+        );
+    } else if task_prefers_exa(task_kind, task) {
+        rationale.push(
+            "Selected `exa` because the task looks research, analysis, or source-discovery heavy."
+                .to_string(),
+        );
+        servers.push(McpServerPlan {
+            name: "exa".to_string(),
+            mode: "readonly".to_string(),
+            stages: vec![
+                "intake".to_string(),
+                "solver".to_string(),
+                "review".to_string(),
+            ],
+            purposes: vec![
+                "source discovery".to_string(),
+                "external research".to_string(),
+            ],
+            usage_hint: "Prefer Exa for source discovery, literature/web research, and collecting primary references before synthesizing conclusions.".to_string(),
+        });
+    }
+
+    if task_should_enable_fetch_mcp(task_kind, task) && !trivial_local_cli {
+        let mut fetch_stages = vec![
+            "intake".to_string(),
+            "solver".to_string(),
+            "review".to_string(),
+        ];
+        if matches!(task_kind, "research" | "docs") || task_is_analysis_only(task) {
+            fetch_stages.push("verification".to_string());
+        }
+        rationale.push(
+            "Selected official `fetch` as a fallback page-retrieval MCP so stages can read specific URLs directly when search or docs servers surface concrete sources."
+                .to_string(),
+        );
+        servers.push(McpServerPlan {
+            name: "fetch".to_string(),
+            mode: "readonly".to_string(),
+            stages: fetch_stages,
+            purposes: vec![
+                "page retrieval".to_string(),
+                "direct source reading".to_string(),
+            ],
+            usage_hint: "Prefer Fetch after Context7 or Exa has identified a specific URL that needs direct chunked retrieval.".to_string(),
+        });
+    }
+
+    if task_should_enable_git_mcp(task_kind, workspace) {
+        rationale.push(
+            "Selected official `git` because this is a review workflow on a Git repository and stage agents can benefit from commit, branch, and diff inspection."
+                .to_string(),
+        );
+        servers.push(McpServerPlan {
+            name: "git".to_string(),
+            mode: "readonly".to_string(),
+            stages: vec![
+                "intake".to_string(),
+                "solver".to_string(),
+                "review".to_string(),
+                "verification".to_string(),
+            ],
+            purposes: vec![
+                "history inspection".to_string(),
+                "diff inspection".to_string(),
+            ],
+            usage_hint: "Prefer Git for read-only repository inspection such as status, diff, show, log, and branch listing during review workflows.".to_string(),
+        });
+    }
+
+    if task_should_enable_memory_mcp(task_kind, complexity, solver_count) {
+        let mut memory_stage_scope = vec![
+            "intake".to_string(),
+            "review".to_string(),
+            "verification".to_string(),
+        ];
+        if default_pipeline_includes_execution(task_kind, task) {
+            memory_stage_scope.insert(2, "execution".to_string());
+        }
+        rationale.push(
+            "Selected `memory` because this run is multi-stage enough to benefit from explicit recall and durable handoffs, while keeping solver stages self-contained for better reliability."
+                .to_string(),
+        );
+        servers.push(McpServerPlan {
+            name: "memory".to_string(),
+            mode: "memory".to_string(),
+            stages: memory_stage_scope,
+            purposes: vec![
+                "cross-stage continuity".to_string(),
+                "durable handoffs".to_string(),
+            ],
+            usage_hint: "Use memory for durable decisions and stage handoffs outside the solver stage; keep solver reasoning self-contained unless a future task explicitly requires shared memory.".to_string(),
+        });
+    }
+
+    McpSelection {
+        auto_select: true,
+        rationale,
+        servers,
+    }
+}
+
+fn solver_assigned_mcp_servers(plan: &McpSelection) -> Vec<String> {
+    let mut names = Vec::new();
+    for preferred in ["context7", "exa", "fetch", "git"] {
+        if plan
+            .servers
+            .iter()
+            .any(|server| server.name == preferred && server.stages.iter().any(|item| item == "solver"))
+        {
+            names.push(preferred.to_string());
+        }
+    }
+    if plan
+        .servers
+        .iter()
+        .any(|server| server.name == "memory" && server.stages.iter().any(|item| item == "solver"))
+    {
+        names.push("memory".to_string());
+    }
+    dedupe_strings(names)
+}
+
+fn effective_solver_mcp_servers(plan: &Plan, solver: &SolverRole) -> Vec<String> {
+    let assigned = if solver.mcp_servers.is_empty() {
+        solver_assigned_mcp_servers(&plan.mcp)
+    } else {
+        solver.mcp_servers.clone()
+    };
+    assigned
+        .into_iter()
+        .filter(|name| {
+            plan.mcp.servers.iter().any(|server| {
+                server.name == *name && server.stages.iter().any(|item| item == "solver")
+            })
+        })
+        .collect()
+}
+
+fn ensure_plan_mcp_defaults(plan: &mut Plan) {
+    let workspace = PathBuf::from(plan.workspace.trim());
+    let workspace = if plan.workspace.trim().is_empty() {
+        None
+    } else {
+        Some(workspace.as_path())
+    };
+    if plan.mcp.auto_select || plan.mcp.servers.is_empty() {
+        plan.mcp = infer_mcp_selection(
+            &plan.task_kind,
+            &plan.complexity,
+            &plan.original_task,
+            std::cmp::max(1, plan.solver_roles.len()),
+            workspace,
+        );
+    }
+    let assigned = solver_assigned_mcp_servers(&plan.mcp);
+    for solver in &mut plan.solver_roles {
+        solver.mcp_servers = assigned.clone();
+    }
+    plan.references
+        .insert("mcp_plan".to_string(), MCP_PLAN_REF.to_string());
+}
+
+fn mcp_auto_provision_enabled() -> bool {
+    if env_flag("AGPIPE_DISABLE_MCP_PROVISION").unwrap_or(false) {
+        return false;
+    }
+    if cfg!(test) && !env_flag("AGPIPE_TEST_ALLOW_MCP_PROVISION").unwrap_or(false) {
+        return false;
+    }
+    env_flag("AGPIPE_AUTO_CONFIGURE_MCP").unwrap_or(true)
+}
+
+fn codex_home_dir() -> Result<PathBuf, String> {
+    if let Ok(path) = env::var("CODEX_HOME") {
+        return PathBuf::from(path).expanduser().resolve();
+    }
+    let home = env::var("HOME").map_err(|_| "HOME is not set.".to_string())?;
+    Ok(PathBuf::from(home).join(".codex"))
+}
+
+fn codex_config_path(codex_home_override: Option<&Path>) -> Result<(PathBuf, PathBuf), String> {
+    let codex_home = match codex_home_override {
+        Some(path) => path.expanduser().resolve()?,
+        None => codex_home_dir()?,
+    };
+    Ok((codex_home.clone(), codex_home.join("config.toml")))
+}
+
+fn mcp_provision_record_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(MCP_PROVISION_RECORD_REF)
+}
+
+fn read_mcp_provision_record(run_dir: &Path) -> Option<McpProvisionRecord> {
+    read_json(&mcp_provision_record_path(run_dir)).ok()
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|meta| meta.is_file() && (meta.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+fn command_exists(name: &str) -> bool {
+    if name.contains('/') {
+        return is_executable_file(&PathBuf::from(name));
+    }
+    env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| env::split_paths(&paths).collect::<Vec<_>>())
+        .any(|dir| is_executable_file(&dir.join(name)))
+}
+
+fn config_has_mcp_server(config: &str, name: &str) -> bool {
+    let header = format!("[mcp_servers.{name}]");
+    config.lines().any(|line| line.trim() == header)
+}
+
+fn render_context7_mcp_block() -> String {
+    [
+        "[mcp_servers.context7]",
+        "enabled = true",
+        "url = \"https://mcp.context7.com/mcp\"",
+        "env_http_headers = { \"CONTEXT7_API_KEY\" = \"CONTEXT7_API_KEY\" }",
+        "startup_timeout_sec = 20.0",
+        "tool_timeout_sec = 60.0",
+    ]
+    .join("\n")
+}
+
+fn render_exa_mcp_block() -> String {
+    [
+        "[mcp_servers.exa]",
+        "enabled = true",
+        "url = \"https://mcp.exa.ai/mcp\"",
+        "startup_timeout_sec = 20.0",
+        "tool_timeout_sec = 60.0",
+    ]
+    .join("\n")
+}
+
+fn render_fetch_mcp_block() -> Option<String> {
+    if command_exists("docker") {
+        return Some(
+            [
+                "[mcp_servers.fetch]",
+                "enabled = true",
+                "command = \"docker\"",
+                "args = [\"run\", \"-i\", \"--rm\", \"mcp/fetch\"]",
+                "enabled_tools = [\"fetch\"]",
+                "startup_timeout_sec = 90.0",
+                "tool_timeout_sec = 60.0",
+            ]
+            .join("\n"),
+        );
+    }
+    None
+}
+
+fn render_git_mcp_block() -> Option<String> {
+    if !command_exists("docker") {
+        return None;
+    }
+    let home = env::var("HOME").ok()?;
+    Some(
+        format!(
+            concat!(
+                "[mcp_servers.git]\n",
+                "enabled = true\n",
+                "command = \"docker\"\n",
+                "args = [\"run\", \"--rm\", \"-i\", \"--mount\", \"type=bind,src={},dst={}\", \"mcp/git\"]\n",
+                "enabled_tools = [\"git_status\", \"git_diff_unstaged\", \"git_diff_staged\", \"git_diff\", \"git_log\", \"git_show\", \"git_branch\"]\n",
+                "startup_timeout_sec = 90.0\n",
+                "tool_timeout_sec = 60.0"
+            ),
+            home,
+            home
+        )
+    )
+}
+
+fn render_memory_mcp_block(codex_home: &Path) -> Option<(String, String)> {
+    if command_exists("docker") {
+        return Some((
+            "memory".to_string(),
+            [
+                "[mcp_servers.memory]",
+                "enabled = true",
+                "command = \"docker\"",
+                "args = [\"run\", \"-i\", \"--rm\", \"-v\", \"agpipe-codex-memory:/app/dist\", \"mcp/memory\"]",
+                "startup_timeout_sec = 90.0",
+                "tool_timeout_sec = 60.0",
+            ]
+            .join("\n"),
+        ));
+    }
+    if command_exists("npx") {
+        let memory_root = codex_home.join("mcp-memory");
+        let memory_file = memory_root.join("memory.json");
+        return Some((
+            "memory".to_string(),
+            format!(
+                concat!(
+                    "[mcp_servers.memory]\n",
+                    "enabled = true\n",
+                    "command = \"npx\"\n",
+                    "args = [\"-y\", \"@modelcontextprotocol/server-memory\"]\n",
+                    "cwd = \"{}\"\n",
+                    "env = {{ \"MEMORY_FILE_PATH\" = \"{}\" }}\n",
+                    "startup_timeout_sec = 45.0\n",
+                    "tool_timeout_sec = 60.0"
+                ),
+                memory_root.display(),
+                memory_file.display()
+            ),
+        ));
+    }
+    None
+}
+
+fn desired_mcp_config_block(codex_home: &Path, name: &str) -> Result<Option<String>, String> {
+    match name {
+        "context7" => Ok(Some(render_context7_mcp_block())),
+        "exa" => Ok(Some(render_exa_mcp_block())),
+        "fetch" => Ok(render_fetch_mcp_block()),
+        "git" => Ok(render_git_mcp_block()),
+        "memory" => Ok(render_memory_mcp_block(codex_home).map(|(_, block)| block)),
+        _ => Ok(None),
+    }
+}
+
+fn provision_selected_mcp_servers(
+    run_dir: &Path,
+    plan: &Plan,
+    codex_home_override: Option<&Path>,
+) -> McpProvisionRecord {
+    let mut record = McpProvisionRecord {
+        enabled: mcp_auto_provision_enabled(),
+        ..McpProvisionRecord::default()
+    };
+    if !record.enabled {
+        record
+            .warnings
+            .push("Automatic MCP provisioning is disabled.".to_string());
+        let _ = write_json(&mcp_provision_record_path(run_dir), &record);
+        return record;
+    }
+    let (codex_home, config_path) = match codex_config_path(codex_home_override) {
+        Ok(paths) => paths,
+        Err(err) => {
+            record.warnings.push(err);
+            let _ = write_json(&mcp_provision_record_path(run_dir), &record);
+            return record;
+        }
+    };
+    record.codex_home = codex_home.display().to_string();
+    record.config_path = config_path.display().to_string();
+
+    let mut existing = read_text(&config_path).unwrap_or_default();
+    let mut appended_blocks = Vec::new();
+    for server in &plan.mcp.servers {
+        if config_has_mcp_server(&existing, &server.name) {
+            record.already_present.push(server.name.clone());
+            continue;
+        }
+        match desired_mcp_config_block(&codex_home, &server.name) {
+            Ok(Some(block)) => {
+                appended_blocks.push(block);
+                record.configured.push(server.name.clone());
+                existing.push('\n');
+                existing.push_str(&format!("[mcp_servers.{}]\n", server.name));
+            }
+            Ok(None) => record.skipped.push(server.name.clone()),
+            Err(err) => record.warnings.push(format!("{}: {err}", server.name)),
+        }
+    }
+
+    if !appended_blocks.is_empty() {
+        if let Some(parent) = config_path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                record.warnings.push(format!(
+                    "Could not create Codex config dir {}: {err}",
+                    parent.display()
+                ));
+                let _ = write_json(&mcp_provision_record_path(run_dir), &record);
+                return record;
+            }
+        }
+        let mut updated = read_text(&config_path).unwrap_or_default();
+        if !updated.trim_end().is_empty() {
+            updated.push_str("\n\n");
+        }
+        updated.push_str(&appended_blocks.join("\n\n"));
+        if let Err(err) = write_text(&config_path, &updated) {
+            record.warnings.push(err);
+            record.configured.clear();
+        }
+    }
+
+    let _ = write_json(&mcp_provision_record_path(run_dir), &record);
+    record
+}
+
+fn solver_memory_namespace(run_dir: &Path, solver_id: &str) -> String {
+    format!(
+        "agpipe:{}:{}",
+        run_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("run"),
+        solver_id
+    )
+}
+
+fn render_mcp_reference(run_dir: &Path, plan: &Plan) -> String {
+    if plan.mcp.servers.is_empty() {
+        return "# MCP Plan\n\nNo MCP servers were selected for this run.\n".to_string();
+    }
+    let mut lines = vec![
+        "# MCP Plan".to_string(),
+        String::new(),
+        "These MCP selections are recommendations for stage agents. Use them only if the current client actually exposes the named MCP server.".to_string(),
+        String::new(),
+        "## Auto Selection Rationale".to_string(),
+    ];
+    if plan.mcp.rationale.is_empty() {
+        lines.push("- none recorded".to_string());
+    } else {
+        lines.extend(plan.mcp.rationale.iter().map(|item| format!("- {item}")));
+    }
+    lines.push(String::new());
+    lines.push("## Selected Servers".to_string());
+    for server in &plan.mcp.servers {
+        lines.push(format!(
+            "- `{}` [{}] stages: {}",
+            server.name,
+            server.mode,
+            server.stages.join(", ")
+        ));
+        if !server.purposes.is_empty() {
+            lines.push(format!("  purposes: {}", server.purposes.join(", ")));
+        }
+        if !server.usage_hint.trim().is_empty() {
+            lines.push(format!("  usage: {}", server.usage_hint.trim()));
+        }
+    }
+    if !plan.solver_roles.is_empty() {
+        lines.push(String::new());
+        lines.push("## Solver Routing".to_string());
+        for solver in &plan.solver_roles {
+            let assigned = if solver.mcp_servers.is_empty() {
+                "none".to_string()
+            } else {
+                solver.mcp_servers.join(", ")
+            };
+            lines.push(format!("- `{}` -> {}", solver.solver_id, assigned));
+            if solver.mcp_servers.iter().any(|name| name == "memory") {
+                lines.push(format!(
+                    "  memory namespace: `{}`",
+                    solver_memory_namespace(run_dir, &solver.solver_id)
+                ));
+                lines.push(
+                    "  isolation rule: never read or write sibling solver namespaces before review."
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if let Some(provision) = read_mcp_provision_record(run_dir) {
+        lines.push(String::new());
+        lines.push("## Client Provisioning".to_string());
+        lines.push(format!(
+            "- auto provisioning enabled: `{}`",
+            provision.enabled
+        ));
+        if !provision.config_path.trim().is_empty() {
+            lines.push(format!("- codex config: `{}`", provision.config_path));
+        }
+        lines.push(format!(
+            "- configured now: {}",
+            if provision.configured.is_empty() {
+                "none".to_string()
+            } else {
+                provision.configured.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "- already present: {}",
+            if provision.already_present.is_empty() {
+                "none".to_string()
+            } else {
+                provision.already_present.join(", ")
+            }
+        ));
+        if !provision.skipped.is_empty() {
+            lines.push(format!("- skipped: {}", provision.skipped.join(", ")));
+        }
+        if !provision.warnings.is_empty() {
+            lines.push("- warnings:".to_string());
+            lines.extend(provision.warnings.iter().map(|item| format!("  - {item}")));
+        }
+    }
+    lines.push(String::new());
+    lines.push("## Safety Rules".to_string());
+    lines.push(
+        "- prefer official or primary-source material when using MCP research servers".to_string(),
+    );
+    lines.push("- treat missing MCP connectivity as a normal fallback to local context or regular browsing".to_string());
+    lines.push("- do not let shared memory break solver independence".to_string());
+    format!("{}\n", lines.join("\n"))
+}
+
+fn mcp_reference_path(run_dir: &Path) -> PathBuf {
+    run_dir.join(MCP_PLAN_REF)
+}
+
+fn write_dynamic_reference_assets(run_dir: &Path, plan: &Plan) -> Result<(), String> {
+    write_text(
+        &mcp_reference_path(run_dir),
+        &render_mcp_reference(run_dir, plan),
+    )
+}
+
 fn solver_count_for(
     task_kind: &str,
     complexity: &str,
     execution_mode: &str,
     workstream_hints: &[WorkstreamHint],
+    task: &str,
 ) -> usize {
+    if task_kind == "review" {
+        return if complexity == "high" { 3 } else { 2 };
+    }
     let mut count = match complexity {
         "low" => 1,
         "medium" => 2,
         _ => 3,
     };
     if matches!(task_kind, "research" | "docs") {
+        count = count.max(2);
+    }
+    if task_requests_cli_entrypoint(task_kind, task) && task_requests_precise_local_contract(task) {
         count = count.max(2);
     }
     if execution_mode == "decomposed" && workstream_hints.len() >= 2 {
@@ -1633,7 +3019,7 @@ fn solver_count_for(
 }
 
 fn angle_sequence_for(task_kind: &str) -> &'static [&'static str] {
-    if matches!(task_kind, "research" | "docs") {
+    if matches!(task_kind, "research" | "docs" | "review" | "audit-improve") {
         &RESEARCH_ANGLE_SEQUENCE
     } else {
         &ANGLE_SEQUENCE
@@ -1643,6 +3029,7 @@ fn angle_sequence_for(task_kind: &str) -> &'static [&'static str] {
 fn reviewer_stack_for(task_kind: &str) -> Vec<String> {
     let stack = match task_kind {
         "ai" => &AI_REVIEWER_STACK[..],
+        "audit-improve" => &AUDIT_IMPROVE_REVIEWER_STACK[..],
         "research" => &RESEARCH_REVIEWER_STACK[..],
         "docs" => &DOCS_REVIEWER_STACK[..],
         _ => &REVIEWER_STACK[..],
@@ -1650,7 +3037,28 @@ fn reviewer_stack_for(task_kind: &str) -> Vec<String> {
     stack.iter().map(|item| item.to_string()).collect()
 }
 
+fn reviewer_stack_for_task(task_kind: &str, complexity: &str, task: &str) -> Vec<String> {
+    if task_kind == "backend"
+        && complexity == "low"
+        && task_requests_cli_entrypoint(task_kind, task)
+        && task_requests_precise_local_contract(task)
+    {
+        return BACKEND_CLI_REVIEWER_STACK
+            .iter()
+            .map(|item| item.to_string())
+            .collect();
+    }
+    reviewer_stack_for(task_kind)
+}
+
+fn default_reviewer_stack_for_plan(plan: &Plan) -> Vec<String> {
+    reviewer_stack_for_task(&plan.task_kind, &plan.complexity, &plan.original_task)
+}
+
 fn task_requests_workspace_changes(task: &str) -> bool {
+    if task_forbids_workspace_changes(task) {
+        return false;
+    }
     let text = task.to_lowercase();
     [
         "implement",
@@ -1683,9 +3091,62 @@ fn task_requests_workspace_changes(task: &str) -> bool {
     .any(|signal| text.contains(signal))
 }
 
+fn task_forbids_workspace_changes(task: &str) -> bool {
+    let text = task.to_lowercase();
+    [
+        "review-only",
+        "research-only",
+        "analysis-only",
+        "result should be an analytical document",
+        "final result should be an analytical document",
+        "output should be an analytical document",
+        "do not turn the task into implementation",
+        "do not turn this into implementation",
+        "working artifacts are not required",
+        "implementation artifacts are not required",
+        "no implementation",
+        "without implementation",
+        "do not change code",
+        "do not modify code",
+        "do not edit the repo",
+        "do not proceed to code changes",
+        "not implementation work",
+        "not for implementing fixes",
+        "не менять код",
+        "не меняй код",
+        "не изменяй код",
+        "не редактируй код",
+        "не переходи к изменению кода",
+        "не переходить к изменению кода",
+        "не переходи к рефакторингу",
+        "не переходить к рефакторингу",
+        "не на реализацию",
+        "не на реализацию исправлений",
+        "без реализации",
+        "без внедрения",
+        "итоговый результат нужен в виде аналитического документа",
+        "результат нужен в виде аналитического документа",
+        "итоговый результат в виде аналитического документа",
+        "не превращай задачу в реализацию",
+        "не превращать задачу в реализацию",
+        "не являются обязательной частью результата",
+        "не внедряй",
+        "не реализуй",
+        "не переписывай",
+        "не вмешивайся",
+        "не модифицируй",
+        "не правь код",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+}
+
 fn task_is_analysis_only(task: &str) -> bool {
     if task_requests_workspace_changes(task) {
         return false;
+    }
+    if task_requests_code_review(task) {
+        return true;
     }
     let text = task.to_lowercase();
     let signals = [
@@ -1695,6 +3156,8 @@ fn task_is_analysis_only(task: &str) -> bool {
         "recommend",
         "proposal",
         "summary",
+        "report",
+        "findings",
         "spec",
         "analyze",
         "analysis",
@@ -1709,6 +3172,9 @@ fn task_is_analysis_only(task: &str) -> bool {
         "исслед",
         "рекомен",
         "предлож",
+        "отч",
+        "вывод",
+        "находк",
         "резюме",
         "спек",
         "анализ",
@@ -1723,7 +3189,79 @@ fn task_is_analysis_only(task: &str) -> bool {
         >= 2
 }
 
+fn task_is_verification_seed_follow_up(task: &str) -> bool {
+    let text = task.to_lowercase();
+    count_signals(
+        &text,
+        &[
+            "verified follow-up task",
+            "verification-derived context",
+            "rerun recommended",
+            "recommended next action",
+            "missing critical checks",
+            "verified progress that must not regress",
+            "do-not-regress constraints",
+            "clear done state for the next run",
+            "follow-up task",
+            "повторный прогон",
+            "следующий прогон",
+            "критические чеки",
+            "верификац",
+        ],
+    ) >= 2
+}
+
+fn task_requests_audit_improve_follow_up(task: &str) -> bool {
+    if !task_is_analysis_only(task) {
+        return false;
+    }
+    let text = task.to_lowercase();
+    let audit_hits = count_signals(
+        &text,
+        &[
+            "audit",
+            "analysis",
+            "analyze",
+            "investigate",
+            "verify",
+            "verification",
+            "аудит",
+            "анализ",
+            "исслед",
+            "верификац",
+            "провер",
+        ],
+    );
+    let improve_hits = count_signals(
+        &text,
+        &[
+            "improve",
+            "improvement",
+            "follow-up",
+            "rerun",
+            "close",
+            "reconcile",
+            "refresh",
+            "preserve",
+            "stale artifact",
+            "улуч",
+            "доработ",
+            "повторн",
+            "перезапуск",
+            "закрой",
+            "сверь",
+            "обнови",
+            "не откатывай",
+            "не reopening",
+        ],
+    );
+    audit_hits >= 2 && improve_hits >= 2
+}
+
 fn default_pipeline_includes_execution(task_kind: &str, task: &str) -> bool {
+    if task_kind == "review" {
+        return false;
+    }
     if task_is_analysis_only(task) {
         return false;
     }
@@ -1757,6 +3295,9 @@ fn infer_token_budget(complexity: &str) -> TokenBudget {
 }
 
 fn infer_execution_mode(task_kind: &str, complexity: &str, task: &str) -> String {
+    if matches!(task_kind, "review" | "audit-improve") {
+        return "alternatives".to_string();
+    }
     let text = task.to_lowercase();
     let compound = [
         "telegram",
@@ -1826,6 +3367,78 @@ fn workstream_hints_for(task_kind: &str, task: &str) -> Vec<WorkstreamHint> {
         ];
     }
     match task_kind {
+        "review" => vec![
+            WorkstreamHint {
+                name: "correctness-and-bugs".to_string(),
+                goal:
+                    "find concrete bugs, incorrect behavior, and code paths that are likely broken"
+                        .to_string(),
+                suggested_role: "engineering/engineering-code-reviewer.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "regression-and-risk".to_string(),
+                goal:
+                    "surface regression risks, unsafe assumptions, and user-visible failure modes"
+                        .to_string(),
+                suggested_role: "testing/testing-reality-checker.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "tests-and-evidence".to_string(),
+                goal: "identify missing tests, weak validation, and evidence gaps".to_string(),
+                suggested_role: "testing/testing-test-results-analyzer.md".to_string(),
+            },
+        ],
+        "audit-improve" => vec![
+            WorkstreamHint {
+                name: "device-probe-reconciliation".to_string(),
+                goal: "reconcile launcher host probe facts with interpreter-qualified runtime evidence".to_string(),
+                suggested_role: "engineering/engineering-backend-architect.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "artifact-refresh-and-narrative".to_string(),
+                goal: "refresh stale run-facing narrative so downstream reruns inherit the current validated state".to_string(),
+                suggested_role: "engineering/engineering-technical-writer.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "regression-guard-validation".to_string(),
+                goal: "rerun only the bounded green slice and preserve already-verified fixes".to_string(),
+                suggested_role: "testing/testing-tool-evaluator.md".to_string(),
+            },
+        ],
+        "docs" => vec![
+            WorkstreamHint {
+                name: "artifact-authoring".to_string(),
+                goal: "produce the requested guide, summary, or spec in a user-facing form".to_string(),
+                suggested_role: "engineering/engineering-technical-writer.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "source-grounding".to_string(),
+                goal: "tie claims to primary references and keep an explicit evidence ledger".to_string(),
+                suggested_role: "testing/testing-evidence-collector.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "decision-summary".to_string(),
+                goal: "compress the material findings into an executive decision-oriented takeaway".to_string(),
+                suggested_role: "support/support-executive-summary-generator.md".to_string(),
+            },
+        ],
+        "research" => vec![
+            WorkstreamHint {
+                name: "landscape-scan".to_string(),
+                goal: "map the relevant option space and identify the strongest candidates".to_string(),
+                suggested_role: "product/product-trend-researcher.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "evidence-ledger".to_string(),
+                goal: "capture the factual source trail and separate confirmed facts from inference".to_string(),
+                suggested_role: "testing/testing-evidence-collector.md".to_string(),
+            },
+            WorkstreamHint {
+                name: "comparison-and-risk".to_string(),
+                goal: "compare tradeoffs, operational fit, and failure modes of the candidate options".to_string(),
+                suggested_role: "testing/testing-tool-evaluator.md".to_string(),
+            },
+        ],
         "frontend" => vec![
             WorkstreamHint {
                 name: "ui-implementation".to_string(),
@@ -1838,18 +3451,37 @@ fn workstream_hints_for(task_kind: &str, task: &str) -> Vec<WorkstreamHint> {
                 suggested_role: "design/design-ux-architect.md".to_string(),
             },
         ],
-        "backend" => vec![
-            WorkstreamHint {
-                name: "service-layer".to_string(),
-                goal: "build the core service or API behavior".to_string(),
-                suggested_role: "engineering/engineering-backend-architect.md".to_string(),
-            },
-            WorkstreamHint {
-                name: "persistence-and-ops".to_string(),
-                goal: "define storage, jobs, and operational boundaries".to_string(),
-                suggested_role: "engineering/engineering-devops-automator.md".to_string(),
-            },
-        ],
+        "backend" => {
+            if task_requests_cli_entrypoint(task_kind, task) {
+                vec![
+                    WorkstreamHint {
+                        name: "local-entrypoint".to_string(),
+                        goal: "build the requested local CLI or script entrypoint".to_string(),
+                        suggested_role: "engineering/engineering-rapid-prototyper.md".to_string(),
+                    },
+                    WorkstreamHint {
+                        name: "run-contract".to_string(),
+                        goal: "lock the exact run command, stdout contract, and documentation"
+                            .to_string(),
+                        suggested_role: "engineering/engineering-technical-writer.md".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    WorkstreamHint {
+                        name: "service-layer".to_string(),
+                        goal: "build the core service or API behavior".to_string(),
+                        suggested_role: "engineering/engineering-senior-developer.md".to_string(),
+                    },
+                    WorkstreamHint {
+                        name: "data-and-interfaces".to_string(),
+                        goal: "define storage, integration surfaces, and operational boundaries"
+                            .to_string(),
+                        suggested_role: "engineering/engineering-backend-architect.md".to_string(),
+                    },
+                ]
+            }
+        }
         "fullstack" => vec![
             WorkstreamHint {
                 name: "entry-surface".to_string(),
@@ -1869,6 +3501,27 @@ fn workstream_hints_for(task_kind: &str, task: &str) -> Vec<WorkstreamHint> {
         ],
         _ => Vec::new(),
     }
+}
+
+fn solver_focus_workstreams(plan: &Plan, solver: &SolverRole) -> Vec<WorkstreamHint> {
+    if plan.workstream_hints.is_empty() {
+        return Vec::new();
+    }
+    let role_matches: Vec<WorkstreamHint> = plan
+        .workstream_hints
+        .iter()
+        .filter(|hint| !hint.suggested_role.is_empty() && hint.suggested_role == solver.role)
+        .cloned()
+        .collect();
+    if !role_matches.is_empty() {
+        return role_matches;
+    }
+    let solver_index = plan
+        .solver_roles
+        .iter()
+        .position(|item| item.solver_id == solver.solver_id)
+        .unwrap_or(0);
+    vec![plan.workstream_hints[solver_index % plan.workstream_hints.len()].clone()]
 }
 
 fn detect_stack(workspace: &Path) -> StackSignals {
@@ -1996,6 +3649,100 @@ fn build_validation_commands(workspace: &Path, signals: &StackSignals) -> Vec<St
     deduped
 }
 
+fn task_specific_validation_commands(task_kind: &str, task: &str) -> Vec<String> {
+    let text = task.to_lowercase();
+    let mut commands = Vec::new();
+    if task_requests_cli_entrypoint(task_kind, task) && text_contains_signal(&text, "main.py") {
+        commands.push("python3 main.py".to_string());
+    }
+    commands
+}
+
+fn validation_command_is_lightweight(command: &str) -> bool {
+    let text = command.trim().to_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+    if text.contains("--help") {
+        return true;
+    }
+    matches!(
+        text.as_str(),
+        "pytest"
+            | "cargo test"
+            | "go test ./..."
+            | "make test"
+            | "terraform validate"
+            | "python3 main.py"
+    ) || text.starts_with("pytest ")
+        || text.starts_with("cargo test ")
+        || text.starts_with("go test ")
+        || text.starts_with("make test ")
+}
+
+fn validation_command_looks_heavy(command: &str) -> bool {
+    let text = command.trim().to_lowercase();
+    if text.is_empty() || validation_command_is_lightweight(command) {
+        return false;
+    }
+    [
+        "--photo-path",
+        "--runtime-dir",
+        "--result-json-path",
+        "--output-dir",
+        "analysis-max-new-tokens",
+        "analysis-device",
+        "python -m llm_freecad.main",
+        "python -m llm_freecad.bot.runtime",
+        "run_service.py",
+        "freecad",
+        "qwen",
+        "telegram",
+    ]
+    .iter()
+    .any(|signal| text.contains(signal))
+        || text.starts_with("python ")
+        || text.starts_with("python3 ")
+        || text.starts_with("uv run ")
+        || (text.contains(" python ") && !text.contains(" --help"))
+        || (text.contains(" python3 ") && !text.contains(" --help"))
+        || (text.contains(" uv run ") && !text.contains(" --help"))
+}
+
+fn non_execution_validation_hints_for_stage(plan: &Plan, run_dir: &Path) -> Vec<String> {
+    let analysis_mode = prompt_prefers_lightweight_validation_for_stage(plan, run_dir);
+    let mut hints = if analysis_mode {
+        plan.validation_commands
+            .iter()
+            .filter(|command| !validation_command_looks_heavy(command))
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        plan.validation_commands.clone()
+    };
+    let mut deduped = Vec::new();
+    for hint in hints.drain(..) {
+        if !deduped.contains(&hint) {
+            deduped.push(hint);
+        }
+    }
+    deduped
+}
+
+fn prompt_prefers_lightweight_validation(plan: &Plan) -> bool {
+    task_forbids_workspace_changes(&plan.original_task)
+        || task_is_analysis_only(&plan.original_task)
+        || matches!(plan.task_kind.as_str(), "review" | "research" | "docs")
+}
+
+fn prompt_prefers_lightweight_validation_for_stage(plan: &Plan, run_dir: &Path) -> bool {
+    prompt_prefers_lightweight_validation(plan)
+        || first_stage_id_for_kind(plan, run_dir, PipelineStageKind::Execution)
+            .ok()
+            .flatten()
+            .is_none()
+}
+
 fn common_python_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Ok(venv) = env::var("VIRTUAL_ENV") {
@@ -2099,20 +3846,47 @@ fn detect_host_facts(source: &str) -> HostFacts {
     facts
 }
 
-fn choose_roles(task_kind: &str, solver_count: usize) -> Vec<SolverRole> {
+#[cfg(test)]
+fn choose_roles(task_kind: &str, task: &str, solver_count: usize) -> Vec<SolverRole> {
+    choose_roles_with_workstreams(task_kind, task, solver_count, &[])
+}
+
+fn choose_roles_with_workstreams(
+    task_kind: &str,
+    task: &str,
+    solver_count: usize,
+    workstream_hints: &[WorkstreamHint],
+) -> Vec<SolverRole> {
     let angles = angle_sequence_for(task_kind);
-    role_matrix(task_kind)
+    let mut ordered_roles = Vec::new();
+    let mut seen = BTreeSet::new();
+    for hint in workstream_hints {
+        if hint.suggested_role.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(hint.suggested_role.clone()) {
+            ordered_roles.push(hint.suggested_role.clone());
+        }
+    }
+    for role in role_matrix(task_kind, task) {
+        let role = role.to_string();
+        if seen.insert(role.clone()) {
+            ordered_roles.push(role);
+        }
+    }
+    ordered_roles
         .into_iter()
         .take(solver_count)
         .enumerate()
         .map(|(index, role)| SolverRole {
             solver_id: format!("solver-{}", (b'a' + index as u8) as char),
-            role: role.to_string(),
+            role,
             angle: angles
                 .get(index)
                 .copied()
                 .unwrap_or("implementation-first")
                 .to_string(),
+            mcp_servers: Vec::new(),
         })
         .collect()
 }
@@ -2825,6 +4599,9 @@ fn stage_cache_key(
         StageBackendKind::LocalTemplate(LocalTemplateKind::HelloWorldPython) => {
             "backend:local-template:hello-world-python"
         }
+        StageBackendKind::LocalTemplate(LocalTemplateKind::ExecutionReadyBackendCliIntake) => {
+            "backend:local-template:execution-ready-backend-cli-intake"
+        }
     });
     for part in command {
         digest.update_text(part);
@@ -3271,22 +5048,44 @@ fn plan_workspace(plan: &Plan) -> PathBuf {
 }
 
 fn load_plan(run_dir: &Path) -> Result<Plan, String> {
-    let path = run_dir.join("plan.json");
-    let text = read_text(&path)?;
+    let path = plan_path(run_dir);
+    let text = read_plan_artifact_text(run_dir)?;
     match serde_json::from_str(&text) {
-        Ok(plan) => Ok(plan),
+        Ok(mut plan) => {
+            ensure_plan_mcp_defaults(&mut plan);
+            Ok(plan)
+        }
         Err(_) => {
-            let mut value: Value = serde_json::from_str(&text)
-                .map_err(|err| format!("Could not parse {}: {err}", path.display()))?;
+            let mut value: Value = serde_json::from_str(&text).map_err(|err| {
+                format!(
+                    "Could not parse plan artifact for {} (expected {} or {}): {err}",
+                    run_dir.display(),
+                    path.display(),
+                    plan_snapshot_path(run_dir).display()
+                )
+            })?;
             normalize_legacy_plan_json(&mut value);
-            serde_json::from_value(value)
-                .map_err(|err| format!("Could not parse {}: {err}", path.display()))
+            let mut plan: Plan = serde_json::from_value(value).map_err(|err| {
+                format!(
+                    "Could not parse plan artifact for {} (expected {} or {}): {err}",
+                    run_dir.display(),
+                    path.display(),
+                    plan_snapshot_path(run_dir).display()
+                )
+            })?;
+            ensure_plan_mcp_defaults(&mut plan);
+            Ok(plan)
         }
     }
 }
 
 fn save_plan(run_dir: &Path, plan: &Plan) -> Result<(), String> {
-    write_json(&run_dir.join("plan.json"), plan)
+    let mut persisted = plan.clone();
+    ensure_plan_mcp_defaults(&mut persisted);
+    provision_selected_mcp_servers(run_dir, &persisted, None);
+    write_dynamic_reference_assets(run_dir, &persisted)?;
+    write_json(&plan_path(run_dir), &persisted)?;
+    write_json(&plan_snapshot_path(run_dir), &persisted)
 }
 
 fn normalize_legacy_plan_json(value: &mut Value) {
@@ -3579,6 +5378,71 @@ fn default_solver_stage_ids(plan: &Plan, run_dir: Option<&Path>) -> Vec<String> 
         .collect()
 }
 
+fn workstream_focus_summary(hints: &[WorkstreamHint]) -> String {
+    let mut labels: Vec<String> = hints
+        .iter()
+        .map(|hint| hint.name.trim())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!("`{name}`"))
+        .collect();
+    labels.sort();
+    labels.dedup();
+    if labels.is_empty() {
+        "the most critical goal checks".to_string()
+    } else {
+        labels.join(", ")
+    }
+}
+
+fn default_stage_description(plan: &Plan, stage: &PipelineStageSpec) -> String {
+    match pipeline_kind_from_str(&stage.kind) {
+        Some(PipelineStageKind::Intake) => format!(
+            "Refine the brief, goal checks, and downstream stage setup without implementing the solution. Keep the plan centered on {}.",
+            workstream_focus_summary(&plan.workstream_hints)
+        ),
+        Some(PipelineStageKind::Solver) => {
+            let solver = SolverRole {
+                solver_id: stage.id.clone(),
+                role: stage.role.clone(),
+                angle: stage.angle.clone(),
+                mcp_servers: Vec::new(),
+            };
+            let focus = solver_focus_workstreams(plan, &solver);
+            if plan.task_kind == "review" {
+                return format!(
+                    "Produce an independent `{}` code review for this task, with special attention to {}.",
+                    if stage.angle.trim().is_empty() {
+                        "evidence-first"
+                    } else {
+                        stage.angle.trim()
+                    },
+                    workstream_focus_summary(&focus)
+                );
+            }
+            format!(
+                "Develop an independent `{}` solution for this `{}` task, with special attention to {}.",
+                if stage.angle.trim().is_empty() {
+                    "implementation-first"
+                } else {
+                    stage.angle.trim()
+                },
+                plan.task_kind,
+                workstream_focus_summary(&focus)
+            )
+        }
+        Some(PipelineStageKind::Review) => {
+            "Compare solver outputs against the brief and goal checks, then choose a winner or explicit hybrid with concrete validation evidence.".to_string()
+        }
+        Some(PipelineStageKind::Execution) => {
+            "Implement the reviewed winner in the primary workspace, run the cheapest relevant validation, and record concrete changes.".to_string()
+        }
+        Some(PipelineStageKind::Verification) => {
+            "Audit the actual workspace and execution evidence, update goal status, and surface ordered findings plus any rerun recommendation.".to_string()
+        }
+        None => String::new(),
+    }
+}
+
 fn default_pipeline_stage_specs(plan: &Plan, run_dir: Option<&Path>) -> Vec<PipelineStageSpec> {
     let solver_ids = default_solver_stage_ids(plan, run_dir);
     let solver_role_map: BTreeMap<String, SolverRole> = plan
@@ -3592,16 +5456,25 @@ fn default_pipeline_stage_specs(plan: &Plan, run_dir: Option<&Path>) -> Vec<Pipe
         kind: "intake".to_string(),
         ..PipelineStageSpec::default()
     }];
+    if let Some(stage) = stages.last_mut() {
+        stage.description = default_stage_description(plan, stage);
+    }
     for (index, solver_id) in solver_ids.into_iter().enumerate() {
         let role = solver_role_map.get(&solver_id).cloned().unwrap_or_else(|| {
-            choose_roles(&plan.task_kind, std::cmp::max(1, plan.solver_count))
-                .get(index)
-                .cloned()
-                .unwrap_or(SolverRole {
-                    solver_id: solver_id.clone(),
-                    role: "engineering/engineering-senior-developer.md".to_string(),
-                    angle: angles[index % angles.len()].to_string(),
-                })
+            choose_roles_with_workstreams(
+                &plan.task_kind,
+                &plan.original_task,
+                std::cmp::max(1, plan.solver_count),
+                &plan.workstream_hints,
+            )
+            .get(index)
+            .cloned()
+            .unwrap_or(SolverRole {
+                solver_id: solver_id.clone(),
+                role: "engineering/engineering-senior-developer.md".to_string(),
+                angle: angles[index % angles.len()].to_string(),
+                mcp_servers: Vec::new(),
+            })
         });
         stages.push(PipelineStageSpec {
             id: solver_id.clone(),
@@ -3611,24 +5484,36 @@ fn default_pipeline_stage_specs(plan: &Plan, run_dir: Option<&Path>) -> Vec<Pipe
             angle: role.angle,
             ..PipelineStageSpec::default()
         });
+        if let Some(stage) = stages.last_mut() {
+            stage.description = default_stage_description(plan, stage);
+        }
     }
     stages.push(PipelineStageSpec {
         id: "review".to_string(),
         kind: "review".to_string(),
         ..PipelineStageSpec::default()
     });
+    if let Some(stage) = stages.last_mut() {
+        stage.description = default_stage_description(plan, stage);
+    }
     if default_pipeline_includes_execution(&plan.task_kind, &plan.original_task) {
         stages.push(PipelineStageSpec {
             id: "execution".to_string(),
             kind: "execution".to_string(),
             ..PipelineStageSpec::default()
         });
+        if let Some(stage) = stages.last_mut() {
+            stage.description = default_stage_description(plan, stage);
+        }
     }
     stages.push(PipelineStageSpec {
         id: "verification".to_string(),
         kind: "verification".to_string(),
         ..PipelineStageSpec::default()
     });
+    if let Some(stage) = stages.last_mut() {
+        stage.description = default_stage_description(plan, stage);
+    }
     stages
 }
 
@@ -3647,13 +5532,58 @@ fn pipeline_stage_specs(
     normalize_pipeline_stage_specs(&config, plan)
 }
 
+fn solver_stages_use_auto_roles(stages: &[PipelineStageSpec]) -> bool {
+    stages.iter().all(|stage| {
+        if pipeline_kind_from_str(&stage.kind) != Some(PipelineStageKind::Solver) {
+            return true;
+        }
+        stage.role_source.trim().is_empty() || stage.role_source.trim().eq_ignore_ascii_case("auto")
+    })
+}
+
+fn refresh_workstream_hints_if_auto(plan: &mut Plan, run_dir: Option<&Path>) -> Result<(), String> {
+    let derived = workstream_hints_for(&plan.task_kind, &plan.original_task);
+    if derived.is_empty() {
+        return Ok(());
+    }
+    if plan.workstream_hints.is_empty() {
+        plan.workstream_hints = derived;
+        return Ok(());
+    }
+    let stages = pipeline_stage_specs(plan, run_dir)?;
+    if !solver_stages_use_auto_roles(&stages) {
+        return Ok(());
+    }
+    let current_roles: BTreeSet<String> = plan
+        .workstream_hints
+        .iter()
+        .filter(|hint| !hint.suggested_role.trim().is_empty())
+        .map(|hint| hint.suggested_role.clone())
+        .collect();
+    let derived_roles: BTreeSet<String> = derived
+        .iter()
+        .filter(|hint| !hint.suggested_role.trim().is_empty())
+        .map(|hint| hint.suggested_role.clone())
+        .collect();
+    if current_roles != derived_roles {
+        plan.workstream_hints = derived;
+    }
+    Ok(())
+}
+
 fn apply_pipeline_solver_defaults(plan: &mut Plan, run_dir: Option<&Path>) -> Result<(), String> {
+    refresh_workstream_hints_if_auto(plan, run_dir)?;
     let mut stages = pipeline_stage_specs(plan, run_dir)?;
     let solver_total = stages
         .iter()
         .filter(|stage| pipeline_kind_from_str(&stage.kind) == Some(PipelineStageKind::Solver))
         .count();
-    let default_roles = choose_roles(&plan.task_kind, std::cmp::max(1, solver_total));
+    let default_roles = choose_roles_with_workstreams(
+        &plan.task_kind,
+        &plan.original_task,
+        std::cmp::max(1, solver_total),
+        &plan.workstream_hints,
+    );
     let angles = angle_sequence_for(&plan.task_kind);
     let mut solver_index = 0usize;
     let mut solver_roles = Vec::new();
@@ -3669,6 +5599,7 @@ fn apply_pipeline_solver_defaults(plan: &mut Plan, run_dir: Option<&Path>) -> Re
                     solver_id: stage.id.clone(),
                     role: "engineering/engineering-senior-developer.md".to_string(),
                     angle: angles[solver_index % angles.len()].to_string(),
+                    mcp_servers: Vec::new(),
                 });
             stage.role = fallback.role;
         }
@@ -3679,12 +5610,20 @@ fn apply_pipeline_solver_defaults(plan: &mut Plan, run_dir: Option<&Path>) -> Re
             solver_id: stage.id.clone(),
             role: stage.role.clone(),
             angle: stage.angle.clone(),
+            mcp_servers: Vec::new(),
         });
         solver_index += 1;
     }
     plan.pipeline.stages = stages;
     plan.solver_count = solver_roles.len();
     plan.solver_roles = solver_roles;
+    ensure_plan_mcp_defaults(plan);
+    let plan_snapshot = plan.clone();
+    for stage in &mut plan.pipeline.stages {
+        if stage.description.trim().is_empty() {
+            stage.description = default_stage_description(&plan_snapshot, stage);
+        }
+    }
     Ok(())
 }
 
@@ -4123,7 +6062,542 @@ fn option_bool(value: Option<bool>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
-fn render_intake_prompt(run_dir: &Path, plan: &Plan) -> String {
+fn stage_memory_namespace(run_dir: &Path, stage: &str) -> String {
+    format!(
+        "agpipe:{}:{}",
+        run_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("run"),
+        stage
+    )
+}
+
+fn localized_copy<'a>(language: &str, english: &'a str, russian: &'a str) -> &'a str {
+    if language_is_russian(language) {
+        russian
+    } else {
+        english
+    }
+}
+
+fn localized_mcp_usage_heading(language: &str) -> &'static str {
+    localized_copy(language, "MCP Usage", "Использование MCP")
+}
+
+fn localized_mcp_usage_heading_candidates() -> &'static [&'static str] {
+    &["mcp usage", "использование mcp"]
+}
+
+fn localized_user_facing_style_rules(language: &str) -> Vec<String> {
+    if language_is_russian(language) {
+        vec![
+            "write every user-facing markdown artifact in natural Russian".to_string(),
+            "avoid unnecessary English jargon, Americanisms, and transliterated calques when a plain Russian equivalent exists".to_string(),
+            "translate internal pipeline labels and section headings into idiomatic Russian unless the term is a product name, code identifier, command, protocol, or exact API term".to_string(),
+            "do not mix English headings with Russian prose; keep the document stylistically consistent".to_string(),
+            "prefer plain Russian terms such as `основа`, `доказательная база`, `короткий список`, `итоговая оценка`, and `повторный прогон` over hybrid wording like `baseline`, `evidence trail`, `shortlist`, `fit-score`, or `rerun` in user-facing prose".to_string(),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn localized_user_facing_style_note(language: &str) -> &'static str {
+    if language_is_russian(language) {
+        "For Russian user-facing output, keep the prose idiomatic and readable: translate internal pipeline labels, avoid unnecessary English jargon and Americanisms, and keep English only for product names, commands, and exact technical terms."
+    } else {
+        "Keep user-facing prose idiomatic in the requested language and avoid unnecessary internal pipeline jargon."
+    }
+}
+
+fn selected_mcp_servers_for_stage<'a>(
+    plan: &'a Plan,
+    stage: &str,
+    solver: Option<&SolverRole>,
+) -> Vec<&'a McpServerPlan> {
+    plan.mcp
+        .servers
+        .iter()
+        .filter(|server| {
+            if stage == "solver" {
+                if !server.stages.iter().any(|item| item == "solver") {
+                    return false;
+                }
+                if let Some(solver) = solver {
+                    let assigned = effective_solver_mcp_servers(plan, solver);
+                    return assigned.iter().any(|item| item == &server.name);
+                }
+            }
+            server.stages.iter().any(|item| item == stage)
+        })
+        .collect()
+}
+
+fn render_mcp_usage_hints(
+    run_dir: &Path,
+    stage: &str,
+    solver: Option<&SolverRole>,
+    plan: &Plan,
+) -> Vec<String> {
+    selected_mcp_servers_for_stage(plan, stage, solver)
+        .into_iter()
+        .map(|server| match server.name.as_str() {
+            "context7" => {
+                "use `context7` for official library/framework/protocol docs before generic browsing"
+                    .to_string()
+            }
+            "exa" => {
+                "use `exa` for research and source discovery; favor primary sources over summaries"
+                    .to_string()
+            }
+            "fetch" => {
+                "use official `fetch` for direct page retrieval after a concrete URL has been identified; if the call requires confirmation or is unavailable, continue locally and record that fallback"
+                    .to_string()
+            }
+            "git" => {
+                "use official `git` for read-only repository inspection such as status, diff, log, show, and branch listing"
+                    .to_string()
+            }
+            "memory" => {
+                if let Some(solver) = solver {
+                    format!(
+                        "use `memory` only within namespace `{}` and never read or write sibling solver namespaces before review; if memory calls are unavailable, keep the handoff local in the stage artifact",
+                        solver_memory_namespace(run_dir, &solver.solver_id)
+                    )
+                } else {
+                    format!(
+                        "use `memory` for durable handoffs within namespace `{}`; if memory calls are unavailable, keep the handoff local in the stage artifact",
+                        stage_memory_namespace(run_dir, stage)
+                    )
+                }
+            }
+            other => format!("use `{other}` only when it improves this stage over local context"),
+        })
+        .collect()
+}
+
+fn render_mcp_accountability_rules(
+    selected_servers: &[String],
+    summary_language: &str,
+) -> Vec<String> {
+    let heading = localized_mcp_usage_heading(summary_language);
+    let mut rules = vec![
+        format!(
+            "include a `## {heading}` section in the main markdown artifact for this stage"
+        ),
+    ];
+    if selected_servers.is_empty() {
+        rules.push(
+            format!(
+                "in `## {heading}`, state that no MCP servers were selected for this stage"
+            ),
+        );
+        rules.push(
+            "do not claim fresh MCP-backed lookups, live external source re-checks, or direct page retrieval happened in this stage when no MCP servers were selected; if you mention URLs, label them as inherited references or unverified context".to_string(),
+        );
+    } else {
+        rules.push(
+            format!(
+                "in `## {heading}`, list each selected MCP server and mark it as `used`, `not used`, or `unavailable` with a short reason"
+            ),
+        );
+        rules.push(
+            "when MCP materially informed the answer, mention the concrete lookup, page, or context it provided"
+                .to_string(),
+        );
+        rules.push(
+            "if a selected MCP call is cancelled, requires manual confirmation, or is unavailable, continue with local evidence and record the fallback instead of blocking the stage"
+                .to_string(),
+        );
+    }
+    rules
+}
+
+fn stage_mcp_usage_note_path(run_dir: &Path, stage: &str) -> PathBuf {
+    run_dir
+        .join("runtime")
+        .join("mcp")
+        .join(format!("{stage}.md"))
+}
+
+fn stage_primary_mcp_artifact_path(
+    plan: &Plan,
+    run_dir: &Path,
+    stage: &str,
+) -> Result<Option<PathBuf>, String> {
+    Ok(Some(match pipeline_stage_kind_for(plan, run_dir, stage)? {
+        PipelineStageKind::Intake => run_dir.join("brief.md"),
+        PipelineStageKind::Solver => run_dir.join("solutions").join(stage).join("RESULT.md"),
+        PipelineStageKind::Review => run_dir.join("review").join("report.md"),
+        PipelineStageKind::Execution => run_dir.join("execution").join("report.md"),
+        PipelineStageKind::Verification => run_dir.join("verification").join("findings.md"),
+    }))
+}
+
+fn extract_markdown_section(markdown: &str, heading: &str) -> Option<String> {
+    let target = heading.trim().to_lowercase();
+    let mut capture = false;
+    let mut section = Vec::new();
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let normalized = trimmed.trim_start_matches('#').trim().to_lowercase();
+            if capture {
+                break;
+            }
+            if normalized == target {
+                capture = true;
+                continue;
+            }
+        }
+        if capture {
+            section.push(line);
+        }
+    }
+    let body = section.join("\n").trim().to_string();
+    if body.is_empty() {
+        None
+    } else {
+        Some(body)
+    }
+}
+
+fn extract_markdown_section_any(markdown: &str, headings: &[&str]) -> Option<String> {
+    headings
+        .iter()
+        .find_map(|heading| extract_markdown_section(markdown, heading))
+}
+
+fn mcp_server_name_from_note_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    for server in ["context7", "exa", "fetch", "git", "memory"] {
+        if trimmed.starts_with(&format!("- `{server}`"))
+            || trimmed.starts_with(&format!("- {server}"))
+            || trimmed.starts_with(&format!("| `{server}` |"))
+            || trimmed.starts_with(&format!("| {server} |"))
+        {
+            return Some(server.to_string());
+        }
+    }
+    None
+}
+
+fn normalize_mcp_usage_note(note: &str, selected: &[String]) -> String {
+    let trimmed = note.trim();
+    if trimmed.is_empty() || selected.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let selected: BTreeSet<String> = selected
+        .iter()
+        .map(|item| item.to_ascii_lowercase())
+        .collect();
+    let mut preamble = Vec::new();
+    let mut blocks: Vec<(Option<String>, Vec<String>)> = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_lines: Vec<String> = Vec::new();
+    let mut saw_named_block = false;
+
+    let flush_block = |blocks: &mut Vec<(Option<String>, Vec<String>)>,
+                       current_name: &mut Option<String>,
+                       current_lines: &mut Vec<String>| {
+        if !current_lines.is_empty() {
+            blocks.push((current_name.take(), std::mem::take(current_lines)));
+        }
+    };
+
+    for raw_line in trimmed.lines() {
+        if let Some(server) = mcp_server_name_from_note_line(raw_line) {
+            saw_named_block = true;
+            flush_block(&mut blocks, &mut current_name, &mut current_lines);
+            current_name = Some(server);
+            current_lines.push(raw_line.to_string());
+        } else if current_name.is_some() {
+            current_lines.push(raw_line.to_string());
+        } else {
+            preamble.push(raw_line.to_string());
+        }
+    }
+    flush_block(&mut blocks, &mut current_name, &mut current_lines);
+
+    if !saw_named_block {
+        return trimmed.to_string();
+    }
+
+    let mut kept = Vec::new();
+    for (name, lines) in blocks {
+        match name {
+            Some(name) if selected.contains(&name) => kept.extend(lines),
+            Some(_) => {}
+            None => kept.extend(lines),
+        }
+    }
+
+    if kept.is_empty() {
+        return trimmed.to_string();
+    }
+
+    let mut normalized = Vec::new();
+    normalized.extend(preamble);
+    if !normalized.is_empty() && !kept.is_empty() {
+        normalized.push(String::new());
+    }
+    normalized.extend(kept);
+    normalized.join("\n").trim().to_string()
+}
+
+fn configured_mcp_servers(run_dir: &Path) -> Vec<String> {
+    let mut servers = BTreeSet::new();
+    if let Ok(record) = read_json::<McpProvisionRecord>(&run_dir.join(MCP_PROVISION_RECORD_REF)) {
+        for value in record
+            .configured
+            .into_iter()
+            .chain(record.already_present.into_iter())
+        {
+            if !value.trim().is_empty() {
+                servers.insert(value);
+            }
+        }
+    }
+    servers.into_iter().collect()
+}
+
+fn solver_role_for_stage<'a>(plan: &'a Plan, stage: &str) -> Option<&'a SolverRole> {
+    plan.solver_roles
+        .iter()
+        .find(|item| item.solver_id == stage)
+}
+
+fn selected_mcp_server_names_for_stage_kind(
+    plan: &Plan,
+    stage_key: &str,
+    solver: Option<&SolverRole>,
+) -> Vec<String> {
+    selected_mcp_servers_for_stage(plan, stage_key, solver)
+        .into_iter()
+        .map(|server| server.name.clone())
+        .collect()
+}
+
+fn selected_mcp_server_names_for_stage(plan: &Plan, run_dir: &Path, stage: &str) -> Vec<String> {
+    if matches!(
+        stage,
+        "intake" | "solver" | "review" | "execution" | "verification"
+    ) {
+        return selected_mcp_server_names_for_stage_kind(
+            plan,
+            stage,
+            solver_role_for_stage(plan, stage),
+        );
+    }
+    let kind = match pipeline_stage_kind_for(plan, run_dir, stage) {
+        Ok(kind) => kind,
+        Err(_) => return Vec::new(),
+    };
+    let stage_key = match kind {
+        PipelineStageKind::Intake => "intake",
+        PipelineStageKind::Solver => "solver",
+        PipelineStageKind::Review => "review",
+        PipelineStageKind::Execution => "execution",
+        PipelineStageKind::Verification => "verification",
+    };
+    selected_mcp_server_names_for_stage_kind(plan, stage_key, solver_role_for_stage(plan, stage))
+}
+
+fn prompt_artifact_shows_empty_mcp_assignment(prompt_text: &str) -> bool {
+    prompt_text.contains("\"mcp_servers\": []")
+        || prompt_text.contains("\"mcp_servers\":[]")
+        || prompt_text.contains("Selected MCP servers:\n\n- none")
+        || prompt_text.contains("Selected MCP servers:\r\n\r\n- none")
+}
+
+fn prompt_artifact_selected_mcp_names(prompt_text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for server in ["context7", "exa", "fetch", "git", "memory"] {
+        if prompt_text.contains(&format!("\"{server}\""))
+            && (prompt_text.contains("\"mcp_servers\"")
+                || prompt_text.contains("Selected MCP servers:"))
+        {
+            names.push(server.to_string());
+        }
+    }
+    dedupe_strings(names)
+}
+
+fn mcp_note_server_names(note: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in note.lines() {
+        if let Some(server) = mcp_server_name_from_note_line(line) {
+            names.push(server);
+        }
+    }
+    dedupe_strings(names)
+}
+
+fn analyze_mcp_usage_note(
+    note: &str,
+    selected: &[String],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let lower = note.to_ascii_lowercase();
+    let negative_markers = [
+        "not used",
+        "did not use",
+        "unused",
+        "unavailable",
+        "not available",
+        "skipped",
+        "missing",
+        "не использ",
+        "недоступ",
+        "пропущ",
+    ];
+    let mut declared_used = Vec::new();
+    let mut declared_not_used = Vec::new();
+    let mut observed_mentions = Vec::new();
+    for server in selected {
+        let server_lower = server.to_ascii_lowercase();
+        if lower.contains(&server_lower) {
+            observed_mentions.push(server.clone());
+            let mut negative = false;
+            for raw_line in note.lines() {
+                let line = raw_line.to_ascii_lowercase();
+                if line.contains(&server_lower)
+                    && negative_markers.iter().any(|item| line.contains(item))
+                {
+                    negative = true;
+                    break;
+                }
+            }
+            if negative {
+                declared_not_used.push(server.clone());
+            } else {
+                declared_used.push(server.clone());
+            }
+        }
+    }
+    (declared_used, declared_not_used, observed_mentions)
+}
+
+fn read_mcp_usage_records(run_dir: &Path) -> Vec<McpUsageRecord> {
+    let path = run_dir.join(MCP_USAGE_LOG_REF);
+    let Ok(text) = read_text(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                serde_json::from_str::<McpUsageRecord>(trimmed).ok()
+            }
+        })
+        .collect()
+}
+
+fn persist_stage_mcp_note(run_dir: &Path, stage: &str, note: &str) -> Result<(), String> {
+    if note.trim().is_empty() {
+        return Ok(());
+    }
+    write_text(&stage_mcp_usage_note_path(run_dir, stage), note.trim_end())
+}
+
+fn record_stage_mcp_usage(
+    plan: &Plan,
+    run_dir: &Path,
+    stage: &str,
+    backend: &str,
+    source: &str,
+) -> Result<(), String> {
+    let kind = pipeline_stage_kind_for(plan, run_dir, stage)?;
+    let stage_kind = match kind {
+        PipelineStageKind::Intake => "intake",
+        PipelineStageKind::Solver => "solver",
+        PipelineStageKind::Review => "review",
+        PipelineStageKind::Execution => "execution",
+        PipelineStageKind::Verification => "verification",
+    };
+    let selected = selected_mcp_server_names_for_stage(plan, run_dir, stage);
+    let configured = configured_mcp_servers(run_dir);
+    let available = if selected.is_empty() {
+        configured
+    } else {
+        selected
+            .iter()
+            .filter(|item| configured.iter().any(|configured| configured == *item))
+            .cloned()
+            .collect()
+    };
+    let artifact_path = stage_primary_mcp_artifact_path(plan, run_dir, stage)?;
+    let note_path = stage_mcp_usage_note_path(run_dir, stage);
+    let mut note_md = if note_path.exists() {
+        read_text(&note_path)?
+    } else {
+        String::new()
+    };
+    if note_md.trim().is_empty() {
+        if let Some(path) = artifact_path.as_ref() {
+            if path.exists() {
+                if let Some(section) = extract_markdown_section_any(
+                    &read_text(path)?,
+                    localized_mcp_usage_heading_candidates(),
+                ) {
+                    note_md = section;
+                    persist_stage_mcp_note(run_dir, stage, &note_md)?;
+                }
+            }
+        }
+    }
+    let normalized_note = normalize_mcp_usage_note(&note_md, &selected);
+    if normalized_note != note_md.trim() {
+        note_md = normalized_note;
+        persist_stage_mcp_note(run_dir, stage, &note_md)?;
+    }
+    let (declared_used, declared_not_used, observed_mentions) =
+        analyze_mcp_usage_note(&note_md, &selected);
+    append_jsonl(
+        &run_dir.join(MCP_USAGE_LOG_REF),
+        &McpUsageRecord {
+            recorded_at: iso_timestamp(),
+            stage: stage.to_string(),
+            stage_kind: stage_kind.to_string(),
+            backend: backend.to_string(),
+            source: source.to_string(),
+            selected,
+            available,
+            declared_used,
+            declared_not_used,
+            observed_mentions,
+            note_present: !note_md.trim().is_empty(),
+            artifact_path: artifact_path
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            note_path: if note_path.exists() {
+                note_path.display().to_string()
+            } else {
+                String::new()
+            },
+            note_md: note_md.trim().to_string(),
+        },
+    )
+}
+
+fn render_intake_prompt(ctx: &Context, run_dir: &Path, plan: &Plan) -> String {
+    let agency_root = discover_agency_agents_dir(ctx)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let decomposition_rules_path =
+        run_reference_asset_display_path(ctx, run_dir, DECOMPOSITION_RULES_REF);
+    let role_map_path = run_reference_asset_display_path(ctx, run_dir, ROLE_MAP_REF);
+    let mcp_plan_path = mcp_reference_path(run_dir).display().to_string();
+    let mcp_usage_hints = render_mcp_usage_hints(run_dir, "intake", None, plan);
+    let readiness_label =
+        if default_pipeline_includes_execution(&plan.task_kind, &plan.original_task) {
+            "execution-ready"
+        } else {
+            "downstream-ready"
+        };
     if plan.prompt_format == "compact" {
         return compact_lines(&json!({
             "stage": "intake",
@@ -4131,8 +6605,9 @@ fn render_intake_prompt(run_dir: &Path, plan: &Plan) -> String {
             "read": [
                 run_dir.join("request.md").display().to_string(),
                 run_dir.join("plan.json").display().to_string(),
-                DECOMPOSITION_RULES_REF,
-                ROLE_MAP_REF
+                decomposition_rules_path,
+                role_map_path,
+                mcp_plan_path
             ],
             "write": [
                 run_dir.join("brief.md").display().to_string(),
@@ -4154,6 +6629,8 @@ fn render_intake_prompt(run_dir: &Path, plan: &Plan) -> String {
                 "validation_commands": plan.validation_commands,
                 "workstream_hints": plan.workstream_hints,
                 "goal_checks": plan.goal_checks,
+                "agency_role_catalog_root": agency_root,
+                "mcp": plan.mcp,
             },
             "rules": [
                 "preserve the original requested outcome as the top-level goal",
@@ -4161,9 +6638,15 @@ fn render_intake_prompt(run_dir: &Path, plan: &Plan) -> String {
                 "refine the goal_checks list so it captures critical user-visible capabilities",
                 "follow intake_research_mode when deciding whether to browse before finalizing the brief",
                 "treat host_facts from plan.json as authoritative local execution facts",
+                "consult the local agency role catalog when selecting or changing solver and reviewer roles if it is available",
+                "prefer the provided role map and catalog summary before recursively scanning the local role catalog; open extra role files only when the summary is insufficient",
+                "if the selected MCP servers are available in the current client, use them according to references/mcp-plan.md before falling back to generic browsing",
+                "if the current plan already captures the named artifacts, local run command, stdout contract, and validation shape, synthesize brief.md directly from request.md plus plan.json before exploring",
+                "do not inspect multi-agent-pipeline source files, tests, or SKILL documents unless the user task is specifically about this pipeline",
                 "if cache.policy is reuse, consult and update the research cache before duplicating external research",
                 "do not implement the solution in this stage"
             ],
+            "mcp_usage_hints": mcp_usage_hints,
             "required_brief_sections": [
                 "original requested outcome",
                 "objective",
@@ -4180,10 +6663,12 @@ fn render_intake_prompt(run_dir: &Path, plan: &Plan) -> String {
         }));
     }
     format!(
-        "# Level 1: Intake And Prompt Builder\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n\nProduce or update `brief.md`, `plan.json`, and downstream prompts.\n\nCurrent defaults:\n\n- workspace exists: `{}`\n- task kind: `{}`\n- complexity: `{}`\n- execution mode: `{}`\n- solver count: `{}`\n- user summary language: `{}`\n- intake research mode: `{}`\n- stage research mode: `{}`\n- execution network mode: `{}`\n- cache policy: `{}`\n- cache root: `{}`\n- host facts source: `{}`\n- preferred torch device: `{}`\n- suggested validation:\n{}\n\nInitial goal checks to refine in `plan.json`:\n{}\n\nRules:\n\n- preserve the user's requested outcome as the top-level goal\n- keep the brief execution-ready\n- decompose compound tasks into workstreams instead of shrinking the deliverable\n- update goal checks when critical capabilities are missing\n- treat host_facts in `plan.json` as authoritative local execution facts\n- follow intake_research_mode when deciding whether to browse\n- do not implement the solution in this stage\n",
+        "# Level 1: Intake And Prompt Builder\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n\nProduce or update `brief.md`, `plan.json`, and downstream prompts.\n\nCurrent defaults:\n\n- workspace exists: `{}`\n- task kind: `{}`\n- complexity: `{}`\n- execution mode: `{}`\n- solver count: `{}`\n- user summary language: `{}`\n- intake research mode: `{}`\n- stage research mode: `{}`\n- execution network mode: `{}`\n- cache policy: `{}`\n- cache root: `{}`\n- host facts source: `{}`\n- preferred torch device: `{}`\n- agency role catalog: `{}`\n- suggested validation:\n{}\n\nSelected MCP guidance:\n{}\n\nInitial goal checks to refine in `plan.json`:\n{}\n\nRules:\n\n- preserve the user's requested outcome as the top-level goal\n- keep the brief {}\n- decompose compound tasks into workstreams instead of shrinking the deliverable\n- update goal checks when critical capabilities are missing\n- treat host_facts in `plan.json` as authoritative local execution facts\n- consult the local agency role catalog when selecting or changing solver and reviewer roles if it is available\n- prefer the provided role map and catalog summary before recursively scanning the local role catalog; open extra role files only when the summary is insufficient\n- if the selected MCP servers are available in the current client, use them according to `references/mcp-plan.md` before falling back to generic browsing\n- if the current plan already captures the named artifacts, local run command, stdout contract, and validation shape, synthesize `brief.md` directly from `request.md` plus `plan.json` before exploring\n- do not inspect multi-agent-pipeline source files, tests, or SKILL documents unless the user task is specifically about this pipeline\n- follow intake_research_mode when deciding whether to browse\n- do not implement the solution in this stage\n",
         run_dir.join("request.md").display(),
         run_dir.join("plan.json").display(),
-        ROLE_MAP_REF,
+        decomposition_rules_path,
+        role_map_path,
+        mcp_plan_path,
         plan.workspace_exists,
         plan.task_kind,
         plan.complexity,
@@ -4197,63 +6682,204 @@ fn render_intake_prompt(run_dir: &Path, plan: &Plan) -> String {
         cache_config_from_plan(plan).root,
         plan.host_facts.source,
         plan.host_facts.preferred_torch_device,
+        if agency_root.is_empty() {
+            "not-detected"
+        } else {
+            agency_root.as_str()
+        },
         bullet_list(plan.validation_commands.iter().map(|item| item.as_str())),
-        bullet_list(plan.goal_checks.iter().map(|item| format!("{} {}: {}", if item.critical { "critical" } else { "supporting" }, item.id, item.requirement)).collect::<Vec<_>>().iter().map(|item| item.as_str()))
+        bullet_list(mcp_usage_hints.iter().map(|item| item.as_str())),
+        bullet_list(plan.goal_checks.iter().map(|item| format!("{} {}: {}", if item.critical { "critical" } else { "supporting" }, item.id, item.requirement)).collect::<Vec<_>>().iter().map(|item| item.as_str())),
+        readiness_label
     )
 }
 
-fn render_solver_prompt(run_dir: &Path, plan: &Plan, solver: &SolverRole) -> String {
+fn render_solver_prompt(ctx: &Context, run_dir: &Path, plan: &Plan, solver: &SolverRole) -> String {
     let result_file = run_dir
         .join("solutions")
         .join(&solver.solver_id)
         .join("RESULT.md");
+    let stage_description = pipeline_stage_spec(plan, run_dir, &solver.solver_id)
+        .ok()
+        .map(|spec| spec.description)
+        .unwrap_or_default();
+    let role_docs = load_agency_role_docs(ctx, &[solver.role.clone()]);
+    let focused_workstreams = solver_focus_workstreams(plan, solver);
+    let mcp_plan_path = mcp_reference_path(run_dir).display().to_string();
+    let selected_mcp_servers = effective_solver_mcp_servers(plan, solver);
+    let mcp_usage_hints = render_mcp_usage_hints(run_dir, "solver", Some(solver), plan);
+    let mcp_heading = localized_mcp_usage_heading(&plan.summary_language);
+    let mcp_accountability_rules =
+        render_mcp_accountability_rules(&selected_mcp_servers, &plan.summary_language);
+    let localized_style_rules = localized_user_facing_style_rules(&plan.summary_language);
+    let review_mode = plan.task_kind == "review";
+    let analysis_only = task_is_analysis_only(&plan.original_task);
+    let analysis_mode = prompt_prefers_lightweight_validation_for_stage(plan, run_dir);
+    let validation_hints = non_execution_validation_hints_for_stage(plan, run_dir);
+    let mut rules = vec![
+        "do not read sibling solver outputs".to_string(),
+        "do not modify the primary workspace during solver stage; keep proposed file changes, patch sketches, and exact commands inside the final RESULT artifact".to_string(),
+        "do not edit `agent-runs/.../solutions/<solver>/RESULT.md` directly; compose the final RESULT in memory and return it as your final assistant message so the pipeline can materialize the artifact".to_string(),
+        "finish the RESULT artifact as soon as the solution shape is clear instead of waiting until the end of the stage".to_string(),
+        "your final assistant message must be exactly the final RESULT artifact contents so `logs/<stage>.last.md` captures the same handoff".to_string(),
+        "if an MCP call is cancelled or unavailable, continue without it and still finish the final RESULT artifact in your assistant message".to_string(),
+        "preserve the full requested system as the top-level goal".to_string(),
+        "stay centered on the assigned workstreams and angle so this solution is materially distinct from parallel solvers".to_string(),
+        "treat the resolved role docs listed above as authoritative and avoid scanning unrelated role files unless they are clearly insufficient".to_string(),
+        "if the selected MCP servers are available in the current client, use them according to references/mcp-plan.md".to_string(),
+        "if you narrow scope, record it as phase 1 while keeping the preserved goal explicit".to_string(),
+        "follow stage_research_mode when deciding whether to use web research during problem solving".to_string(),
+        "state validation performed or the exact blocker".to_string(),
+    ];
+    rules.extend(localized_style_rules.clone());
+    if analysis_mode {
+        rules.push(
+            "prefer quick, bounded validation first; avoid long-running model, FreeCAD, or end-to-end runtime commands during solver stage unless a cheap preflight has already justified them".to_string(),
+        );
+        rules.push(
+            "if heavyweight local validation would take minutes or large model startup, record the blocker and leave the expensive probe for verification instead of blocking RESULT.md".to_string(),
+        );
+    }
+    let deliverables: Vec<&str> = if review_mode {
+        rules.insert(
+            2,
+            "treat this as a review-only stage; do not turn the outcome into an implementation plan unless the user explicitly asked for fixes".to_string(),
+        );
+        rules.insert(
+            5,
+            "anchor material findings in concrete file paths and line references when possible"
+                .to_string(),
+        );
+        vec![
+            "scope inspected",
+            "findings with severity and evidence",
+            "regression risks",
+            "test gaps and validation gaps",
+            "validation performed",
+            "open questions or blind spots",
+        ]
+    } else if analysis_only {
+        rules.insert(
+            2,
+            "treat this as an analysis-only stage; do not turn the outcome into an implementation plan unless the user explicitly asked for changes".to_string(),
+        );
+        vec![
+            "scope inspected",
+            "key findings and evidence",
+            "system or contract analysis",
+            "validation performed",
+            "residual gaps and contradictions",
+            "follow-up recommendations",
+        ]
+    } else {
+        vec![
+            "assumptions",
+            "approach",
+            "implementation summary or exact file plan",
+            "goal check coverage",
+            "focus workstream coverage",
+            "validation performed",
+            "unresolved risks",
+        ]
+    };
+    let mut read_paths = vec![
+        run_dir.join("request.md").display().to_string(),
+        run_dir.join("brief.md").display().to_string(),
+        run_dir.join("plan.json").display().to_string(),
+    ];
+    read_paths.extend(
+        role_docs
+            .iter()
+            .map(|doc| doc.full_path.display().to_string()),
+    );
+    read_paths.push(mcp_plan_path.clone());
     if plan.prompt_format == "compact" {
         return compact_lines(&json!({
             "stage": solver.solver_id,
             "mode": "solve",
             "role": solver.role,
             "angle": solver.angle,
-            "read": [
-                run_dir.join("request.md").display().to_string(),
-                run_dir.join("brief.md").display().to_string(),
-                run_dir.join("plan.json").display().to_string(),
-            ],
-            "write": [result_file.display().to_string()],
+            "stage_description": stage_description,
+            "primary_workspace": plan.workspace,
+            "read": read_paths,
+            "write": [],
             "stage_research_mode": plan.stage_research_mode,
-            "rules": [
-                "do not read sibling solver outputs",
-                "preserve the full requested system as the top-level goal",
-                "if you narrow scope, record it as phase 1 while keeping the preserved goal explicit",
-                "follow stage_research_mode when deciding whether to use web research during problem solving",
-                "state validation performed or the exact blocker"
-            ],
-            "deliverables": [
-                "assumptions",
-                "approach",
-                "implementation summary or exact file plan",
-                "goal check coverage",
-                "workstream coverage",
-                "validation performed",
-                "unresolved risks"
-            ],
-            "validation_hints": plan.validation_commands
+            "focus_workstreams": focused_workstreams.iter().map(|hint| json!({
+                "name": hint.name,
+                "goal": hint.goal,
+                "suggested_role": hint.suggested_role,
+            })).collect::<Vec<_>>(),
+            "resolved_role_docs": role_docs.iter().map(|doc| json!({
+                "requested_role": doc.requested_role,
+                "path": doc.full_path.display().to_string(),
+                "title": doc.title,
+                "description": doc.description,
+            })).collect::<Vec<_>>(),
+            "mcp_servers": selected_mcp_servers,
+            "mcp_usage_hints": mcp_usage_hints,
+            "mcp_accountability_rules": mcp_accountability_rules,
+            "rules": rules,
+            "deliverables": deliverables
+                .iter()
+                .copied()
+                .chain([mcp_heading])
+                .collect::<Vec<_>>(),
+            "validation_hints": validation_hints
         }));
     }
     format!(
-        "# Level 2: {}\n\nAssigned role: `{}`\nSolution angle: `{}`\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n\nDo not read sibling solution files.\n\nDeliver:\n\n- write your solution summary to `{}`\n- include assumptions, approach, implementation summary, goal check coverage, validation performed, and unresolved risks\n\nValidation hints:\n{}\n\nStage research mode:\n\n- `{}`\n",
+        "# Level 2: {}\n\nAssigned role: `{}`\nSolution angle: `{}`\n\nStage description:\n\n- {}\n\nPrimary workspace:\n\n- `{}`\n\nFocus workstreams:\n{}\n\nRead:\n\n{}\n\nResolved role docs:\n{}\n\nSelected MCP servers:\n{}\n\nMCP usage hints:\n{}\n\nRules:\n\n{}\n\nDeliver:\n\n- return the final solution artifact for `{}` in your final assistant message; the pipeline will materialize the file\n{}\n\nValidation hints:\n{}\n\nStage research mode:\n\n- `{}`\n",
         solver.solver_id,
         solver.role,
         solver.angle,
-        run_dir.join("request.md").display(),
-        run_dir.join("brief.md").display(),
-        run_dir.join("plan.json").display(),
+        if stage_description.trim().is_empty() {
+            "no explicit stage description; infer the strongest distinct angle from the role, workstreams, and plan"
+        } else {
+            stage_description.trim()
+        },
+        plan.workspace,
+        bullet_list(
+            focused_workstreams
+                .iter()
+                .map(|hint| format!("`{}`: {}", hint.name, hint.goal))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|item| item.as_str())
+        ),
+        bullet_list(read_paths.iter().map(|item| item.as_str())),
+        bullet_list(role_docs.iter().map(|doc| doc.full_path.display().to_string()).collect::<Vec<_>>().iter().map(|item| item.as_str())),
+        bullet_list(
+            if selected_mcp_servers.is_empty() {
+                vec!["none".to_string()]
+            } else {
+                selected_mcp_servers.clone()
+            }
+            .iter()
+            .map(|item| item.as_str())
+        ),
+        bullet_list(mcp_usage_hints.iter().map(|item| item.as_str())),
+        bullet_list(
+            rules
+                .iter()
+                .chain(mcp_accountability_rules.iter())
+                .map(|item| item.as_str())
+        ),
         result_file.display(),
-        bullet_list(plan.validation_commands.iter().map(|item| item.as_str())),
+        bullet_list(
+            deliverables
+                .iter()
+                .map(|item| format!("include {item}"))
+                .chain(std::iter::once(format!("include `{mcp_heading}`")))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|item| item.as_str())
+        ),
+        bullet_list(validation_hints.iter().map(|item| item.as_str())),
         plan.stage_research_mode
     )
 }
 
-fn render_review_prompt(run_dir: &Path, plan: &Plan) -> String {
+fn render_review_prompt(ctx: &Context, run_dir: &Path, plan: &Plan) -> String {
     let solution_files: Vec<String> = solver_ids(plan, run_dir)
         .into_iter()
         .map(|solver| {
@@ -4265,54 +6891,110 @@ fn render_review_prompt(run_dir: &Path, plan: &Plan) -> String {
                 .to_string()
         })
         .collect();
+    let reviewer_stack = if plan.reviewer_stack.is_empty() {
+        default_reviewer_stack_for_plan(plan)
+    } else {
+        plan.reviewer_stack.clone()
+    };
+    let reviewer_docs = load_agency_role_docs(ctx, &reviewer_stack);
+    let review_rubric_path = run_reference_asset_display_path(ctx, run_dir, REVIEW_RUBRIC_REF);
+    let mcp_plan_path = mcp_reference_path(run_dir).display().to_string();
+    let mcp_usage_hints = render_mcp_usage_hints(run_dir, "review", None, plan);
+    let selected_review_mcp = selected_mcp_server_names_for_stage_kind(plan, "review", None);
+    let mcp_heading = localized_mcp_usage_heading(&plan.summary_language);
+    let mcp_accountability_rules =
+        render_mcp_accountability_rules(&selected_review_mcp, &plan.summary_language);
+    let localized_style_rules = localized_user_facing_style_rules(&plan.summary_language);
+    let validation_hints = non_execution_validation_hints_for_stage(plan, run_dir);
+    let mut review_rules = vec![
+        "compare every solution against the brief, not style preference".to_string(),
+        "compare every solution against the plan goal_checks and call out uncovered critical checks".to_string(),
+        "if solver outputs are materially identical, say so explicitly and prefer the one with clearer evidence and execution notes instead of inventing false differentiation".to_string(),
+        "treat the resolved reviewer docs and review rubric as the primary review guidance; avoid opening unrelated role files unless the current stack is clearly insufficient".to_string(),
+        "if the selected MCP servers are available in the current client, use them according to references/mcp-plan.md".to_string(),
+        "follow stage_research_mode when deciding whether to use web research during review".to_string(),
+        "prefer quick, bounded validation first; do not block review on long-running local model or FreeCAD probes when code and test evidence already establish the main findings".to_string(),
+        "scorecard_json must include winner, backup, why, validation_evidence, critical_gaps, and execution_notes".to_string(),
+        "penalize silent scope reduction".to_string(),
+        "treat missing evidence as a penalty".to_string(),
+        "write a short user-facing summary in the requested language".to_string(),
+        "recommend a hybrid only when the parts are clearly compatible".to_string(),
+        format!("include a `## {mcp_heading}` section in review/report.md"),
+        "do not edit `review/report.md`, `review/scorecard.json`, or `review/user-summary.md` directly; compose them in memory and return them only via the tagged fallback bundle so the pipeline can materialize the files".to_string(),
+        format!(
+            "return a final backup bundle using the exact tags `{REVIEW_REPORT_START}`, `{REVIEW_SCORECARD_START}`, and `{REVIEW_USER_SUMMARY_START}` so the pipeline can materialize the review outputs without direct file edits"
+        ),
+    ];
+    review_rules.extend(localized_style_rules.clone());
+    if plan.task_kind == "audit-improve" {
+        review_rules.push(
+            "treat the verification-seeded request as authoritative and keep the review bounded to the named follow-up gap plus preservation of already-green slices".to_string(),
+        );
+        review_rules.push(
+            "prefer the solution that refreshes current facts and closes the follow-up gap with the least reopening of unrelated work".to_string(),
+        );
+    }
     if plan.prompt_format == "compact" {
+        let mut read_paths = vec![
+            run_dir.join("request.md").display().to_string(),
+            run_dir.join("brief.md").display().to_string(),
+            run_dir.join("plan.json").display().to_string(),
+            review_rubric_path,
+            mcp_plan_path,
+        ];
+        read_paths.extend(solution_files.iter().cloned());
         return compact_lines(&json!({
             "stage": "review",
             "mode": "compare",
-            "read": [
-                run_dir.join("request.md").display().to_string(),
-                run_dir.join("brief.md").display().to_string(),
-                run_dir.join("plan.json").display().to_string(),
-                REVIEW_RUBRIC_REF,
-                solution_files,
-            ],
-            "write": [
-                run_dir.join("review").join("report.md").display().to_string(),
-                run_dir.join("review").join("scorecard.json").display().to_string(),
-                run_dir.join("review").join("user-summary.md").display().to_string(),
-            ],
-            "reviewer_stack": if plan.reviewer_stack.is_empty() { reviewer_stack_for(&plan.task_kind) } else { plan.reviewer_stack.clone() },
+            "read": read_paths,
+            "write": [],
+            "reviewer_stack": reviewer_stack,
+            "resolved_reviewer_docs": reviewer_docs.iter().map(|doc| json!({
+                "requested_role": doc.requested_role,
+                "path": doc.full_path.display().to_string(),
+                "title": doc.title,
+                "description": doc.description,
+            })).collect::<Vec<_>>(),
             "user_summary_language": plan.summary_language,
             "stage_research_mode": plan.stage_research_mode,
-            "validation_hints": plan.validation_commands,
-            "rules": [
-                "compare every solution against the brief, not style preference",
-                "compare every solution against the plan goal_checks and call out uncovered critical checks",
-                "follow stage_research_mode when deciding whether to use web research during review",
-                "penalize silent scope reduction",
-                "treat missing evidence as a penalty",
-                "write a short user-facing summary in the requested language",
-                "recommend a hybrid only when the parts are clearly compatible"
-            ]
+            "mcp_usage_hints": mcp_usage_hints,
+            "mcp_accountability_rules": mcp_accountability_rules,
+            "validation_hints": validation_hints,
+            "rules": review_rules,
+            "backup_bundle_format": [
+                REVIEW_REPORT_START,
+                REVIEW_SCORECARD_START,
+                REVIEW_USER_SUMMARY_START,
+            ],
         }));
     }
     format!(
-        "# Level 3: Censor And Reviewer\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n- solver outputs:\n{}\n\nReviewer stack:\n{}\n\nStage research mode:\n\n- `{}`\n\nValidation hints:\n{}\n\nDeliver:\n\n- `review/report.md`\n- `review/scorecard.json`\n- `review/user-summary.md`\n",
+        "# Level 3: Censor And Reviewer\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n- solver outputs:\n{}\n\nReviewer stack:\n{}\n\nResolved reviewer role docs:\n{}\n\nSelected MCP guidance:\n{}\n\nStage research mode:\n\n- `{}`\n\nValidation hints:\n{}\n\nRules:\n\n- compare every solution against the brief and plan goal checks, not style preference\n- if solver outputs are materially identical, say so explicitly and prefer the one with clearer evidence and execution notes instead of inventing false differentiation\n- treat the resolved reviewer docs and review rubric as the primary review guidance; avoid opening unrelated role files unless the current stack is clearly insufficient\n- if the selected MCP servers are available in the current client, use them according to `references/mcp-plan.md`\n- penalize silent scope reduction and missing evidence\n{}\n\nScorecard requirements:\n\n- `winner`: selected solver id or `hybrid`\n- `backup`: second-best solver id when available\n- `why`: short verdict grounded in evidence\n- `validation_evidence`: commands, artifacts, or observations used during review\n- `critical_gaps`: uncovered critical goal checks or blockers\n- `execution_notes`: concrete instructions for execution, including which compatible pieces to combine for a hybrid\n\nDeliver:\n\n- do not edit `review/report.md`, `review/scorecard.json`, or `review/user-summary.md` directly\n- keep user-facing prose in `{}` and localize section headings accordingly\n- return the review outputs only via this exact fallback bundle so the pipeline can materialize the files:\n  - `<<<AGPIPE_REVIEW_REPORT>>>`\n  - report markdown\n  - `<<<AGPIPE_REVIEW_SCORECARD_JSON>>>`\n  - raw JSON object\n  - `<<<AGPIPE_REVIEW_USER_SUMMARY>>>`\n  - user summary markdown\n",
         run_dir.join("request.md").display(),
         run_dir.join("brief.md").display(),
         run_dir.join("plan.json").display(),
-        REVIEW_RUBRIC_REF,
+        run_reference_asset_display_path(ctx, run_dir, REVIEW_RUBRIC_REF),
+        mcp_plan_path,
         bullet_list(solution_files.iter().map(|item| item.as_str())),
-        bullet_list(plan.reviewer_stack.iter().map(|item| item.as_str())),
+        bullet_list(reviewer_stack.iter().map(|item| item.as_str())),
+        bullet_list(reviewer_docs.iter().map(|doc| doc.full_path.display().to_string()).collect::<Vec<_>>().iter().map(|item| item.as_str())),
+        bullet_list(mcp_usage_hints.iter().map(|item| item.as_str())),
         plan.stage_research_mode,
-        bullet_list(plan.validation_commands.iter().map(|item| item.as_str()))
+        bullet_list(validation_hints.iter().map(|item| item.as_str())),
+        bullet_list(
+            review_rules
+                .iter()
+                .map(|item| item.as_str())
+                .chain(mcp_accountability_rules.iter().map(|item| item.as_str()))
+        ),
+        plan.summary_language
     )
 }
 
 fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
     let validation_commands = effective_validation_commands(run_dir, plan, "execution");
     let service_harness_expected =
-        task_looks_like_service(plan) || discover_service_check_spec_path(run_dir).is_some();
+        runtime_harness_expected_for_stage(plan, run_dir, PipelineStageKind::Execution);
     let solution_files: Vec<String> = solver_ids(plan, run_dir)
         .into_iter()
         .map(|solver| {
@@ -4328,10 +7010,26 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
         .ok()
         .flatten()
         .is_some();
+    let mcp_plan_path = mcp_reference_path(run_dir).display().to_string();
+    let mcp_usage_hints = render_mcp_usage_hints(run_dir, "execution", None, plan);
+    let selected_execution_mcp = selected_mcp_server_names_for_stage_kind(plan, "execution", None);
+    let mcp_heading = localized_mcp_usage_heading(&plan.summary_language);
+    let mcp_accountability_rules =
+        render_mcp_accountability_rules(&selected_execution_mcp, &plan.summary_language);
+    let localized_style_rules = localized_user_facing_style_rules(&plan.summary_language);
+    let user_facing_language_section = if localized_style_rules.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\nUser-facing language rules:\n{}\n",
+            bullet_list(localized_style_rules.iter().map(|item| item.as_str()))
+        )
+    };
     let mut read_paths = vec![
         run_dir.join("request.md").display().to_string(),
         run_dir.join("brief.md").display().to_string(),
         run_dir.join("plan.json").display().to_string(),
+        mcp_plan_path.clone(),
     ];
     if review_present {
         read_paths.push(
@@ -4365,6 +7063,7 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
             run_dir.join("request.md").display().to_string(),
             run_dir.join("brief.md").display().to_string(),
             run_dir.join("plan.json").display().to_string(),
+            mcp_plan_path.clone(),
         ];
         if review_present {
             compact_reads.push(
@@ -4417,10 +7116,18 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
                 2,
                 "follow the review recommendation unless local validation forces a narrower implementation".to_string(),
             );
+            rules.insert(
+                3,
+                "treat any workspace edits that predate execution as untrusted proposals until they match the brief, review verdict, and local validation".to_string(),
+            );
         } else {
             rules.insert(
                 2,
                 "there is no review stage in this pipeline, so synthesize the best implementation directly from the brief and solver outputs".to_string(),
+            );
+            rules.insert(
+                3,
+                "treat any incidental workspace edits from earlier stages as proposals, not accepted output, until local validation confirms them".to_string(),
             );
         }
         return compact_lines(&json!({
@@ -4430,10 +7137,13 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
             "read": compact_reads,
             "write": [run_dir.join("execution").join("report.md").display().to_string()],
             "rules": rules,
+            "mcp_usage_hints": mcp_usage_hints,
+            "mcp_accountability_rules": mcp_accountability_rules,
             "deliverables": [
                 "actual workspace changes",
                 "execution summary",
                 "changed files",
+                "MCP Usage",
                 "validation performed",
                 "remaining blockers and next steps"
             ],
@@ -4456,26 +7166,38 @@ fn render_execution_prompt(run_dir: &Path, plan: &Plan) -> String {
     } else {
         "there is no review stage in this pipeline, so synthesize the best implementation directly from the brief and solver outputs"
     };
+    let leakage_rule = if review_present {
+        "treat any workspace edits that predate execution as untrusted proposals until they match the brief, review verdict, and local validation"
+    } else {
+        "treat any incidental workspace edits from earlier stages as proposals, not accepted output, until local validation confirms them"
+    };
     format!(
-        "# Level 4: Execution\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n{}- relevant solver outputs:\n{}\n\nExecution guidance:\n\n- {}\n\nExecution network mode:\n\n- `{}`\n\nStage research mode:\n\n- `{}`\n\nCache:\n\n- policy: `{}`\n- root: `{}`\n\nDeliver:\n\n- actual code or configuration changes in the workspace\n- `execution/report.md`\n\nValidation hints:\n{}\n",
+        "# Level 4: Execution\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n{}- relevant solver outputs:\n{}\n\nExecution guidance:\n\n- {}\n- {}\n\nSelected MCP guidance:\n{}\n\nExecution network mode:\n\n- `{}`\n\nStage research mode:\n\n- `{}`\n\nCache:\n\n- policy: `{}`\n- root: `{}`\n\nMCP accountability:\n{}\n{}\nDeliver:\n\n- actual code or configuration changes in the workspace\n- `execution/report.md`\n- include `{}`\n- keep user-facing prose in `{}` and localize section headings accordingly\n\nValidation hints:\n{}\n",
         run_dir.join("request.md").display(),
         run_dir.join("brief.md").display(),
         run_dir.join("plan.json").display(),
+        mcp_plan_path,
         review_section,
         bullet_list(solution_files.iter().map(|item| item.as_str())),
         review_rule,
+        leakage_rule,
+        bullet_list(mcp_usage_hints.iter().map(|item| item.as_str())),
         plan.execution_network_mode,
         plan.stage_research_mode,
         cache_config_from_plan(plan).policy,
         cache_config_from_plan(plan).root,
+        bullet_list(mcp_accountability_rules.iter().map(|item| item.as_str())),
+        user_facing_language_section,
+        mcp_heading,
+        plan.summary_language,
         bullet_list(validation_commands.iter().map(|item| item.as_str()))
     )
 }
 
-fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
+fn render_verification_prompt(ctx: &Context, run_dir: &Path, plan: &Plan) -> String {
     let validation_commands = effective_validation_commands(run_dir, plan, "verification");
     let service_harness_expected =
-        task_looks_like_service(plan) || discover_service_check_spec_path(run_dir).is_some();
+        runtime_harness_expected_for_stage(plan, run_dir, PipelineStageKind::Verification);
     let review_present = first_stage_id_for_kind(plan, run_dir, PipelineStageKind::Review)
         .ok()
         .flatten()
@@ -4484,11 +7206,22 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
         .ok()
         .flatten()
         .is_some();
+    let verification_rubric_path =
+        run_reference_asset_display_path(ctx, run_dir, VERIFICATION_RUBRIC_REF);
+    let mcp_plan_path = mcp_reference_path(run_dir).display().to_string();
+    let mcp_usage_hints = render_mcp_usage_hints(run_dir, "verification", None, plan);
+    let selected_verification_mcp =
+        selected_mcp_server_names_for_stage_kind(plan, "verification", None);
+    let mcp_heading = localized_mcp_usage_heading(&plan.summary_language);
+    let mcp_accountability_rules =
+        render_mcp_accountability_rules(&selected_verification_mcp, &plan.summary_language);
+    let localized_style_rules = localized_user_facing_style_rules(&plan.summary_language);
     if plan.prompt_format == "compact" {
         let mut reads = vec![
             run_dir.join("request.md").display().to_string(),
             run_dir.join("brief.md").display().to_string(),
             run_dir.join("plan.json").display().to_string(),
+            mcp_plan_path.clone(),
         ];
         if review_present {
             reads.push(
@@ -4522,14 +7255,19 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
                     .to_string(),
             );
         }
-        reads.push(VERIFICATION_RUBRIC_REF.to_string());
+        reads.push(verification_rubric_path.clone());
         let mut rules = vec![
             "act in code-review mode: prioritize bugs, regressions, unsafe behavior, and missing validation".to_string(),
             "run the cheapest relevant checks first and record exact evidence or blockers".to_string(),
             "write findings ordered by severity with file references when possible".to_string(),
+            "call out stale or contradictory artifacts, including workspace changes that appear to have bypassed the intended execution stage".to_string(),
             "verify device choice against host_facts from plan.json when relevant".to_string(),
             "set goal_complete=false when any critical plan goal check remains missing, unverified, or replaced by a placeholder implementation".to_string(),
+            "write `verification/improvement-request.md` and `verification/augmented-task.md` for the NEXT rerun, not as a request to mutate previous run-local files under `agent-runs`".to_string(),
+            "treat previous run artifact paths as evidence references only; when a follow-up needs refreshed run-local narrative, the rerun should write it under its own run directory".to_string(),
+            "only workspace or user-facing deliverables outside `agent-runs` may be updated in place when the follow-up explicitly requires a mirror".to_string(),
             "if there are no meaningful findings, say so explicitly".to_string(),
+            "do not edit `verification/findings.md`, `verification/user-summary.md`, `verification/goal-status.json`, `verification/improvement-request.md`, or `verification/augmented-task.md` directly; compose them in memory and return them only via the tagged fallback bundle so the pipeline can materialize the files".to_string(),
         ];
         if service_harness_expected {
             rules.push(format!(
@@ -4555,22 +7293,34 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
                 2,
                 "start from the review verdict and solver evidence; inspect the workspace only where the recommendation depends on current code state".to_string(),
             );
+            rules.insert(
+                4,
+                "do not report a missing `execution/report.md` as a defect when this run has no execution stage".to_string(),
+            );
         }
+        rules.extend(localized_style_rules.clone());
+        rules.push(format!(
+            "return a final backup bundle using the exact tags `{VERIFICATION_FINDINGS_START}`, `{VERIFICATION_GOAL_STATUS_START}`, `{VERIFICATION_USER_SUMMARY_START}`, `{VERIFICATION_IMPROVEMENT_REQUEST_START}`, and `{VERIFICATION_AUGMENTED_TASK_START}` so the pipeline can materialize the verification outputs without direct file edits"
+        ));
         return compact_lines(&json!({
             "stage": "verification",
             "mode": "audit",
             "read": reads,
-            "write": [
-                run_dir.join("verification").join("findings.md").display().to_string(),
-                run_dir.join("verification").join("user-summary.md").display().to_string(),
-                run_dir.join("verification").join("improvement-request.md").display().to_string(),
-                run_dir.join("verification").join("augmented-task.md").display().to_string(),
-                run_dir.join("verification").join("goal-status.json").display().to_string()
-            ],
+            "write": [],
             "validation_hints": validation_commands,
             "user_summary_language": plan.summary_language,
             "stage_research_mode": plan.stage_research_mode,
-            "rules": rules
+            "mcp_usage_hints": mcp_usage_hints,
+            "mcp_accountability_rules": mcp_accountability_rules,
+            "rules": rules,
+            "backup_bundle_format": [
+                VERIFICATION_FINDINGS_START,
+                VERIFICATION_GOAL_STATUS_START,
+                VERIFICATION_USER_SUMMARY_START,
+                VERIFICATION_IMPROVEMENT_REQUEST_START,
+                VERIFICATION_AUGMENTED_TASK_START
+            ],
+            "user_facing_mcp_heading": mcp_heading,
         }));
     }
     let review_lines = if review_present {
@@ -4592,13 +7342,19 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
         String::new()
     };
     format!(
-        "# Level 5: Verification And Improvement Seed\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n{}{}- `{}`\n\nDeliver:\n\n- `verification/findings.md`\n- `verification/user-summary.md`\n- `verification/goal-status.json`\n- `verification/improvement-request.md`\n- `verification/augmented-task.md`\n\nStage research mode:\n\n- `{}`\n\nValidation hints:\n{}\n",
+        "# Level 5: Verification And Improvement Seed\n\nRead:\n\n- `{}`\n- `{}`\n- `{}`\n- `{}`\n{}{}- `{}`\n\nAudit emphasis:\n\n- prioritize bugs, regressions, unsafe behavior, and missing validation\n- call out stale or contradictory artifacts, including workspace changes that appear to have bypassed the intended execution stage\n- set `goal_complete=false` when any critical goal check remains missing or unverified\n- if this run has no execution stage, do not treat missing `execution/report.md` as a defect by itself\n- write `verification/improvement-request.md` and `verification/augmented-task.md` for the next rerun, not as a request to mutate previous run-local files under `agent-runs`\n- treat previous run artifact paths as evidence references only; when the follow-up needs refreshed run-local narrative, the rerun should write it under its own run directory\n- only workspace or user-facing deliverables outside `agent-runs` may be updated in place when the follow-up explicitly requires a mirror\n\nSelected MCP guidance:\n{}\n\nMCP accountability:\n{}\n\nUser-facing language rules:\n{}\n\nDeliver:\n\n- do not edit `verification/findings.md`, `verification/user-summary.md`, `verification/goal-status.json`, `verification/improvement-request.md`, or `verification/augmented-task.md` directly\n- include `{}` in the findings content\n- keep user-facing prose in `{}` and localize section headings accordingly\n- return the verification outputs only via this exact fallback bundle so the pipeline can materialize the files:\n  - `<<<AGPIPE_VERIFICATION_FINDINGS>>>`\n  - findings markdown\n  - `<<<AGPIPE_VERIFICATION_GOAL_STATUS_JSON>>>`\n  - raw JSON object\n  - `<<<AGPIPE_VERIFICATION_USER_SUMMARY>>>`\n  - user summary markdown\n  - `<<<AGPIPE_VERIFICATION_IMPROVEMENT_REQUEST>>>`\n  - improvement request markdown\n  - `<<<AGPIPE_VERIFICATION_AUGMENTED_TASK>>>`\n  - augmented task markdown\n\nStage research mode:\n\n- `{}`\n\nValidation hints:\n{}\n",
         run_dir.join("request.md").display(),
         run_dir.join("brief.md").display(),
         run_dir.join("plan.json").display(),
+        mcp_plan_path,
         review_lines,
         execution_line,
-        VERIFICATION_RUBRIC_REF,
+        verification_rubric_path,
+        bullet_list(mcp_usage_hints.iter().map(|item| item.as_str())),
+        bullet_list(mcp_accountability_rules.iter().map(|item| item.as_str())),
+        bullet_list(localized_style_rules.iter().map(|item| item.as_str())),
+        mcp_heading,
+        plan.summary_language,
         plan.stage_research_mode,
         bullet_list(validation_commands.iter().map(|item| item.as_str()))
     )
@@ -4606,7 +7362,7 @@ fn render_verification_prompt(run_dir: &Path, plan: &Plan) -> String {
 
 fn ensure_reviewer_stack(plan: &mut Plan) {
     if plan.reviewer_stack.is_empty() {
-        plan.reviewer_stack = reviewer_stack_for(&plan.task_kind);
+        plan.reviewer_stack = default_reviewer_stack_for_plan(plan);
     }
 }
 
@@ -4616,6 +7372,7 @@ fn infer_goal_checks(
     workstream_hints: &[WorkstreamHint],
 ) -> Vec<GoalCheck> {
     let text = task.to_lowercase();
+    let analysis_only = task_is_analysis_only(task);
     let mut checks = Vec::new();
     let mut seen = BTreeSet::new();
     fn add_goal_check(
@@ -4632,6 +7389,109 @@ fn infer_goal_checks(
                 critical,
             });
         }
+    }
+    if task_kind == "review" {
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "review_findings",
+            "produce ordered review findings that prioritize bugs, regressions, unsafe behavior, and broken assumptions by severity",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "evidence_with_file_refs",
+            "support each material finding with concrete evidence, including file paths and line references when possible",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "test_and_validation_gaps",
+            "identify missing tests, weak validation, or risky behavior that remains unverified",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "review_only_scope",
+            "keep the run review-only unless the user explicitly requested fixes or implementation work",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "coverage_of_requested_codebase",
+            "inspect the requested codebase deeply enough to justify the findings and call out any blind spots explicitly",
+            false,
+        );
+        return checks;
+    }
+    if task_kind == "audit-improve" {
+        if [
+            "device_story_reconciled",
+            "device story",
+            "device-story",
+            "mps",
+            "torch",
+            "host probe",
+            "device probe",
+            "cpu fallback",
+        ]
+        .iter()
+        .any(|word| text.contains(word))
+        {
+            add_goal_check(
+                &mut seen,
+                &mut checks,
+                "device_story_reconciled",
+                "reconcile the verification-era device/runtime contradiction with fresh same-basis evidence instead of stale narrative",
+                true,
+            );
+        } else {
+            add_goal_check(
+                &mut seen,
+                &mut checks,
+                "verification_gap_closed",
+                "close the named verification-derived gap with fresh local evidence rather than reopening unrelated work",
+                true,
+            );
+        }
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "current_facts_authoritative",
+            "refresh the authoritative current facts and run-facing narrative so follow-up stages do not rely on stale request, brief, or review artifacts",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "preserve_verified_green_slices",
+            "preserve already-verified green slices unless new local evidence explicitly disproves them",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "bounded_follow_up_scope",
+            "keep the follow-up narrowly scoped to the verification seed and avoid broad reimplementation",
+            true,
+        );
+        if workstream_hints
+            .iter()
+            .any(|hint| hint.name == "artifact-refresh-and-narrative")
+        {
+            add_goal_check(
+                &mut seen,
+                &mut checks,
+                "artifact_refresh",
+                "refresh user-facing narrative artifacts from current evidence only",
+                false,
+            );
+        }
+        return checks;
     }
     if text.contains("telegram") || text.contains("телеграм") {
         add_goal_check(
@@ -4673,24 +7533,25 @@ fn infer_goal_checks(
             true,
         );
     }
-    if [
-        "llm",
-        "llama",
-        "lama",
-        "model",
-        "vision",
-        "analysis",
-        "нейросет",
-        "модель",
-        "дообуч",
-        "обуч",
-    ]
-    .iter()
-    .any(|word| text.contains(word))
+    if !analysis_only
+        && [
+            "llm",
+            "llama",
+            "lama",
+            "model",
+            "vision",
+            "analysis",
+            "нейросет",
+            "модель",
+            "дообуч",
+            "обуч",
+        ]
+        .iter()
+        .any(|word| text.contains(word))
     {
         add_goal_check(&mut seen, &mut checks, "analysis_adapter", "implement or preserve an analysis path that turns the requested inputs into grounded observations or bounded classifications", true);
     }
-    if text.contains("freecad") {
+    if !analysis_only && text.contains("freecad") {
         add_goal_check(
             &mut seen,
             &mut checks,
@@ -4699,16 +7560,60 @@ fn infer_goal_checks(
             true,
         );
     }
-    if matches!(task_kind, "ai" | "backend" | "fullstack")
-        || ["service", "bot", "api", "сервис", "бот", "entrypoint"]
-            .iter()
-            .any(|word| text.contains(word))
+    if !analysis_only
+        && (matches!(task_kind, "ai" | "backend" | "fullstack")
+            || ["service", "bot", "api", "сервис", "бот", "entrypoint"]
+                .iter()
+                .any(|word| text_contains_signal(&text, word)))
     {
         add_goal_check(
             &mut seen,
             &mut checks,
             "runnable_entrypoint",
             "provide a runnable local entrypoint or service path for the implemented slice",
+            true,
+        );
+    }
+    if analysis_only {
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "reproducible_audit_report",
+            "produce a reproducible evidence-driven audit or analysis package grounded in the current repository state",
+            true,
+        );
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "residual_gaps_documented",
+            "document residual gaps, contradictions, and exact follow-up work without silently converting the task into implementation",
+            true,
+        );
+    }
+    if task_requests_cli_entrypoint(task_kind, task) && text_contains_signal(&text, "main.py") {
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "main_py_entrypoint",
+            "place or update the primary runnable entrypoint in `main.py`",
+            true,
+        );
+    }
+    if task_requests_cli_entrypoint(task_kind, task) && task_requests_precise_local_contract(task) {
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "exact_stdout_contract",
+            "match the requested stdout contract exactly for the primary local run path",
+            true,
+        );
+    }
+    if text_contains_signal(&text, "readme") || text_contains_signal(&text, "readme.md") {
+        add_goal_check(
+            &mut seen,
+            &mut checks,
+            "readme_run_command",
+            "document the exact local run command and expected result in README or equivalent developer docs",
             true,
         );
     }
@@ -4763,10 +7668,20 @@ fn create_run(
     });
     let task_kind = infer_task_kind(task_text);
     let complexity = infer_complexity(task_text);
+    let trivial_local_cli =
+        task_is_trivial_local_cli_contract(&task_kind, &complexity, task_text, Some(&workspace));
     let workstream_hints = workstream_hints_for(&task_kind, task_text);
     let execution_mode = infer_execution_mode(&task_kind, &complexity, task_text);
-    let mut solver_count =
-        solver_count_for(&task_kind, &complexity, &execution_mode, &workstream_hints);
+    let mut solver_count = solver_count_for(
+        &task_kind,
+        &complexity,
+        &execution_mode,
+        &workstream_hints,
+        task_text,
+    );
+    if trivial_local_cli {
+        solver_count = 1;
+    }
     if !default_pipeline_includes_execution(&task_kind, task_text) {
         solver_count = solver_count.max(2);
     }
@@ -4774,9 +7689,14 @@ fn create_run(
     let token_budget = infer_token_budget(&complexity);
     let stack_signals = detect_stack(&workspace);
     let host_facts = detect_host_facts("init_run_local_rust");
-    let validation_commands = build_validation_commands(&workspace, &stack_signals);
-    let roles = choose_roles(&task_kind, solver_count);
-    let reviewer_stack = reviewer_stack_for(&task_kind);
+    let mut validation_commands = task_specific_validation_commands(&task_kind, task_text);
+    for command in build_validation_commands(&workspace, &stack_signals) {
+        if !validation_commands.contains(&command) {
+            validation_commands.push(command);
+        }
+    }
+    let roles = choose_roles_with_workstreams(&task_kind, task_text, solver_count, &workstream_hints);
+    let reviewer_stack = reviewer_stack_for_task(&task_kind, &complexity, task_text);
     let run_dir =
         output_dir
             .expanduser()
@@ -4792,6 +7712,7 @@ fn create_run(
         .map_err(|err| format!("Could not create run execution dir: {err}"))?;
     fs::create_dir_all(run_dir.join("verification"))
         .map_err(|err| format!("Could not create run verification dir: {err}"))?;
+    seed_run_reference_assets(ctx, &run_dir)?;
 
     let mut plan = Plan {
         created_at: iso_timestamp(),
@@ -4818,6 +7739,7 @@ fn create_run(
         reviewer_stack,
         stack_signals,
         validation_commands,
+        mcp: McpSelection::default(),
         references: BTreeMap::from([
             ("role_map".to_string(), ROLE_MAP_REF.to_string()),
             (
@@ -4829,9 +7751,11 @@ fn create_run(
                 "verification_rubric".to_string(),
                 VERIFICATION_RUBRIC_REF.to_string(),
             ),
+            ("mcp_plan".to_string(), MCP_PLAN_REF.to_string()),
         ]),
         pipeline: PipelineConfig::default(),
     };
+    ensure_plan_mcp_defaults(&mut plan);
     plan.pipeline =
         load_pipeline_config(&workspace, pipeline_file, &plan)?.unwrap_or_else(|| PipelineConfig {
             source: "default".to_string(),
@@ -4878,22 +7802,26 @@ fn create_run(
     Ok(run_dir)
 }
 
-fn render_stage_prompt(run_dir: &Path, stage: &str) -> Result<String, String> {
+fn render_stage_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, String> {
     let mut plan = load_plan(run_dir)?;
     ensure_reviewer_stack(&mut plan);
     let spec = pipeline_stage_spec(&plan, run_dir, stage)?;
     match pipeline_kind_from_str(&spec.kind) {
-        Some(PipelineStageKind::Intake) => Ok(render_intake_prompt(run_dir, &plan)),
-        Some(PipelineStageKind::Review) => Ok(render_review_prompt(run_dir, &plan)),
+        Some(PipelineStageKind::Intake) => Ok(render_intake_prompt(ctx, run_dir, &plan)),
+        Some(PipelineStageKind::Review) => Ok(render_review_prompt(ctx, run_dir, &plan)),
         Some(PipelineStageKind::Execution) => Ok(render_execution_prompt(run_dir, &plan)),
-        Some(PipelineStageKind::Verification) => Ok(render_verification_prompt(run_dir, &plan)),
+        Some(PipelineStageKind::Verification) => {
+            Ok(render_verification_prompt(ctx, run_dir, &plan))
+        }
         Some(PipelineStageKind::Solver) => Ok(render_solver_prompt(
+            ctx,
             run_dir,
             &plan,
             &SolverRole {
                 solver_id: spec.id,
                 role: spec.role,
                 angle: spec.angle,
+                mcp_servers: Vec::new(),
             },
         )),
         None => Err(format!("Unknown stage: {stage}")),
@@ -4935,6 +7863,16 @@ fn stage_placeholder_content(
     run_dir: &Path,
     stage: &str,
 ) -> Result<Vec<(PathBuf, String)>, String> {
+    let review_summary_placeholder = if language_is_russian(&plan.summary_language) {
+        "# Краткий итог\n\nЛокализованный итог review пока не подготовлен.\n".to_string()
+    } else {
+        "# User Summary\n\nPending localized review summary.\n".to_string()
+    };
+    let verification_summary_placeholder = if language_is_russian(&plan.summary_language) {
+        "# Итог проверки\n\nЛокализованный итог проверки пока не подготовлен.\n".to_string()
+    } else {
+        "# Verification Summary\n\nPending localized verification summary.\n".to_string()
+    };
     let pairs = match pipeline_stage_kind_for(plan, run_dir, stage)? {
         PipelineStageKind::Intake => vec![(
             run_dir.join("brief.md"),
@@ -4951,7 +7889,7 @@ fn stage_placeholder_content(
             ),
             (
                 run_dir.join("review").join("user-summary.md"),
-                "# User Summary\n\nPending localized review summary.\n".to_string(),
+                review_summary_placeholder,
             ),
         ],
         PipelineStageKind::Execution => vec![(
@@ -4966,8 +7904,7 @@ fn stage_placeholder_content(
                 ),
                 (
                     run_dir.join("verification").join("user-summary.md"),
-                    "# Verification Summary\n\nPending localized verification summary.\n"
-                        .to_string(),
+                    verification_summary_placeholder,
                 ),
                 (
                     run_dir.join("verification").join("improvement-request.md"),
@@ -5017,9 +7954,11 @@ fn output_looks_placeholder(stage: &str, text: &str) -> bool {
         "fill this file with the solver output.",
         "pending review stage.",
         "pending localized review summary.",
+        "локализованный итог review пока не подготовлен.",
         "pending execution stage.",
         "pending verification stage.",
         "pending localized verification summary.",
+        "локализованный итог проверки пока не подготовлен.",
         &format!("pending {stage} stage."),
         &format!("pending {stage} stage"),
     ];
@@ -5160,6 +8099,17 @@ fn is_stage_complete(run_dir: &Path, stage: &str) -> Result<bool, String> {
         }
         return Ok(true);
     }
+    if kind == PipelineStageKind::Execution {
+        if runtime_check_required(run_dir, "execution")? {
+            let summary = service_check_summary_json_path(run_dir, "execution");
+            let status = read_json::<Value>(&summary)
+                .ok()
+                .and_then(|value| value.get("status").and_then(|item| item.as_str()).map(str::to_string));
+            if status.as_deref() != Some("passed") {
+                return Ok(false);
+            }
+        }
+    }
     for output in outputs {
         if !output.exists() {
             return Ok(false);
@@ -5181,6 +8131,9 @@ fn available_stages(run_dir: &Path) -> Result<Vec<String>, String> {
 }
 
 fn sync_run_artifacts(ctx: &Context, run_dir: &Path) -> Result<(), String> {
+    // Normalize runtime state transitions like dead pid -> exited before
+    // deriving doctor/status snapshots so UI state stays consistent.
+    let _ = crate::runtime::active_job_state(run_dir);
     check_run_interrupt(run_dir)?;
     let mut plan = load_plan(run_dir)?;
     apply_pipeline_solver_defaults(&mut plan, Some(run_dir))?;
@@ -5194,7 +8147,7 @@ fn sync_run_artifacts(ctx: &Context, run_dir: &Path) -> Result<(), String> {
     for stage in pipeline {
         check_run_interrupt(run_dir)?;
         let prompt_path = stage_prompt_path(run_dir, &stage.id)?;
-        let prompt = render_stage_prompt(run_dir, &stage.id)?;
+        let prompt = render_stage_prompt(ctx, run_dir, &stage.id)?;
         write_text(&prompt_path, &prompt)?;
         for (path, content) in stage_placeholder_content(&plan, run_dir, &stage.id)? {
             check_run_interrupt(run_dir)?;
@@ -5214,7 +8167,6 @@ fn sync_run_artifacts(ctx: &Context, run_dir: &Path) -> Result<(), String> {
         persist_run_backend_config(run_dir, ctx)?;
     }
     save_plan(run_dir, &plan)?;
-    let _ = refresh_cache_index(&cache)?;
     Ok(())
 }
 
@@ -5248,6 +8200,167 @@ fn oldest_mtime(paths: &[PathBuf]) -> Option<SystemTime> {
         .iter()
         .filter_map(|path| path.metadata().ok()?.modified().ok())
         .min()
+}
+
+#[derive(Debug, Clone)]
+struct ActiveStageStall {
+    stage: String,
+    elapsed_secs: u64,
+    idle_secs: u64,
+}
+
+fn active_stage_progress_paths(run_dir: &Path, stage: &str, plan: &Plan) -> Result<Vec<PathBuf>, String> {
+    let mut candidates = vec![
+        run_dir.join("logs").join(format!("{stage}.last.md")),
+        run_dir.join("logs").join(format!("{stage}.stdout.log")),
+        run_dir.join("logs").join(format!("{stage}.stderr.log")),
+    ];
+    match stage {
+        "review" => {
+            candidates.push(run_dir.join("review").join("report.md"));
+            candidates.push(run_dir.join("review").join("user-summary.md"));
+            candidates.push(run_dir.join("review").join("scorecard.json"));
+        }
+        "execution" => {
+            candidates.push(run_dir.join("execution").join("report.md"));
+        }
+        "verification" => {
+            candidates.push(run_dir.join("verification").join("findings.md"));
+            candidates.push(run_dir.join("verification").join("user-summary.md"));
+            candidates.push(run_dir.join("verification").join("goal-status.json"));
+            candidates.push(run_dir.join("verification").join("improvement-request.md"));
+            if plan.augmented_follow_up_enabled {
+                candidates.push(augmented_task_path(run_dir));
+            }
+        }
+        "intake" => {
+            candidates.push(run_dir.join("brief.md"));
+            candidates.push(run_dir.join("plan.json"));
+        }
+        solver if solver.starts_with("solver-") => {
+            candidates.push(run_dir.join("solutions").join(solver).join("RESULT.md"));
+        }
+        "" | "none" | "rerun" => {
+            candidates.push(crate::runtime::process_log_path(run_dir));
+        }
+        _ => {}
+    }
+    Ok(candidates)
+}
+
+fn substantive_stage_progress_mtime(path: &Path, stage: &str) -> Option<SystemTime> {
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    match file_name {
+        "report.md" => {
+            let section = if path.components().any(|component| component.as_os_str() == "review") {
+                "review"
+            } else if path
+                .components()
+                .any(|component| component.as_os_str() == "execution")
+            {
+                "execution"
+            } else {
+                stage
+            };
+            if output_looks_placeholder(section, &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "RESULT.md" => {
+            if output_looks_placeholder(stage, &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "brief.md" => {
+            if output_looks_placeholder("intake", &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "findings.md" => {
+            if output_looks_placeholder("verification", &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "user-summary.md" => {
+            let section = if path
+                .components()
+                .any(|component| component.as_os_str() == "verification")
+            {
+                "verification-summary"
+            } else {
+                "review-summary"
+            };
+            if output_looks_placeholder(section, &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "improvement-request.md" => {
+            if output_looks_placeholder("improvement-request", &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "augmented-task.md" => {
+            if output_looks_placeholder("augmented-task", &read_text(path).ok()?) {
+                return None;
+            }
+        }
+        "scorecard.json" => {
+            if !review_scorecard_complete(path) {
+                return None;
+            }
+        }
+        "goal-status.json" => {
+            if !goal_status_complete(path) {
+                return None;
+            }
+        }
+        _ => {}
+    }
+    path.metadata().ok()?.modified().ok()
+}
+
+fn active_stage_stall(run_dir: &Path) -> Result<Option<ActiveStageStall>, String> {
+    let Some(state) = crate::runtime::active_job_state(run_dir) else {
+        return Ok(None);
+    };
+    let Some(recorded_stage) = state.stage.clone() else {
+        return Ok(None);
+    };
+    let stage = resolve_attempt_stage(run_dir, &state, &recorded_stage)?;
+    if stage.trim().is_empty() || stage == "rerun" {
+        return Ok(None);
+    }
+    if !available_stages(run_dir)?
+        .iter()
+        .any(|candidate| candidate == &stage)
+    {
+        return Ok(None);
+    }
+    let elapsed_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(state.started_at_unix)
+        .saturating_sub(state.started_at_unix);
+    if elapsed_secs < ACTIVE_STAGE_STALL_WARN_SECS {
+        return Ok(None);
+    }
+    let plan = load_plan(run_dir)?;
+    let latest_progress = active_stage_progress_paths(run_dir, &stage, &plan)?
+        .into_iter()
+        .filter_map(|path| substantive_stage_progress_mtime(&path, &stage))
+        .max();
+    let idle_secs = latest_progress
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(elapsed_secs);
+    if idle_secs < ACTIVE_STAGE_STALL_WARN_SECS {
+        return Ok(None);
+    }
+    Ok(Some(ActiveStageStall {
+        stage,
+        elapsed_secs,
+        idle_secs,
+    }))
 }
 
 fn review_is_stale(run_dir: &Path) -> Result<bool, String> {
@@ -5412,10 +8525,17 @@ fn incomplete_stage_attempt(run_dir: &Path) -> Result<Option<RuntimeAttemptPaylo
     let Some(state) = crate::runtime::load_job_state(run_dir) else {
         return Ok(None);
     };
-    let Some(stage) = state.stage.clone() else {
+    if state.label == "doctor fix" && state.status == "completed" && state.exit_code == Some(0) {
+        return Ok(None);
+    }
+    let Some(recorded_stage) = state.stage.clone() else {
         return Ok(None);
     };
+    let stage = resolve_attempt_stage(run_dir, &state, &recorded_stage)?;
     if state.is_active() {
+        return Ok(None);
+    }
+    if should_ignore_completed_single_step_attempt(run_dir, &state, &stage)? {
         return Ok(None);
     }
     if !available_stages(run_dir)?
@@ -5450,7 +8570,90 @@ fn incomplete_stage_attempt(run_dir: &Path) -> Result<Option<RuntimeAttemptPaylo
     }))
 }
 
+fn resolve_attempt_stage(
+    run_dir: &Path,
+    state: &crate::runtime::RuntimeJobState,
+    recorded_stage: &str,
+) -> Result<String, String> {
+    if state.label != "resume" {
+        return Ok(recorded_stage.to_string());
+    }
+    let Some(next) = next_stage_for_run(run_dir)? else {
+        return Ok(recorded_stage.to_string());
+    };
+    if next == "rerun" || next == recorded_stage {
+        return Ok(recorded_stage.to_string());
+    }
+    if available_stages(run_dir)?
+        .iter()
+        .any(|candidate| candidate == &next)
+    {
+        return Ok(next);
+    }
+    Ok(recorded_stage.to_string())
+}
+
+fn should_ignore_completed_single_step_attempt(
+    run_dir: &Path,
+    state: &crate::runtime::RuntimeJobState,
+    recorded_stage: &str,
+) -> Result<bool, String> {
+    if !matches!(state.label.as_str(), "start-next" | "safe-next") {
+        return Ok(false);
+    }
+    if state.status != "completed" || state.exit_code != Some(0) {
+        return Ok(false);
+    }
+    let Some((completed_stage, completed_code)) = last_completed_stage_from_process_log(run_dir)
+    else {
+        return Ok(false);
+    };
+    if completed_code != Some(0) || completed_stage == recorded_stage {
+        return Ok(false);
+    }
+    if next_stage_for_run(run_dir)?.as_deref() != Some(recorded_stage) {
+        return Ok(false);
+    }
+    if stage_direct_successor(run_dir, &completed_stage)?.as_deref() != Some(recorded_stage) {
+        return Ok(false);
+    }
+    Ok(is_stage_complete(run_dir, &completed_stage)?)
+}
+
+fn stage_direct_successor(run_dir: &Path, stage: &str) -> Result<Option<String>, String> {
+    let stages = available_stages(run_dir)?;
+    let Some(index) = stages.iter().position(|candidate| candidate == stage) else {
+        return Ok(None);
+    };
+    Ok(stages.get(index + 1).cloned())
+}
+
+fn last_completed_stage_from_process_log(run_dir: &Path) -> Option<(String, Option<i32>)> {
+    crate::runtime::tail_process_log(run_dir, 200)
+        .into_iter()
+        .rev()
+        .find_map(|line| parse_completed_stage_line(&line))
+}
+
+fn parse_completed_stage_line(line: &str) -> Option<(String, Option<i32>)> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix("Completed ")?;
+    let (stage, tail) = rest.split_once(" with exit code ")?;
+    let code_text: String = tail
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect();
+    if code_text.is_empty() {
+        return None;
+    }
+    let code = code_text.parse::<i32>().ok()?;
+    Some((stage.trim().to_string(), Some(code)))
+}
+
 fn safe_next_action_for_run(run_dir: &Path) -> Result<String, String> {
+    if active_stage_stall(run_dir)?.is_some() {
+        return Ok("interrupt".to_string());
+    }
     let statuses = stage_status_map(run_dir)?;
     let plan = load_plan(run_dir)?;
     let solver_ids = solver_ids(&plan, run_dir);
@@ -5551,6 +8754,7 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
     let backend_config =
         load_run_backend_config(run_dir).unwrap_or_else(|| context_backend_config(ctx));
     let last_attempt = incomplete_stage_attempt(run_dir)?;
+    let active_stall = active_stage_stall(run_dir)?;
 
     if matches!(
         backend_config.stage0_backend.trim().to_lowercase().as_str(),
@@ -5735,6 +8939,33 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
             }),
         }
     }
+    if let Some(stall) = &active_stall {
+        let fix = format!(
+            "Interrupt the current `{}` stage, inspect {}/runtime/process.log and the latest `{}` logs, then retry the stage once the blocker is understood.",
+            stall.stage,
+            run_dir.display(),
+            stall.stage
+        );
+        if stall.idle_secs >= ACTIVE_STAGE_STALL_BROKEN_SECS {
+            issues.push(DoctorIssue {
+                severity: "error".to_string(),
+                message: format!(
+                    "Current stage `{}` appears stuck: no new stage output for {}s while the tracked job is still alive (elapsed {}s).",
+                    stall.stage, stall.idle_secs, stall.elapsed_secs
+                ),
+                fix,
+            });
+        } else {
+            warnings.push(DoctorIssue {
+                severity: "warn".to_string(),
+                message: format!(
+                    "Current stage `{}` has not produced new output for {}s (elapsed {}s) and may be stalled.",
+                    stall.stage, stall.idle_secs, stall.elapsed_secs
+                ),
+                fix,
+            });
+        }
+    }
     let goal = goal_state(run_dir)?;
     if matches!(goal.as_str(), "partial" | "blocked")
         && next_stage_for_run(run_dir)?.as_deref() != Some("rerun")
@@ -5768,6 +8999,65 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
             });
         }
     }
+    let mcp_usage_records = read_mcp_usage_records(run_dir);
+    let mut mcp_stage_mismatches = Vec::new();
+    let mut mcp_stage_unexpected = Vec::new();
+    for stage in available_stages(run_dir)? {
+        let selected = selected_mcp_server_names_for_stage(&plan, run_dir, &stage);
+        let record = mcp_usage_records.iter().find(|item| item.stage == stage);
+        let prompt_path = run_dir.join("logs").join(format!("{stage}.prompt.md"));
+        if !prompt_path.exists() && record.is_none() {
+            continue;
+        }
+        let prompt_text = read_text(&prompt_path).unwrap_or_default();
+        let note_text = record.map(|item| item.note_md.as_str()).unwrap_or("");
+        let empty_prompt_assignment = prompt_artifact_shows_empty_mcp_assignment(&prompt_text);
+        let explicit_none = note_text
+            .to_ascii_lowercase()
+            .contains("no mcp servers were selected");
+        let prompt_selected = prompt_artifact_selected_mcp_names(&prompt_text);
+        let note_selected = mcp_note_server_names(note_text);
+        let expected: BTreeSet<String> = selected.iter().cloned().collect();
+        let observed: BTreeSet<String> = prompt_selected
+            .into_iter()
+            .chain(note_selected.into_iter())
+            .collect();
+        if !selected.is_empty() && (empty_prompt_assignment || explicit_none) {
+            mcp_stage_mismatches.push(stage);
+            continue;
+        }
+        if !expected.is_empty() && !observed.is_empty() {
+            let missing_expected = expected.iter().any(|name| !observed.contains(name));
+            let unexpected_observed = observed.iter().any(|name| !expected.contains(name));
+            if missing_expected || unexpected_observed {
+                mcp_stage_mismatches.push(stage);
+                continue;
+            }
+        }
+        if expected.is_empty() && !observed.is_empty() {
+            mcp_stage_unexpected.push(stage);
+        }
+    }
+    if !mcp_stage_mismatches.is_empty() {
+        warnings.push(DoctorIssue {
+            severity: "warn".to_string(),
+            message: format!(
+                "Selected MCP servers did not propagate cleanly into stage artifacts for: {}.",
+                mcp_stage_mismatches.join(", ")
+            ),
+            fix: "Refresh prompts or rerun the affected stages after regenerating the plan so stage MCP assignments match `references/mcp-plan.md`.".to_string(),
+        });
+    }
+    if !mcp_stage_unexpected.is_empty() {
+        warnings.push(DoctorIssue {
+            severity: "warn".to_string(),
+            message: format!(
+                "Stage artifacts show unexpected MCP assignments that were not selected in the plan for: {}.",
+                mcp_stage_unexpected.join(", ")
+            ),
+            fix: "Restart any stale TUI sessions, refresh prompts, and rerun the affected stages so live stage MCP assignments match `references/mcp-plan.md`.".to_string(),
+        });
+    }
     let health = if !issues.is_empty() {
         "broken"
     } else if !warnings.is_empty() {
@@ -5775,7 +9065,7 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
     } else {
         "healthy"
     };
-    Ok(DoctorPayload {
+    let mut payload = DoctorPayload {
         run_dir: run_dir.display().to_string(),
         health: health.to_string(),
         stages: statuses,
@@ -5785,10 +9075,37 @@ fn doctor_payload(ctx: &Context, run_dir: &Path) -> Result<DoctorPayload, String
         goal,
         next: next_stage_for_run(run_dir)?.unwrap_or_else(|| "none".to_string()),
         safe_next_action: safe_next_action_for_run(run_dir)?,
+        fix_actions: Vec::new(),
         last_attempt,
         issues,
         warnings,
-    })
+    };
+    payload.fix_actions = doctor_fix_actions(&payload);
+    Ok(payload)
+}
+
+fn doctor_fix_actions(report: &DoctorPayload) -> Vec<String> {
+    let mut actions = Vec::new();
+    let late_stage = matches!(report.next.trim(), "execution" | "verification" | "rerun")
+        || report
+            .last_attempt
+            .as_ref()
+            .map(|attempt| matches!(attempt.stage.trim(), "execution" | "verification"))
+            .unwrap_or(false);
+    if late_stage && (report.host_probe.trim() == "missing" || report.host_drift.is_some()) {
+        actions.push("host-probe --refresh".to_string());
+    }
+    let safe = report.safe_next_action.trim();
+    if !safe.is_empty() && safe != "none" {
+        actions.push(safe.to_string());
+    }
+    let mut deduped = Vec::new();
+    for action in actions {
+        if !deduped.contains(&action) {
+            deduped.push(action);
+        }
+    }
+    deduped
 }
 
 fn status_payload(run_dir: &Path) -> Result<StatusPayload, String> {
@@ -5835,7 +9152,7 @@ pub fn load_run_snapshots(
                     next: "none".to_string(),
                     ..StatusPayload::default()
                 };
-                let (preview_label, preview) = preview_text(&run_dir, 2400);
+                let (preview_label, preview) = preview_text(&run_dir, 1600);
                 let (log_title, log_lines) =
                     contextual_log_excerpt(&run_dir, None, Some(&status.next), 12);
                 snapshots.push(RunSnapshot {
@@ -5843,6 +9160,7 @@ pub fn load_run_snapshots(
                     doctor,
                     status,
                     token_summary: RunTokenSummary::default(),
+                    solver_stage_ids: Vec::new(),
                     preview_label,
                     preview,
                     log_title,
@@ -5859,13 +9177,26 @@ pub fn load_run_snapshot(ctx: &Context, run_dir: &Path) -> Result<RunSnapshot, S
     let status = status_report(ctx, run_dir)?;
     let plan = load_plan(run_dir)?;
     let token_summary = summarize_token_ledger(run_dir, &plan)?;
-    let (preview_label, preview) = preview_text(run_dir, 2400);
+    let solver_stage_ids = plan
+        .pipeline
+        .stages
+        .iter()
+        .filter(|stage| {
+            matches!(
+                stage.kind.trim().to_ascii_lowercase().as_str(),
+                "solver" | "research" | "analysis" | "researcher"
+            )
+        })
+        .map(|stage| stage.id.clone())
+        .collect();
+    let (preview_label, preview) = preview_text(run_dir, 1600);
     let (log_title, log_lines) = contextual_log_excerpt(run_dir, None, Some(&status.next), 12);
     Ok(RunSnapshot {
         run_dir: run_dir.to_path_buf(),
         doctor,
         status,
         token_summary,
+        solver_stage_ids,
         preview_label,
         preview,
         log_title,
@@ -5889,32 +9220,16 @@ pub fn next_stage(_ctx: &Context, run_dir: &Path) -> Result<String, String> {
 }
 
 fn discover_agency_agents_dir(ctx: &Context) -> Option<PathBuf> {
-    if let Ok(path) = env::var("AGENCY_AGENTS_DIR") {
-        let candidate = PathBuf::from(path);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    if let Ok(home) = env::var("HOME") {
-        let home_catalog = PathBuf::from(home).join("agency-agents");
-        if home_catalog.exists() {
-            return Some(home_catalog);
-        }
-    }
-    let parent = ctx.repo_root.parent()?;
-    let sibling = parent.parent().unwrap_or(parent).join("agency-agents");
-    if sibling.exists() {
-        Some(sibling)
-    } else {
-        None
-    }
+    discover_agency_agents_dir_for_repo_root(&ctx.repo_root)
 }
 
 fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, String> {
     let plan = load_plan(run_dir)?;
     let stage_kind = pipeline_stage_kind_for(&plan, run_dir, stage)?;
     let workspace = plan_workspace(&plan);
-    let prompt_body = read_text(&stage_prompt_path(run_dir, stage)?)?;
+    let prompt_path = stage_prompt_path(run_dir, stage)?;
+    let prompt_body = render_stage_prompt(ctx, run_dir, stage)?;
+    write_text(&prompt_path, &prompt_body)?;
     let outputs = stage_output_paths(&plan, run_dir, stage)?
         .into_iter()
         .map(|path| format!("- `{}`", path.display()))
@@ -5933,27 +9248,45 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
         ),
         format!("- Cache policy: `{}`", cache_config_from_plan(&plan).policy),
         format!("- Cache root: `{}`", cache_config_from_plan(&plan).root),
-        format!(
-            "- Role map reference: `{}`",
-            ctx.repo_root.join(ROLE_MAP_REF).display()
-        ),
-        format!(
-            "- Review rubric reference: `{}`",
-            ctx.repo_root.join(REVIEW_RUBRIC_REF).display()
-        ),
-        format!(
-            "- Verification rubric reference: `{}`",
-            ctx.repo_root.join(VERIFICATION_RUBRIC_REF).display()
-        ),
     ];
+    match stage_kind {
+        PipelineStageKind::Intake => {
+            guidance.push(format!(
+                "- Decomposition rules reference: `{}`",
+                run_reference_asset_display_path(ctx, run_dir, DECOMPOSITION_RULES_REF)
+            ));
+            guidance.push(format!(
+                "- Role map reference: `{}`",
+                run_reference_asset_display_path(ctx, run_dir, ROLE_MAP_REF)
+            ));
+        }
+        PipelineStageKind::Review => {
+            guidance.push(format!(
+                "- Review rubric reference: `{}`",
+                run_reference_asset_display_path(ctx, run_dir, REVIEW_RUBRIC_REF)
+            ));
+        }
+        PipelineStageKind::Verification => {
+            guidance.push(format!(
+                "- Verification rubric reference: `{}`",
+                run_reference_asset_display_path(ctx, run_dir, VERIFICATION_RUBRIC_REF)
+            ));
+        }
+        PipelineStageKind::Solver | PipelineStageKind::Execution => {}
+    }
     if let Some(agency) = discover_agency_agents_dir(ctx) {
         guidance.push(format!("- Agency role catalog: `{}`", agency.display()));
     }
 
     let mut extra_rules = vec![
-        "- Update the requested artifacts directly on disk.".to_string(),
+        if matches!(stage_kind, PipelineStageKind::Execution | PipelineStageKind::Intake) {
+            "- Update the requested artifacts directly on disk.".to_string()
+        } else {
+            "- Do not edit run-local stage output files directly unless the stage prompt explicitly asks for it; prefer returning the final artifact or tagged bundle in your assistant message so the pipeline can materialize it.".to_string()
+        },
         "- Use the primary workspace for repo inspection when it exists.".to_string(),
         "- If blocked, replace placeholders with a concrete blocker note instead of leaving them unchanged.".to_string(),
+        "- Treat the stage prompt as self-contained; do not open generic workflow `SKILL.md` files, pipeline docs, or unrelated instructions unless they are explicitly listed in the read set or validation hints.".to_string(),
     ];
     if amendments_exist(run_dir) {
         extra_rules.push("- Treat `amendments.md` as the latest authoritative user input when it adds constraints, corrections, or newly clarified expected behavior.".to_string());
@@ -5961,15 +9294,41 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
     if stage_kind == PipelineStageKind::Solver {
         extra_rules.push("- Do not read sibling solver outputs.".to_string());
     }
-    if matches!(
-        stage_kind,
-        PipelineStageKind::Execution | PipelineStageKind::Verification
-    ) {
-        extra_rules.push("- Treat the latest host probe artifact from the launcher as authoritative local runtime evidence for device availability and visible environment keys.".to_string());
+    if stage_kind == PipelineStageKind::Intake {
+        extra_rules.push("- Prefer direct synthesis from `request.md` plus the current `plan.json` defaults before opening extra files.".to_string());
+        extra_rules.push("- Open only the explicitly listed reference assets or workspace files that materially change the brief.".to_string());
+        extra_rules.push("- Do not inspect multi-agent-pipeline source files, tests, or SKILL docs unless the user task is explicitly about this pipeline.".to_string());
+    }
+    if stage_kind == PipelineStageKind::Execution {
+        extra_rules.push("- Treat the latest host probe artifact from the launcher as authoritative local runtime evidence for this execution stage when discussing device availability and visible environment keys.".to_string());
+        extra_rules.push("- When citing that probe in run-facing artifacts, label it as the execution-stage launcher probe with its timestamp; do not describe it as the authoritative probe for the whole run because later stages may refresh the launcher probe.".to_string());
+    }
+    if stage_kind == PipelineStageKind::Verification {
+        extra_rules.push("- Treat the latest host probe artifact from the launcher as the authoritative run-level local runtime evidence for final device availability and visible environment keys.".to_string());
+        extra_rules.push("- If earlier artifacts cite an older stage-local probe and the underlying host facts are unchanged, do not fail the run for timestamp drift alone; only flag it when the artifact claims final or run-global authority, or when the facts materially differ.".to_string());
     }
 
     let mut dynamic_context = Vec::new();
-    if !plan.goal_checks.is_empty() {
+    let audit_improve_focus = plan.task_kind == "audit-improve"
+        && matches!(
+            stage_kind,
+            PipelineStageKind::Intake | PipelineStageKind::Solver | PipelineStageKind::Review
+        );
+    if audit_improve_focus {
+        dynamic_context.push("Audit-improve focus for this stage:".to_string());
+        dynamic_context.push(
+            "- Use the verification-seeded request as the authoritative target for the specific follow-up gap.".to_string(),
+        );
+        dynamic_context.push(
+            "- Preserve already-green slices unless new local evidence contradicts them.".to_string(),
+        );
+        dynamic_context.push(
+            "- Treat older implementation-oriented checks from the source run as historical context, not the primary target of this follow-up stage.".to_string(),
+        );
+        dynamic_context.push(
+            "- Keep the work narrow enough to refresh current facts and close the named gap without reopening unrelated work.".to_string(),
+        );
+    } else if !plan.goal_checks.is_empty() {
         dynamic_context.push("Goal checks from current plan:".to_string());
         dynamic_context.extend(plan.goal_checks.iter().map(|item| {
             format!(
@@ -6052,7 +9411,9 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
             dynamic_context.push(format!("- `host_drift`: {drift}"));
         }
     }
-    if task_looks_like_service(&plan) || discover_service_check_spec_path(run_dir).is_some() {
+    let include_runtime_harness =
+        runtime_harness_expected_for_stage(&plan, run_dir, stage_kind);
+    if include_runtime_harness {
         let spec_path = discover_service_check_spec_path(run_dir)
             .unwrap_or_else(|| service_check_default_spec_path(&plan, run_dir));
         dynamic_context.push("Runtime harness:".to_string());
@@ -6095,6 +9456,22 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
                 "- Solver angle from current plan: `{}`",
                 spec.angle
             ));
+            let role_docs = load_agency_role_docs(ctx, &[spec.role.clone()]);
+            if !role_docs.is_empty() {
+                dynamic_context.push("Resolved solver role docs:".to_string());
+                dynamic_context.extend(role_docs.into_iter().map(|doc| {
+                    format!(
+                        "- `{}`: `{}` ({})",
+                        doc.requested_role,
+                        doc.full_path.display(),
+                        if doc.description.is_empty() {
+                            "no description".to_string()
+                        } else {
+                            doc.description
+                        }
+                    )
+                }));
+            }
         }
     }
     if stage_kind == PipelineStageKind::Review {
@@ -6112,6 +9489,27 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
         if !outputs.is_empty() {
             dynamic_context.push("Current solver outputs from plan:".to_string());
             dynamic_context.extend(outputs.into_iter().map(|path| format!("- `{path}`")));
+        }
+        let reviewer_roles = if plan.reviewer_stack.is_empty() {
+            default_reviewer_stack_for_plan(&plan)
+        } else {
+            plan.reviewer_stack.clone()
+        };
+        let reviewer_docs = load_agency_role_docs(ctx, &reviewer_roles);
+        if !reviewer_docs.is_empty() {
+            dynamic_context.push("Resolved reviewer role docs:".to_string());
+            dynamic_context.extend(reviewer_docs.into_iter().map(|doc| {
+                format!(
+                    "- `{}`: `{}` ({})",
+                    doc.requested_role,
+                    doc.full_path.display(),
+                    if doc.description.is_empty() {
+                        "no description".to_string()
+                    } else {
+                        doc.description
+                    }
+                )
+            }));
         }
     }
     if stage_kind == PipelineStageKind::Execution {
@@ -6177,7 +9575,7 @@ fn compile_prompt(ctx: &Context, run_dir: &Path, stage: &str) -> Result<String, 
     }
 
     Ok(format!(
-        "You are executing stage `{}` of a multi-agent pipeline.\n\nExecution context:\n{}\n\n{}Required output files:\n{}\n\nGlobal rules:\n{}\n\nStage prompt:\n\n{}\n",
+        "You are executing workflow stage `{}` for a file-based run.\n\nExecution context:\n{}\n\n{}Required output files:\n{}\n\nGlobal rules:\n{}\n\nStage prompt:\n\n{}\n",
         stage,
         guidance.join("\n"),
         if dynamic_context.is_empty() { String::new() } else { format!("Dynamic stage context:\n{}\n\n", dynamic_context.join("\n")) },
@@ -6205,6 +9603,99 @@ fn detect_local_template(plan: &Plan) -> Option<LocalTemplateKind> {
     }
 }
 
+fn detect_local_intake_template(
+    plan: &Plan,
+    stage_kind: PipelineStageKind,
+) -> Option<LocalTemplateKind> {
+    if stage_kind != PipelineStageKind::Intake {
+        return None;
+    }
+    if plan.task_kind != "backend" {
+        return None;
+    }
+    if !task_requests_cli_entrypoint(&plan.task_kind, &plan.original_task) {
+        return None;
+    }
+    if !task_requests_precise_local_contract(&plan.original_task) {
+        return None;
+    }
+    if !stack_signals_are_empty(&plan.stack_signals) {
+        return None;
+    }
+    if !workspace_looks_greenfield(&plan_workspace(plan)) {
+        return None;
+    }
+    Some(LocalTemplateKind::ExecutionReadyBackendCliIntake)
+}
+
+fn local_cli_artifact_summary(task: &str) -> Vec<String> {
+    let text = task.to_lowercase();
+    let mut items = Vec::new();
+    if text_contains_signal(&text, "main.py") {
+        items.push("`main.py` as the primary runnable entrypoint".to_string());
+    }
+    if task_requests_readme(task) {
+        items.push("`README.md` with the exact local run command and expected result".to_string());
+    }
+    if items.is_empty() {
+        items.push(
+            "a local runnable CLI or script entrypoint plus concise run documentation".to_string(),
+        );
+    }
+    items
+}
+
+fn render_execution_ready_backend_cli_brief(plan: &Plan) -> String {
+    let workspace = plan_workspace(plan);
+    let workstreams: Vec<String> = if plan.workstream_hints.is_empty() {
+        vec!["implement the requested local entrypoint and lock the local run contract".to_string()]
+    } else {
+        plan.workstream_hints
+            .iter()
+            .map(|hint| format!("`{}`: {}", hint.name, hint.goal))
+            .collect()
+    };
+    let deliverables = local_cli_artifact_summary(&plan.original_task);
+    let goal_matrix: Vec<String> = if plan.goal_checks.is_empty() {
+        vec!["capture the requested runnable behavior in a verifiable local artifact".to_string()]
+    } else {
+        plan.goal_checks
+            .iter()
+            .map(|item| {
+                format!(
+                    "`{}` `{}`: {}",
+                    if item.critical {
+                        "critical"
+                    } else {
+                        "supporting"
+                    },
+                    item.id,
+                    item.requirement
+                )
+            })
+            .collect()
+    };
+    let done_checks: Vec<String> = if plan.goal_checks.is_empty() {
+        vec!["the requested local CLI behavior is implemented and documented".to_string()]
+    } else {
+        plan.goal_checks
+            .iter()
+            .filter(|item| item.critical)
+            .map(|item| item.requirement.clone())
+            .collect()
+    };
+    format!(
+        "# Brief\n\n## Original requested outcome\n{}\n\n## Objective\nImplement the requested local CLI or script behavior in the primary workspace without narrowing the named artifacts or run/output contract.\n\n## Deliverable\n{}\n\n## Goal coverage matrix\n{}\n\n## Workstream decomposition\n{}\n\n## Scope\n- primary workspace: `{}`\n- operate as a local backend CLI/script task\n- preserve any explicitly named artifact paths and commands from the request\n\n## Constraints\n- do not silently narrow the requested deliverable\n- keep the primary local run path deterministic when exact stdout is requested\n- preserve the exact local run command and output contract in the implementation and docs\n\n## Definition of done\n{}\n\n## Validation expectations\n{}\n",
+        plan.original_task.trim(),
+        bullet_list(deliverables.iter().map(|item| item.as_str())),
+        bullet_list(goal_matrix.iter().map(|item| item.as_str())),
+        bullet_list(workstreams.iter().map(|item| item.as_str())),
+        workspace.display(),
+        bullet_list(done_checks.iter().map(|item| item.as_str())),
+        bullet_list(plan.validation_commands.iter().map(|item| item.as_str()))
+    )
+}
+
 fn stage_backend_kind(
     ctx: &Context,
     run_dir: &Path,
@@ -6212,6 +9703,9 @@ fn stage_backend_kind(
 ) -> Result<StageBackendKind, String> {
     let plan = load_plan(run_dir)?;
     let kind = pipeline_stage_kind_for(&plan, run_dir, stage)?;
+    if let Some(template) = detect_local_intake_template(&plan, kind) {
+        return Ok(StageBackendKind::LocalTemplate(template));
+    }
     if let Some(template) = detect_local_template(&plan) {
         return Ok(StageBackendKind::LocalTemplate(template));
     }
@@ -6255,6 +9749,43 @@ fn read_reference_asset(ctx: &Context, relative: &str) -> Result<String, String>
     }
 }
 
+fn reference_asset_display_path(ctx: &Context, relative: &str) -> String {
+    let path = ctx.repo_root.join(relative);
+    if path.exists() {
+        path.display().to_string()
+    } else {
+        relative.to_string()
+    }
+}
+
+fn run_reference_asset_path(run_dir: &Path, relative: &str) -> PathBuf {
+    let file_name = Path::new(relative)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(relative);
+    run_dir.join("references").join(file_name)
+}
+
+fn run_reference_asset_display_path(ctx: &Context, run_dir: &Path, relative: &str) -> String {
+    let run_local = run_reference_asset_path(run_dir, relative);
+    if run_local.exists() {
+        run_local.display().to_string()
+    } else {
+        reference_asset_display_path(ctx, relative)
+    }
+}
+
+fn seed_run_reference_assets(ctx: &Context, run_dir: &Path) -> Result<(), String> {
+    let references_dir = run_dir.join("references");
+    fs::create_dir_all(&references_dir)
+        .map_err(|err| format!("Could not create {}: {err}", references_dir.display()))?;
+    for relative in REFERENCE_ASSET_RELS {
+        let asset = read_reference_asset(ctx, relative)?;
+        write_text(&run_reference_asset_path(run_dir, relative), &asset)?;
+    }
+    Ok(())
+}
+
 fn stage_context_documents(
     ctx: &Context,
     run_dir: &Path,
@@ -6269,10 +9800,7 @@ fn stage_context_documents(
                 "request.md".to_string(),
                 read_text(&run_dir.join("request.md"))?,
             ));
-            docs.push((
-                "plan.json".to_string(),
-                read_text(&run_dir.join("plan.json"))?,
-            ));
+            docs.push(("plan.json".to_string(), read_plan_artifact_text(run_dir)?));
             if amendments_exist(run_dir) {
                 docs.push((
                     "amendments.md".to_string(),
@@ -6287,6 +9815,9 @@ fn stage_context_documents(
                 "agency-role-map.md".to_string(),
                 read_reference_asset(ctx, ROLE_MAP_REF)?,
             ));
+            if let Some(catalog) = agency_role_catalog_summary(ctx) {
+                docs.push(("agency-role-catalog.md".to_string(), catalog));
+            }
         }
         PipelineStageKind::Solver => {
             docs.push((
@@ -6297,10 +9828,12 @@ fn stage_context_documents(
                 "brief.md".to_string(),
                 read_text(&run_dir.join("brief.md"))?,
             ));
-            docs.push((
-                "plan.json".to_string(),
-                read_text(&run_dir.join("plan.json"))?,
-            ));
+            docs.push(("plan.json".to_string(), read_plan_artifact_text(run_dir)?));
+            if let Ok(spec) = pipeline_stage_spec(&plan, run_dir, stage) {
+                for doc in load_agency_role_docs(ctx, &[spec.role]) {
+                    docs.push((format!("agency-role/{}", doc.relative_path), doc.content));
+                }
+            }
         }
         PipelineStageKind::Review => {
             docs.push((
@@ -6311,10 +9844,7 @@ fn stage_context_documents(
                 "brief.md".to_string(),
                 read_text(&run_dir.join("brief.md"))?,
             ));
-            docs.push((
-                "plan.json".to_string(),
-                read_text(&run_dir.join("plan.json"))?,
-            ));
+            docs.push(("plan.json".to_string(), read_plan_artifact_text(run_dir)?));
             docs.push((
                 "review-rubric.md".to_string(),
                 read_reference_asset(ctx, REVIEW_RUBRIC_REF)?,
@@ -6324,6 +9854,14 @@ fn stage_context_documents(
                     format!("solutions/{solver}/RESULT.md"),
                     read_text(&run_dir.join("solutions").join(&solver).join("RESULT.md"))?,
                 ));
+            }
+            let reviewer_roles = if plan.reviewer_stack.is_empty() {
+                default_reviewer_stack_for_plan(&plan)
+            } else {
+                plan.reviewer_stack.clone()
+            };
+            for doc in load_agency_role_docs(ctx, &reviewer_roles) {
+                docs.push((format!("agency-role/{}", doc.relative_path), doc.content));
             }
         }
         PipelineStageKind::Execution => {
@@ -6335,10 +9873,7 @@ fn stage_context_documents(
                 "brief.md".to_string(),
                 read_text(&run_dir.join("brief.md"))?,
             ));
-            docs.push((
-                "plan.json".to_string(),
-                read_text(&run_dir.join("plan.json"))?,
-            ));
+            docs.push(("plan.json".to_string(), read_plan_artifact_text(run_dir)?));
             if first_stage_id_for_kind(&plan, run_dir, PipelineStageKind::Review)?.is_some() {
                 docs.push((
                     "review/report.md".to_string(),
@@ -6379,10 +9914,7 @@ fn stage_context_documents(
                 "brief.md".to_string(),
                 read_text(&run_dir.join("brief.md"))?,
             ));
-            docs.push((
-                "plan.json".to_string(),
-                read_text(&run_dir.join("plan.json"))?,
-            ));
+            docs.push(("plan.json".to_string(), read_plan_artifact_text(run_dir)?));
             docs.extend(verification_workspace_documents(&working_root(
                 &plan, run_dir,
             ))?);
@@ -6428,6 +9960,10 @@ fn stage_context_documents(
             ));
         }
     }
+    let mcp_plan = mcp_reference_path(run_dir);
+    if mcp_plan.exists() {
+        docs.push(("mcp-plan.md".to_string(), read_text(&mcp_plan)?));
+    }
     Ok(docs)
 }
 
@@ -6450,11 +9986,7 @@ fn verification_workspace_documents(
         ],
     )?;
     let mut candidates: Vec<PathBuf> = files.into_iter().filter(|path| path.is_file()).collect();
-    candidates.sort_by(|left, right| {
-        file_mtime(right)
-            .cmp(&file_mtime(left))
-            .then_with(|| left.cmp(right))
-    });
+    candidates.sort_by_cached_key(|path| (std::cmp::Reverse(file_mtime(path)), path.clone()));
     let selected: Vec<PathBuf> = candidates
         .iter()
         .filter_map(|path| {
@@ -6541,34 +10073,37 @@ fn responses_text_format_for_label(label: &str) -> Option<ResponseTextFormat> {
         "intake" => json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["brief_md", "plan_json"],
+            "required": ["brief_md", "plan_json", "mcp_usage_md"],
             "properties": {
                 "brief_md": {"type": "string"},
                 "plan_json": {
                     "type": "object",
                     "additionalProperties": true
-                }
+                },
+                "mcp_usage_md": {"type": "string"}
             }
         }),
         value if value == "solver" || value.starts_with("solver-") => json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["result_md"],
+            "required": ["result_md", "mcp_usage_md"],
             "properties": {
-                "result_md": {"type": "string"}
+                "result_md": {"type": "string"},
+                "mcp_usage_md": {"type": "string"}
             }
         }),
         "review" => json!({
             "type": "object",
             "additionalProperties": false,
-            "required": ["report_md", "scorecard_json", "user_summary_md"],
+            "required": ["report_md", "scorecard_json", "user_summary_md", "mcp_usage_md"],
             "properties": {
                 "report_md": {"type": "string"},
                 "scorecard_json": {
                     "type": "object",
                     "additionalProperties": true
                 },
-                "user_summary_md": {"type": "string"}
+                "user_summary_md": {"type": "string"},
+                "mcp_usage_md": {"type": "string"}
             }
         }),
         "verification" => json!({
@@ -6579,7 +10114,8 @@ fn responses_text_format_for_label(label: &str) -> Option<ResponseTextFormat> {
                 "user_summary_md",
                 "improvement_request_md",
                 "augmented_task_md",
-                "goal_status_json"
+                "goal_status_json",
+                "mcp_usage_md"
             ],
             "properties": {
                 "findings_md": {"type": "string"},
@@ -6589,13 +10125,14 @@ fn responses_text_format_for_label(label: &str) -> Option<ResponseTextFormat> {
                 "goal_status_json": {
                     "type": "object",
                     "additionalProperties": true
-                }
+                },
+                "mcp_usage_md": {"type": "string"}
             }
         }),
         _ => return None,
     };
     Some(ResponseTextFormat {
-        name: format!("agpipe_{}_v1", slugify(label)),
+        name: format!("agpipe_{}_v2", slugify(label)),
         schema,
     })
 }
@@ -6653,18 +10190,20 @@ fn build_responses_stage_prompt(
     let docs = stage_context_documents(ctx, run_dir, stage)?;
     let rendered_docs = render_responses_context_documents(docs);
     let schema_guidance = match stage_kind {
-        PipelineStageKind::Intake => "Return the complete intake payload through the configured structured output schema.\n\nRules:\n- keep `plan_json` compatible with the existing agpipe Plan schema\n- preserve cache config, host facts, and existing defaults unless the prompt gives a clear reason to change them\n- make sure `summary_language`, `stage_research_mode`, `execution_network_mode`, `goal_checks`, `solver_roles`, and `pipeline` remain coherent".to_string(),
-        PipelineStageKind::Solver => "Return the complete solver payload through the configured structured output schema.\n\nRules:\n- include assumptions, approach, implementation plan, validation, and unresolved risks\n- keep the full requested goal explicit".to_string(),
+        PipelineStageKind::Intake => "Return the complete intake payload through the configured structured output schema.\n\nRules:\n- keep `plan_json` compatible with the existing agpipe Plan schema\n- preserve cache config, host facts, and existing defaults unless the prompt gives a clear reason to change them\n- make sure `summary_language`, `stage_research_mode`, `execution_network_mode`, `goal_checks`, `solver_roles`, and `pipeline` remain coherent\n- set `mcp_usage_md` to a short markdown note covering which selected MCP servers were used, not used, or unavailable".to_string(),
+        PipelineStageKind::Solver => "Return the complete solver payload through the configured structured output schema.\n\nRules:\n- include assumptions, approach, implementation plan, validation, and unresolved risks\n- keep the full requested goal explicit\n- do not modify the primary workspace in solver stage; describe proposed file-level changes in `result_md`\n- stay centered on the assigned workstream or angle instead of repeating other solvers\n- set `mcp_usage_md` to a short markdown note covering which selected MCP servers were used, not used, or unavailable".to_string(),
         PipelineStageKind::Review => format!(
-            "Return the complete review payload through the configured structured output schema.\n\nRules:\n- choose a winner or explicit hybrid in `scorecard_json`\n- include enough structure in `scorecard_json` for downstream execution\n- write `user_summary_md` in {}",
-            plan.summary_language
+            "Return the complete review payload through the configured structured output schema.\n\nRules:\n- choose a winner or explicit hybrid in `scorecard_json`\n- include `winner`, `backup`, `why`, `validation_evidence`, `critical_gaps`, and `execution_notes` in `scorecard_json`\n- if solver outputs are materially identical, say so explicitly and prefer the one with clearer evidence instead of inventing a hybrid\n- set `mcp_usage_md` to a short markdown note covering which selected MCP servers were used, not used, or unavailable\n- write `user_summary_md` in {}\n- {}",
+            plan.summary_language,
+            localized_user_facing_style_note(&plan.summary_language)
         ),
         PipelineStageKind::Execution => {
             return Err("Responses backend is not implemented for execution stages.".to_string())
         }
         PipelineStageKind::Verification => format!(
-            "Return the complete verification payload through the configured structured output schema.\n\nRules:\n- set `goal_status_json.goal_complete=false` when any critical goal check is missing or unverified\n- include `goal_verdict`, `rerun_recommended`, and `recommended_next_action` in `goal_status_json`\n- write `user_summary_md` in {}",
-            plan.summary_language
+            "Return the complete verification payload through the configured structured output schema.\n\nRules:\n- set `goal_status_json.goal_complete=false` when any critical goal check is missing or unverified\n- include `goal_verdict`, `rerun_recommended`, and `recommended_next_action` in `goal_status_json`\n- call out stale or contradictory artifacts, including workspace changes that bypassed the intended execution path\n- set `mcp_usage_md` to a short markdown note covering which selected MCP servers were used, not used, or unavailable\n- write `user_summary_md` in {}\n- {}",
+            plan.summary_language,
+            localized_user_facing_style_note(&plan.summary_language)
         ),
     };
     Ok(format!(
@@ -6681,33 +10220,43 @@ fn write_responses_stage_outputs(
     match pipeline_stage_kind_for(plan, run_dir, stage)? {
         PipelineStageKind::Intake => {
             let payload: ResponsesIntakePayload = parse_structured_json_output(raw_output)?;
-            if payload.brief_md.trim().is_empty() {
-                return Err("Responses intake output is missing `brief_md`.".to_string());
+            if payload.brief_md.trim().is_empty() || payload.mcp_usage_md.trim().is_empty() {
+                return Err(
+                    "Responses intake output is missing `brief_md` or `mcp_usage_md`.".to_string(),
+                );
             }
-            let plan: Plan = serde_json::from_value(payload.plan_json)
+            let mut plan: Plan = serde_json::from_value(payload.plan_json)
                 .map_err(|err| format!("Could not parse intake `plan_json`: {err}"))?;
+            ensure_plan_mcp_defaults(&mut plan);
+            ensure_reviewer_stack(&mut plan);
             write_text(&run_dir.join("brief.md"), payload.brief_md.trim_end())?;
+            persist_stage_mcp_note(run_dir, stage, &payload.mcp_usage_md)?;
             save_plan(run_dir, &plan)?;
         }
         PipelineStageKind::Solver => {
             let payload: ResponsesSolverPayload = parse_structured_json_output(raw_output)?;
-            if payload.result_md.trim().is_empty() {
+            if payload.result_md.trim().is_empty() || payload.mcp_usage_md.trim().is_empty() {
                 return Err(format!(
-                    "Responses output for `{stage}` is missing `result_md`."
+                    "Responses output for `{stage}` is missing `result_md` or `mcp_usage_md`."
                 ));
             }
             write_text(
                 &run_dir.join("solutions").join(stage).join("RESULT.md"),
                 payload.result_md.trim_end(),
             )?;
+            persist_stage_mcp_note(run_dir, stage, &payload.mcp_usage_md)?;
         }
         PipelineStageKind::Review => {
             let payload: ResponsesReviewPayload = parse_structured_json_output(raw_output)?;
             if payload.report_md.trim().is_empty()
                 || payload.user_summary_md.trim().is_empty()
+                || payload.mcp_usage_md.trim().is_empty()
                 || !payload.scorecard_json.is_object()
             {
-                return Err("Responses review output is missing required fields.".to_string());
+                return Err(
+                    "Responses review output is missing required fields including `mcp_usage_md`."
+                        .to_string(),
+                );
             }
             write_text(
                 &run_dir.join("review").join("report.md"),
@@ -6721,6 +10270,7 @@ fn write_responses_stage_outputs(
                 &run_dir.join("review").join("user-summary.md"),
                 payload.user_summary_md.trim_end(),
             )?;
+            persist_stage_mcp_note(run_dir, stage, &payload.mcp_usage_md)?;
         }
         PipelineStageKind::Execution => {
             return Err("Responses backend does not persist execution stages.".to_string())
@@ -6730,9 +10280,10 @@ fn write_responses_stage_outputs(
             if payload.findings_md.trim().is_empty()
                 || payload.user_summary_md.trim().is_empty()
                 || payload.improvement_request_md.trim().is_empty()
+                || payload.mcp_usage_md.trim().is_empty()
             {
                 return Err(
-                    "Responses verification output is missing required markdown fields."
+                    "Responses verification output is missing required markdown fields including `mcp_usage_md`."
                         .to_string(),
                 );
             }
@@ -6760,6 +10311,7 @@ fn write_responses_stage_outputs(
                     &payload.goal_status_json,
                 )?;
             }
+            persist_stage_mcp_note(run_dir, stage, &payload.mcp_usage_md)?;
         }
     }
     Ok(())
@@ -6823,6 +10375,11 @@ fn sanitize_artifact_label(value: &str) -> String {
 }
 
 fn task_looks_like_service(plan: &Plan) -> bool {
+    if task_is_analysis_only(&plan.original_task)
+        && !task_requests_workspace_changes(&plan.original_task)
+    {
+        return false;
+    }
     let lower = plan.original_task.to_ascii_lowercase();
     [
         "service",
@@ -6888,16 +10445,48 @@ fn discover_service_check_spec_path(run_dir: &Path) -> Option<PathBuf> {
 }
 
 fn service_check_validation_command(run_dir: &Path, phase: &str) -> String {
+    let agpipe = env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "agpipe".to_string());
     format!(
-        "agpipe internal runtime-check {} --phase {}",
-        run_dir.display(),
-        phase
+        "{} internal runtime-check {} --phase {}",
+        shell_quote(&agpipe),
+        shell_quote(&run_dir.display().to_string()),
+        shell_quote(phase)
     )
+}
+
+fn runtime_harness_expected_for_stage(
+    plan: &Plan,
+    run_dir: &Path,
+    _stage_kind: PipelineStageKind,
+) -> bool {
+    let has_spec = discover_service_check_spec_path(run_dir).is_some();
+    if has_spec {
+        return true;
+    }
+    if !task_looks_like_service(plan) {
+        return false;
+    }
+    let has_execution_stage = first_stage_id_for_kind(plan, run_dir, PipelineStageKind::Execution)
+        .ok()
+        .flatten()
+        .is_some();
+    has_execution_stage
 }
 
 fn effective_validation_commands(run_dir: &Path, plan: &Plan, phase: &str) -> Vec<String> {
     let mut commands = plan.validation_commands.clone();
-    if task_looks_like_service(plan) || discover_service_check_spec_path(run_dir).is_some() {
+    let stage_kind = match phase {
+        "execution" => Some(PipelineStageKind::Execution),
+        "verification" => Some(PipelineStageKind::Verification),
+        _ => None,
+    };
+    if stage_kind
+        .map(|kind| runtime_harness_expected_for_stage(plan, run_dir, kind))
+        .unwrap_or_else(|| discover_service_check_spec_path(run_dir).is_some())
+    {
         commands.push(service_check_validation_command(run_dir, phase));
     }
     let mut deduped = Vec::new();
@@ -6913,7 +10502,13 @@ fn runtime_check_required(run_dir: &Path, phase: &str) -> Result<bool, String> {
     if !matches!(phase, "execution" | "verification") {
         return Ok(false);
     }
-    Ok(task_looks_like_service(&load_plan(run_dir)?))
+    let plan = load_plan(run_dir)?;
+    let stage_kind = if phase == "execution" {
+        PipelineStageKind::Execution
+    } else {
+        PipelineStageKind::Verification
+    };
+    Ok(runtime_harness_expected_for_stage(&plan, run_dir, stage_kind))
 }
 
 fn load_service_check_spec(
@@ -8368,14 +11963,21 @@ fn build_codex_command(
         root.display().to_string(),
         "--add-dir".to_string(),
         run_dir.display().to_string(),
-        "--add-dir".to_string(),
-        ctx.repo_root.display().to_string(),
         "-".to_string(),
     ];
     if cache.enabled {
         command.splice(
             command.len() - 1..command.len() - 1,
             ["--add-dir".to_string(), cache.root.clone()],
+        );
+    }
+    if let Some(reasoning_effort) = stage_reasoning_effort_override(&plan, run_dir, stage) {
+        command.splice(
+            2..2,
+            [
+                "--config".to_string(),
+                format!("model_reasoning_effort=\"{reasoning_effort}\""),
+            ],
         );
     }
     if let Some(model) = &args.model {
@@ -8387,7 +11989,48 @@ fn build_codex_command(
     if args.oss {
         command.insert(2, "--oss".to_string());
     }
+    if env_flag("AGPIPE_CODEX_EPHEMERAL").unwrap_or(false) {
+        command.insert(2, "--ephemeral".to_string());
+    }
+    if let Some(agency_root) = discover_agency_agents_dir(ctx) {
+        if agency_root != ctx.repo_root && agency_root != root {
+            let insert_at = command.len().saturating_sub(1);
+            command.insert(insert_at, "--add-dir".to_string());
+            command.insert(insert_at + 1, agency_root.display().to_string());
+        }
+    }
     Ok((command, prompt))
+}
+
+fn stage_reasoning_effort_override(
+    plan: &Plan,
+    run_dir: &Path,
+    stage: &str,
+) -> Option<&'static str> {
+    let kind = pipeline_stage_kind_for(plan, run_dir, stage).ok()?;
+    if !matches!(
+        kind,
+        PipelineStageKind::Intake
+            | PipelineStageKind::Solver
+            | PipelineStageKind::Review
+            | PipelineStageKind::Execution
+            | PipelineStageKind::Verification
+    ) {
+        return None;
+    }
+    let workspace = working_root(plan, run_dir);
+    if task_is_trivial_local_cli_contract(
+        &plan.task_kind,
+        &plan.complexity,
+        &plan.original_task,
+        Some(&workspace),
+    ) {
+        return Some("low");
+    }
+    if plan.complexity == "low" {
+        return Some("medium");
+    }
+    None
 }
 
 fn build_responses_command(
@@ -8420,6 +12063,7 @@ fn build_local_template_command(
 ) -> Result<(Vec<String>, String), String> {
     let template_name = match template {
         LocalTemplateKind::HelloWorldPython => "hello-world-python",
+        LocalTemplateKind::ExecutionReadyBackendCliIntake => "execution-ready-backend-cli-intake",
     };
     let prompt = compile_prompt(ctx, run_dir, stage)?;
     Ok((
@@ -8440,6 +12084,10 @@ fn prepare_stage_command(
     stage: &str,
     args: &StartArgs,
 ) -> Result<PreparedStageCommand, String> {
+    let mut normalized_plan = load_plan(run_dir)?;
+    apply_pipeline_solver_defaults(&mut normalized_plan, Some(run_dir))?;
+    ensure_reviewer_stack(&mut normalized_plan);
+    save_plan(run_dir, &normalized_plan)?;
     let logs_dir = run_dir.join("logs");
     fs::create_dir_all(&logs_dir)
         .map_err(|err| format!("Could not create {}: {err}", logs_dir.display()))?;
@@ -8480,6 +12128,8 @@ fn run_prompted_command_capture(
     stdout_path: &Path,
     stderr_path: &Path,
     run_dir: Option<&Path>,
+    stage: Option<&str>,
+    last_message_path: Option<&Path>,
     mirror_stderr_to_stdout: bool,
 ) -> Result<i32, String> {
     initialize_capture_file(stdout_path)?;
@@ -8501,8 +12151,10 @@ fn run_prompted_command_capture(
     let mut child = cmd
         .spawn()
         .map_err(|err| format!("Failed to run command: {err}"))?;
+    let spawn_started_at = SystemTime::now();
     let pid = child.id() as i32;
     let mut interrupted = false;
+    let mut completed_from_last_message = false;
     notify_process_started(pid, pid);
     let stdout = child
         .stdout
@@ -8557,6 +12209,36 @@ fn run_prompted_command_capture(
                 break status;
             }
         }
+        if let (Some(run_dir), Some(stage), Some(last_message_path)) = (run_dir, stage, last_message_path) {
+            if file_modified_after(last_message_path, spawn_started_at)
+                && maybe_recover_codex_outputs_from_last_message(run_dir, stage, last_message_path)?
+                && is_stage_complete(run_dir, stage)?
+            {
+                completed_from_last_message = true;
+                let _ = unsafe { libc::kill(-pid, libc::SIGTERM) };
+                let mut finished = None;
+                for _ in 0..20 {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            finished = Some(status);
+                            break;
+                        }
+                        Ok(None) => thread::sleep(Duration::from_millis(100)),
+                        Err(err) => {
+                            return Err(format!("Could not wait for completed command: {err}"))
+                        }
+                    }
+                }
+                if let Some(status) = finished {
+                    break status;
+                }
+                let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                let status = child
+                    .wait()
+                    .map_err(|err| format!("Could not wait for completed command: {err}"))?;
+                break status;
+            }
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => thread::sleep(Duration::from_millis(100)),
@@ -8577,6 +12259,11 @@ fn run_prompted_command_capture(
     })??;
     if interrupted {
         Ok(130)
+    } else if completed_from_last_message {
+        if mirror_stderr_to_stdout {
+            initialize_capture_file(stderr_path)?;
+        }
+        Ok(0)
     } else {
         let code = status.code().unwrap_or(1);
         if mirror_stderr_to_stdout && code == 0 {
@@ -8584,6 +12271,496 @@ fn run_prompted_command_capture(
         }
         Ok(code)
     }
+}
+
+fn codex_solver_batch_parallel_enabled(ctx: &Context) -> bool {
+    if let Ok(value) = std::env::var("AGPIPE_CODEX_SOLVER_PARALLEL") {
+        let normalized = value.trim().to_ascii_lowercase();
+        return matches!(normalized.as_str(), "1" | "true" | "yes" | "on");
+    }
+    Path::new(&ctx.codex_bin)
+        .file_name()
+        .and_then(|item| item.to_str())
+        .map(|item| item.contains("mock-"))
+        .unwrap_or(false)
+}
+
+fn fail_closed_if_stage_outputs_incomplete(
+    run_dir: &Path,
+    stage: &str,
+    stdout_path: &Path,
+    stderr_path: &Path,
+    code: i32,
+) -> Result<i32, String> {
+    if code != 0 || is_stage_complete(run_dir, stage)? {
+        return Ok(code);
+    }
+    let message = format!(
+        "Stage `{stage}` exited with code 0, but required artifacts are still incomplete. The run is being treated as failed instead of accepting placeholder outputs.\n"
+    );
+    append_log_line(stdout_path, &message)?;
+    append_log_line(stderr_path, &message)?;
+    notify_output_line(message.trim_end());
+    Ok(1)
+}
+
+fn extract_last_codex_message_from_stdout_transcript(text: &str) -> Option<String> {
+    let mut last_block = None;
+    let lines: Vec<&str> = text.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        if lines[index].trim() != "codex" {
+            index += 1;
+            continue;
+        }
+        let start = index + 1;
+        let mut end = start;
+        while end < lines.len() {
+            let trimmed = lines[end].trim();
+            if end > start
+                && (trimmed == "codex"
+                    || trimmed == "user"
+                    || trimmed == "exec"
+                    || trimmed.starts_with("mcp:"))
+            {
+                break;
+            }
+            end += 1;
+        }
+        let block = lines[start..end].join("\n").trim().to_string();
+        if !block.is_empty() {
+            last_block = Some(block);
+        }
+        index = end;
+    }
+    last_block
+}
+
+fn recover_solver_artifact_from_stdout_transcript(
+    run_dir: &Path,
+    stage: &str,
+    stdout_path: &Path,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    let result_path = run_dir.join("solutions").join(stage).join("RESULT.md");
+    let current = read_text(&result_path).unwrap_or_default();
+    if !output_looks_placeholder(stage, &current) {
+        return Ok(false);
+    }
+    let transcript = read_text(stdout_path).unwrap_or_default();
+    let Some(recovered) = extract_last_codex_message_from_stdout_transcript(&transcript) else {
+        return Ok(false);
+    };
+    if output_looks_placeholder(stage, &recovered) {
+        return Ok(false);
+    }
+    write_text(&result_path, recovered.trim_end())?;
+    if !last_message_path.exists() || output_looks_placeholder(stage, &read_text(last_message_path).unwrap_or_default()) {
+        write_text(last_message_path, recovered.trim_end())?;
+    }
+    append_log_line(
+        stdout_path,
+        &format!(
+            "Recovered `{stage}` artifact from the final assistant message in the stdout transcript because `--output-last-message` did not materialize."
+        ),
+    )?;
+    Ok(true)
+}
+
+fn recover_solver_artifact_from_last_message(
+    run_dir: &Path,
+    stage: &str,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    let result_path = run_dir.join("solutions").join(stage).join("RESULT.md");
+    let current = read_text(&result_path).unwrap_or_default();
+    if !output_looks_placeholder(stage, &current) {
+        return Ok(false);
+    }
+    let last_message = read_text(last_message_path).unwrap_or_default();
+    if output_looks_placeholder(stage, &last_message) {
+        return Ok(false);
+    }
+    write_text(&result_path, last_message.trim_end())?;
+    Ok(true)
+}
+
+const REVIEW_REPORT_START: &str = "<<<AGPIPE_REVIEW_REPORT>>>";
+const REVIEW_SCORECARD_START: &str = "<<<AGPIPE_REVIEW_SCORECARD_JSON>>>";
+const REVIEW_USER_SUMMARY_START: &str = "<<<AGPIPE_REVIEW_USER_SUMMARY>>>";
+const VERIFICATION_FINDINGS_START: &str = "<<<AGPIPE_VERIFICATION_FINDINGS>>>";
+const VERIFICATION_GOAL_STATUS_START: &str = "<<<AGPIPE_VERIFICATION_GOAL_STATUS_JSON>>>";
+const VERIFICATION_USER_SUMMARY_START: &str = "<<<AGPIPE_VERIFICATION_USER_SUMMARY>>>";
+const VERIFICATION_IMPROVEMENT_REQUEST_START: &str = "<<<AGPIPE_VERIFICATION_IMPROVEMENT_REQUEST>>>";
+const VERIFICATION_AUGMENTED_TASK_START: &str = "<<<AGPIPE_VERIFICATION_AUGMENTED_TASK>>>";
+
+fn extract_tagged_section_from_known_tags(
+    text: &str,
+    start_tag: &str,
+    known_tags: &[&str],
+) -> Option<String> {
+    let mut tags = vec![start_tag];
+    tags.extend_from_slice(known_tags);
+    tags.sort_unstable();
+    tags.dedup();
+
+    let mut occurrences: Vec<(usize, &str)> = Vec::new();
+    for tag in &tags {
+        for (offset, _) in text.match_indices(tag) {
+            occurrences.push((offset, *tag));
+        }
+    }
+    occurrences.sort_by_key(|(offset, _)| *offset);
+
+    for (index, (offset, tag)) in occurrences.iter().enumerate() {
+        if *tag != start_tag {
+            continue;
+        }
+        let content_start = *offset + start_tag.len();
+        let next_offset = occurrences
+            .iter()
+            .skip(index + 1)
+            .map(|(next_offset, _)| *next_offset)
+            .find(|next_offset| *next_offset >= content_start)
+            .unwrap_or(text.len());
+        let section = text[content_start..next_offset].trim().to_string();
+        if !section.is_empty() {
+            return Some(section);
+        }
+    }
+    None
+}
+
+fn recover_review_artifacts_from_stdout_transcript(
+    run_dir: &Path,
+    stdout_path: &Path,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    let report_path = run_dir.join("review").join("report.md");
+    let scorecard_path = run_dir.join("review").join("scorecard.json");
+    let summary_path = run_dir.join("review").join("user-summary.md");
+    let report_current = read_text(&report_path).unwrap_or_default();
+    let summary_current = read_text(&summary_path).unwrap_or_default();
+    if !output_looks_placeholder("review", &report_current)
+        && !output_looks_placeholder("review-summary", &summary_current)
+        && review_scorecard_complete(&scorecard_path)
+    {
+        return Ok(false);
+    }
+    let transcript = read_text(stdout_path).unwrap_or_default();
+    let last_message = extract_last_codex_message_from_stdout_transcript(&transcript)
+        .unwrap_or_else(|| transcript.clone());
+    let report = extract_tagged_section_from_known_tags(
+        &last_message,
+        REVIEW_REPORT_START,
+        &[REVIEW_REPORT_START, REVIEW_SCORECARD_START, REVIEW_USER_SUMMARY_START],
+    );
+    let scorecard = extract_tagged_section_from_known_tags(
+        &last_message,
+        REVIEW_SCORECARD_START,
+        &[REVIEW_REPORT_START, REVIEW_SCORECARD_START, REVIEW_USER_SUMMARY_START],
+    );
+    let summary = extract_tagged_section_from_known_tags(
+        &last_message,
+        REVIEW_USER_SUMMARY_START,
+        &[REVIEW_REPORT_START, REVIEW_SCORECARD_START, REVIEW_USER_SUMMARY_START],
+    );
+    let (Some(report), Some(scorecard), Some(summary)) = (report, scorecard, summary) else {
+        return Ok(false);
+    };
+    let scorecard_json = serde_json::from_str::<Value>(&scorecard)
+        .map_err(|err| format!("Recovered review scorecard is not valid JSON: {err}"))?;
+    write_text(&report_path, report.trim_end())?;
+    write_json(&scorecard_path, &scorecard_json)?;
+    write_text(&summary_path, summary.trim_end())?;
+    if !last_message_path.exists()
+        || output_looks_placeholder("review", &read_text(last_message_path).unwrap_or_default())
+    {
+        write_text(last_message_path, last_message.trim_end())?;
+    }
+    append_log_line(
+        stdout_path,
+        "Recovered review artifacts from the final assistant message in the stdout transcript because the direct review outputs remained placeholders.",
+    )?;
+    Ok(true)
+}
+
+fn recover_review_artifacts_from_last_message(
+    run_dir: &Path,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    let report_path = run_dir.join("review").join("report.md");
+    let scorecard_path = run_dir.join("review").join("scorecard.json");
+    let summary_path = run_dir.join("review").join("user-summary.md");
+    let report_current = read_text(&report_path).unwrap_or_default();
+    let summary_current = read_text(&summary_path).unwrap_or_default();
+    if !output_looks_placeholder("review", &report_current)
+        && !output_looks_placeholder("review-summary", &summary_current)
+        && review_scorecard_complete(&scorecard_path)
+    {
+        return Ok(false);
+    }
+    let last_message = read_text(last_message_path).unwrap_or_default();
+    let report = extract_tagged_section_from_known_tags(
+        &last_message,
+        REVIEW_REPORT_START,
+        &[REVIEW_REPORT_START, REVIEW_SCORECARD_START, REVIEW_USER_SUMMARY_START],
+    );
+    let scorecard = extract_tagged_section_from_known_tags(
+        &last_message,
+        REVIEW_SCORECARD_START,
+        &[REVIEW_REPORT_START, REVIEW_SCORECARD_START, REVIEW_USER_SUMMARY_START],
+    );
+    let summary = extract_tagged_section_from_known_tags(
+        &last_message,
+        REVIEW_USER_SUMMARY_START,
+        &[REVIEW_REPORT_START, REVIEW_SCORECARD_START, REVIEW_USER_SUMMARY_START],
+    );
+    let (Some(report), Some(scorecard), Some(summary)) = (report, scorecard, summary) else {
+        return Ok(false);
+    };
+    let scorecard_json = serde_json::from_str::<Value>(&scorecard)
+        .map_err(|err| format!("Recovered review scorecard is not valid JSON: {err}"))?;
+    write_text(&report_path, report.trim_end())?;
+    write_json(&scorecard_path, &scorecard_json)?;
+    write_text(&summary_path, summary.trim_end())?;
+    Ok(true)
+}
+
+fn recover_verification_artifacts_from_stdout_transcript(
+    run_dir: &Path,
+    stdout_path: &Path,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    let findings_path = run_dir.join("verification").join("findings.md");
+    let summary_path = run_dir.join("verification").join("user-summary.md");
+    let improvement_path = run_dir.join("verification").join("improvement-request.md");
+    let augmented_path = run_dir.join("verification").join("augmented-task.md");
+    let goal_status = goal_status_path(run_dir);
+    let plan = load_plan(run_dir)?;
+    if !output_looks_placeholder("verification", &read_text(&findings_path).unwrap_or_default())
+        && !output_looks_placeholder(
+            "verification-summary",
+            &read_text(&summary_path).unwrap_or_default(),
+        )
+        && !output_looks_placeholder(
+            "improvement-request",
+            &read_text(&improvement_path).unwrap_or_default(),
+        )
+        && (!plan.augmented_follow_up_enabled
+            || !output_looks_placeholder(
+                "augmented-task",
+                &read_text(&augmented_path).unwrap_or_default(),
+            ))
+        && (!plan.goal_gate_enabled || goal_status_complete(&goal_status))
+    {
+        return Ok(false);
+    }
+    let transcript = read_text(stdout_path).unwrap_or_default();
+    let last_message = extract_last_codex_message_from_stdout_transcript(&transcript)
+        .unwrap_or_else(|| transcript.clone());
+    let verification_tags = [
+        VERIFICATION_FINDINGS_START,
+        VERIFICATION_GOAL_STATUS_START,
+        VERIFICATION_USER_SUMMARY_START,
+        VERIFICATION_IMPROVEMENT_REQUEST_START,
+        VERIFICATION_AUGMENTED_TASK_START,
+    ];
+    let findings = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_FINDINGS_START,
+        &verification_tags,
+    );
+    let goal_status_json = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_GOAL_STATUS_START,
+        &verification_tags,
+    );
+    let user_summary = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_USER_SUMMARY_START,
+        &verification_tags,
+    );
+    let improvement_request = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_IMPROVEMENT_REQUEST_START,
+        &verification_tags,
+    );
+    let augmented_task = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_AUGMENTED_TASK_START,
+        &verification_tags,
+    );
+    let (Some(findings), Some(goal_status_json), Some(user_summary), Some(improvement_request)) =
+        (findings, goal_status_json, user_summary, improvement_request)
+    else {
+        return Ok(false);
+    };
+    if plan.augmented_follow_up_enabled && augmented_task.is_none() {
+        return Ok(false);
+    }
+    let goal_status_json = serde_json::from_str::<Value>(&goal_status_json)
+        .map_err(|err| format!("Recovered verification goal-status is not valid JSON: {err}"))?;
+    write_text(&findings_path, findings.trim_end())?;
+    write_text(&summary_path, user_summary.trim_end())?;
+    write_text(&improvement_path, improvement_request.trim_end())?;
+    if let Some(augmented_task) = augmented_task {
+        write_text(&augmented_path, augmented_task.trim_end())?;
+    }
+    write_json(&goal_status, &goal_status_json)?;
+    if !last_message_path.exists()
+        || output_looks_placeholder("verification", &read_text(last_message_path).unwrap_or_default())
+    {
+        write_text(last_message_path, last_message.trim_end())?;
+    }
+    append_log_line(
+        stdout_path,
+        "Recovered verification artifacts from the final assistant message in the stdout transcript because the direct verification outputs remained placeholders.",
+    )?;
+    Ok(true)
+}
+
+fn recover_verification_artifacts_from_last_message(
+    run_dir: &Path,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    let findings_path = run_dir.join("verification").join("findings.md");
+    let summary_path = run_dir.join("verification").join("user-summary.md");
+    let improvement_path = run_dir.join("verification").join("improvement-request.md");
+    let augmented_path = run_dir.join("verification").join("augmented-task.md");
+    let goal_status = goal_status_path(run_dir);
+    let plan = load_plan(run_dir)?;
+    if !output_looks_placeholder("verification", &read_text(&findings_path).unwrap_or_default())
+        && !output_looks_placeholder(
+            "verification-summary",
+            &read_text(&summary_path).unwrap_or_default(),
+        )
+        && !output_looks_placeholder(
+            "improvement-request",
+            &read_text(&improvement_path).unwrap_or_default(),
+        )
+        && (!plan.augmented_follow_up_enabled
+            || !output_looks_placeholder(
+                "augmented-task",
+                &read_text(&augmented_path).unwrap_or_default(),
+            ))
+        && (!plan.goal_gate_enabled || goal_status_complete(&goal_status))
+    {
+        return Ok(false);
+    }
+    let last_message = read_text(last_message_path).unwrap_or_default();
+    let verification_tags = [
+        VERIFICATION_FINDINGS_START,
+        VERIFICATION_GOAL_STATUS_START,
+        VERIFICATION_USER_SUMMARY_START,
+        VERIFICATION_IMPROVEMENT_REQUEST_START,
+        VERIFICATION_AUGMENTED_TASK_START,
+    ];
+    let findings = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_FINDINGS_START,
+        &verification_tags,
+    );
+    let goal_status_json = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_GOAL_STATUS_START,
+        &verification_tags,
+    );
+    let user_summary = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_USER_SUMMARY_START,
+        &verification_tags,
+    );
+    let improvement_request = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_IMPROVEMENT_REQUEST_START,
+        &verification_tags,
+    );
+    let augmented_task = extract_tagged_section_from_known_tags(
+        &last_message,
+        VERIFICATION_AUGMENTED_TASK_START,
+        &verification_tags,
+    );
+    let (Some(findings), Some(goal_status_json), Some(user_summary), Some(improvement_request)) =
+        (findings, goal_status_json, user_summary, improvement_request)
+    else {
+        return Ok(false);
+    };
+    if plan.augmented_follow_up_enabled && augmented_task.is_none() {
+        return Ok(false);
+    }
+    let goal_status_json = serde_json::from_str::<Value>(&goal_status_json)
+        .map_err(|err| format!("Recovered verification goal-status is not valid JSON: {err}"))?;
+    write_text(&findings_path, findings.trim_end())?;
+    write_text(&summary_path, user_summary.trim_end())?;
+    write_text(&improvement_path, improvement_request.trim_end())?;
+    if let Some(augmented_task) = augmented_task {
+        write_text(&augmented_path, augmented_task.trim_end())?;
+    }
+    write_json(&goal_status, &goal_status_json)?;
+    Ok(true)
+}
+
+fn maybe_recover_codex_outputs_from_last_message(
+    run_dir: &Path,
+    stage: &str,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    if !last_message_path.exists() {
+        return Ok(false);
+    }
+    if stage.starts_with("solver-") {
+        return recover_solver_artifact_from_last_message(run_dir, stage, last_message_path);
+    }
+    if stage == "review" {
+        return recover_review_artifacts_from_last_message(run_dir, last_message_path);
+    }
+    if stage == "verification" {
+        return recover_verification_artifacts_from_last_message(run_dir, last_message_path);
+    }
+    Ok(false)
+}
+
+fn file_modified_after(path: &Path, threshold: SystemTime) -> bool {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map(|modified| modified >= threshold)
+        .unwrap_or(false)
+}
+
+fn maybe_recover_codex_solver_outputs(
+    backend: StageBackendKind,
+    run_dir: &Path,
+    stage: &str,
+    stdout_path: &Path,
+    last_message_path: &Path,
+) -> Result<bool, String> {
+    if backend != StageBackendKind::Codex {
+        return Ok(false);
+    }
+    if stage.starts_with("solver-") {
+        return recover_solver_artifact_from_stdout_transcript(
+            run_dir,
+            stage,
+            stdout_path,
+            last_message_path,
+        );
+    }
+    if stage == "review" {
+        return recover_review_artifacts_from_stdout_transcript(
+            run_dir,
+            stdout_path,
+            last_message_path,
+        );
+    }
+    if stage == "verification" {
+        return recover_verification_artifacts_from_stdout_transcript(
+            run_dir,
+            stdout_path,
+            last_message_path,
+        );
+    }
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8627,6 +12804,9 @@ fn run_responses_stage_capture(
 fn local_template_token_usage(template: LocalTemplateKind) -> TokenUsage {
     let source = match template {
         LocalTemplateKind::HelloWorldPython => "local-template:hello-world-python",
+        LocalTemplateKind::ExecutionReadyBackendCliIntake => {
+            "local-template:execution-ready-backend-cli-intake"
+        }
     };
     TokenUsage {
         source: source.to_string(),
@@ -8682,6 +12862,21 @@ fn write_local_template_stage_outputs(
     let mut plan = load_plan(run_dir)?;
     let stage_kind = pipeline_stage_kind_for(&plan, run_dir, stage)?;
     match template {
+        LocalTemplateKind::ExecutionReadyBackendCliIntake => match stage_kind {
+            PipelineStageKind::Intake => {
+                ensure_reviewer_stack(&mut plan);
+                save_plan(run_dir, &plan)?;
+                write_text(
+                    &run_dir.join("brief.md"),
+                    &render_execution_ready_backend_cli_brief(&plan),
+                )?;
+                Ok("Local intake fast-path synthesized a backend CLI brief from the existing request and plan defaults.".to_string())
+            }
+            _ => Err(
+                "Execution-ready backend CLI intake template only supports the intake stage."
+                    .to_string(),
+            ),
+        },
         LocalTemplateKind::HelloWorldPython => match stage_kind {
             PipelineStageKind::Intake => {
                 plan.task_kind = "backend".to_string();
@@ -8692,6 +12887,7 @@ fn write_local_template_stage_outputs(
                     solver_id: "solver-a".to_string(),
                     role: "engineering/engineering-senior-developer.md".to_string(),
                     angle: "implementation-first".to_string(),
+                    mcp_servers: Vec::new(),
                 }];
                 plan.validation_commands = vec!["python3 main.py".to_string()];
                 plan.workstream_hints = vec![WorkstreamHint {
@@ -8971,6 +13167,12 @@ fn doctor_text(report: &DoctorPayload) -> String {
         format!("safe-next-action: {}", report.safe_next_action),
         format!("host-probe: {}", report.host_probe),
     ];
+    if !report.fix_actions.is_empty() {
+        lines.push(format!(
+            "doctor-fix-actions: {}",
+            report.fix_actions.join(" -> ")
+        ));
+    }
     if !report.stale.is_empty() {
         lines.push(format!("stale: {}", report.stale.join(", ")));
     }
@@ -9005,6 +13207,40 @@ fn doctor_text(report: &DoctorPayload) -> String {
     }
     if report.issues.is_empty() && report.warnings.is_empty() {
         lines.push("\nNo consistency issues detected.".to_string());
+    }
+    lines.join("\n")
+}
+
+fn doctor_compact_text(report: &DoctorPayload) -> String {
+    let mut lines = vec![
+        format!("health: {}", report.health),
+        format!("goal: {}", report.goal),
+        format!("next: {}", report.next),
+        format!("safe-next-action: {}", report.safe_next_action),
+        format!("host-probe: {}", report.host_probe),
+    ];
+    if !report.fix_actions.is_empty() {
+        lines.push(format!(
+            "doctor-fix-actions: {}",
+            report.fix_actions.join(" -> ")
+        ));
+    }
+    if !report.issues.is_empty() {
+        lines.push(format!("issues: {}", report.issues.len()));
+        for item in report.issues.iter().take(2) {
+            lines.push(format!("- {}", item.message));
+        }
+    }
+    if !report.warnings.is_empty() {
+        lines.push(format!("warnings: {}", report.warnings.len()));
+        for item in report.warnings.iter().take(2) {
+            lines.push(format!("- {}", item.message));
+        }
+    }
+    if report.issues.is_empty() && report.warnings.is_empty() {
+        lines.push("No consistency issues detected.".to_string());
+    } else {
+        lines.push("Open the full doctor report for the detailed issue list.".to_string());
     }
     lines.join("\n")
 }
@@ -9128,6 +13364,16 @@ fn start_stage(
                 &usage,
             )?;
             sync_run_artifacts(ctx, run_dir)?;
+            record_stage_mcp_usage(
+                &plan,
+                run_dir,
+                stage,
+                stage_backend_label(backend),
+                "cache-hit",
+            )?;
+            if stage_kind == PipelineStageKind::Verification {
+                write_verification_current_facts(run_dir, &plan)?;
+            }
             let _ = refresh_cache_index(&cache)?;
             let mut stdout = format!(
                 "Reused cached {stage} result.\ncache key: {cache_key}\nstdout log: {}\nstderr log: {}\n",
@@ -9163,6 +13409,8 @@ fn start_stage(
             &stdout_path,
             &stderr_path,
             Some(run_dir),
+            Some(stage),
+            Some(&last_message_path),
             true,
         )?,
         StageBackendKind::Responses => run_responses_stage_capture(
@@ -9185,6 +13433,22 @@ fn start_stage(
         )?,
     };
     sync_run_artifacts(ctx, run_dir)?;
+    if maybe_recover_codex_solver_outputs(
+        backend,
+        run_dir,
+        stage,
+        &stdout_path,
+        &last_message_path,
+    )? {
+        sync_run_artifacts(ctx, run_dir)?;
+    }
+    code = fail_closed_if_stage_outputs_incomplete(
+        run_dir,
+        stage,
+        &stdout_path,
+        &stderr_path,
+        code,
+    )?;
     check_run_interrupt(run_dir)?;
     if code == 0 && stage_kind == PipelineStageKind::Execution {
         if let Some(result) = maybe_run_service_check(run_dir, "execution")? {
@@ -9226,6 +13490,16 @@ fn start_stage(
             &token_usage,
             &["provisional"],
         )?;
+        record_stage_mcp_usage(
+            &plan,
+            run_dir,
+            stage,
+            stage_backend_label(backend),
+            "executed",
+        )?;
+        if stage_kind == PipelineStageKind::Verification {
+            write_verification_current_facts(run_dir, &plan)?;
+        }
     }
     let _ = refresh_cache_index(&cache)?;
     let mut stdout = String::new();
@@ -9283,9 +13557,16 @@ fn start_solver_batch(
             Ok(StageBackendKind::Responses | StageBackendKind::LocalTemplate(_))
         )
     });
-    if requires_in_process {
+    let all_codex = stages.iter().all(|stage| {
+        matches!(stage_backend_kind(ctx, run_dir, stage), Ok(StageBackendKind::Codex))
+    });
+    let force_serial_codex = all_codex && !codex_solver_batch_parallel_enabled(ctx);
+    if requires_in_process || force_serial_codex {
         let mut combined = String::new();
         let mut exit_code = 0;
+        if force_serial_codex {
+            combined.push_str("Running solver stages sequentially for Codex stability.\n");
+        }
         for stage in stages {
             check_run_interrupt(run_dir)?;
             let result = start_stage(ctx, run_dir, stage, args)?;
@@ -9404,6 +13685,13 @@ fn start_solver_batch(
                     stderr_path.display()
                 ));
                 sync_run_artifacts(ctx, run_dir)?;
+                record_stage_mcp_usage(
+                    &plan,
+                    run_dir,
+                    &stage,
+                    stage_backend_label(StageBackendKind::Codex),
+                    "cache-hit",
+                )?;
                 let _ = refresh_cache_index(&cache)?;
                 continue;
             }
@@ -9421,8 +13709,10 @@ fn start_solver_batch(
             &["provisional"],
         )?;
         let run_dir_for_thread = run_dir.to_path_buf();
+        let stage_for_thread = stage.clone();
         let command_for_thread = command.clone();
         let prompt_for_thread = prompt.clone();
+        let last_message_path_for_thread = last_message_path.clone();
         let stdout_path_for_thread = stdout_path.clone();
         let stderr_path_for_thread = stderr_path.clone();
         let observer_for_thread = observer.clone();
@@ -9435,6 +13725,8 @@ fn start_solver_batch(
                         &stdout_path_for_thread,
                         &stderr_path_for_thread,
                         Some(&run_dir_for_thread),
+                        Some(&stage_for_thread),
+                        Some(&last_message_path_for_thread),
                         true,
                     )
                 })
@@ -9445,6 +13737,8 @@ fn start_solver_batch(
                     &stdout_path_for_thread,
                     &stderr_path_for_thread,
                     Some(&run_dir_for_thread),
+                    Some(&stage_for_thread),
+                    Some(&last_message_path_for_thread),
                     true,
                 )
             }
@@ -9495,10 +13789,26 @@ fn start_solver_batch(
         let result = handle
             .join()
             .map_err(|_| format!("Failed to join {stage} capture thread."))??;
+        sync_run_artifacts(ctx, run_dir)?;
+        if maybe_recover_codex_solver_outputs(
+            StageBackendKind::Codex,
+            run_dir,
+            &stage,
+            &stdout_path,
+            &last_message_path,
+        )? {
+            sync_run_artifacts(ctx, run_dir)?;
+        }
+        let result = fail_closed_if_stage_outputs_incomplete(
+            run_dir,
+            &stage,
+            &stdout_path,
+            &stderr_path,
+            result,
+        )?;
         if result != 0 && exit_code == 0 {
             exit_code = result;
         }
-        sync_run_artifacts(ctx, run_dir)?;
         if result == 0 && is_stage_complete(run_dir, &stage)? {
             let token_usage = build_stage_token_usage(&prompt, &last_message_path);
             store_stage_cache(
@@ -9524,6 +13834,13 @@ fn start_solver_batch(
                 &workspace_hash,
                 &token_usage,
                 &["provisional"],
+            )?;
+            record_stage_mcp_usage(
+                &plan,
+                run_dir,
+                &stage,
+                stage_backend_label(StageBackendKind::Codex),
+                "executed",
             )?;
         }
         let _ = refresh_cache_index(&cache)?;
@@ -10034,12 +14351,13 @@ fn recheck_stage(
 }
 
 fn refresh_stage_prompt(
+    ctx: &Context,
     run_dir: &Path,
     stage: &str,
     dry_run: bool,
 ) -> Result<CommandResult, String> {
     check_run_interrupt(run_dir)?;
-    let prompt_text = render_stage_prompt(run_dir, stage)?;
+    let prompt_text = render_stage_prompt(ctx, run_dir, stage)?;
     let prompt_path = stage_prompt_path(run_dir, stage)?;
     if dry_run {
         return Ok(CommandResult {
@@ -10056,12 +14374,16 @@ fn refresh_stage_prompt(
     })
 }
 
-fn refresh_all_stage_prompts(run_dir: &Path, dry_run: bool) -> Result<CommandResult, String> {
+fn refresh_all_stage_prompts(
+    ctx: &Context,
+    run_dir: &Path,
+    dry_run: bool,
+) -> Result<CommandResult, String> {
     let stages = available_stages(run_dir)?;
     let mut chunks = Vec::new();
     for (index, stage) in stages.iter().enumerate() {
         check_run_interrupt(run_dir)?;
-        let result = refresh_stage_prompt(run_dir, stage, dry_run)?;
+        let result = refresh_stage_prompt(ctx, run_dir, stage, dry_run)?;
         chunks.push(result.stdout.trim_end().to_string());
         if dry_run && index + 1 < stages.len() {
             chunks.push("\n---\n".to_string());
@@ -10092,6 +14414,248 @@ fn follow_up_prompt_path(run_dir: &Path, prompt_source: Option<&str>) -> PathBuf
                 improvement
             }
         }
+    }
+}
+
+fn non_placeholder_artifact_text(run_dir: &Path, rel: &str, label: &str) -> Option<String> {
+    let path = run_dir.join(rel);
+    if !path.exists() {
+        return None;
+    }
+    let text = read_text(&path).ok()?;
+    if output_looks_placeholder(label, &text) {
+        None
+    } else {
+        Some(text.trim().to_string())
+    }
+}
+
+fn verification_current_facts_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("verification").join("current-facts.md")
+}
+
+fn build_verification_current_facts_markdown(run_dir: &Path, plan: &Plan) -> String {
+    let goal_status =
+        read_json::<Value>(&run_dir.join("verification").join("goal-status.json")).ok();
+    let host_probe = read_json::<Value>(&host_probe_path(run_dir)).ok();
+    let goal_verdict = goal_status
+        .as_ref()
+        .and_then(|value| value.get("goal_verdict"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let recommended_next_action = goal_status
+        .as_ref()
+        .and_then(|value| value.get("recommended_next_action"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let rerun_recommended = goal_status
+        .as_ref()
+        .and_then(|value| value.get("rerun_recommended"))
+        .and_then(Value::as_bool)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let top_findings = goal_status
+        .as_ref()
+        .and_then(|value| value.get("top_findings"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter()
+                .filter_map(Value::as_str)
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "- none recorded".to_string());
+    let host_lines = if let Some(probe) = host_probe {
+        let captured_at = probe
+            .get("captured_at")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let preferred = probe
+            .get("preferred_torch_device")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let mps_built = probe
+            .get("mps_built")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        let mps_available = probe
+            .get("mps_available")
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "null".to_string());
+        format!(
+            "- latest launcher probe: `{}`\n- preferred torch device: `{}`\n- launcher `mps_built`: `{}`\n- launcher `mps_available`: `{}`\n",
+            captured_at, preferred, mps_built, mps_available
+        )
+    } else {
+        "- latest launcher probe: unavailable\n".to_string()
+    };
+    let execution_present = first_stage_id_for_kind(plan, run_dir, PipelineStageKind::Execution)
+        .ok()
+        .flatten()
+        .is_some();
+    if language_is_russian(&plan.summary_language) {
+        format!(
+            "# Актуальные факты\n\nЭто авторитетный снимок текущего состояния этого прогона.\nЕсли факты расходятся, опирайся на него, а не на более старые `request.md`, `brief.md` и `review/*`.\n\n## Состояние цели\n\n- вердикт: `{}`\n- рекомендуемое следующее действие: `{}`\n- нужен повторный прогон: `{}`\n- есть execution stage: `{}`\n\n## Последний probe хоста\n\n{}\
+\n## Ключевые находки\n\n{}\n",
+            goal_verdict,
+            recommended_next_action,
+            rerun_recommended,
+            execution_present,
+            host_lines.trim_end(),
+            top_findings
+        )
+    } else {
+        format!(
+            "# Current Facts\n\nThis is the authoritative current-state snapshot for this run.\nPrefer it over older `request.md`, `brief.md`, and `review/*` artifacts when facts conflict.\n\n## Goal State\n\n- verdict: `{}`\n- recommended next action: `{}`\n- rerun recommended: `{}`\n- execution stage present: `{}`\n\n## Latest Host Probe\n\n{}\
+\n## Top Findings\n\n{}\n",
+            goal_verdict,
+            recommended_next_action,
+            rerun_recommended,
+            execution_present,
+            host_lines.trim_end(),
+            top_findings
+        )
+    }
+}
+
+fn write_verification_current_facts(run_dir: &Path, plan: &Plan) -> Result<(), String> {
+    let path = verification_current_facts_path(run_dir);
+    write_text(&path, &build_verification_current_facts_markdown(run_dir, plan))
+}
+
+fn build_follow_up_prompt(
+    run_dir: &Path,
+    prompt_file: &Path,
+    prompt_label: &str,
+    prompt_text: &str,
+    summary_language: &str,
+    operator_note: Option<&str>,
+) -> String {
+    let run_name = run_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("run");
+    let goal_status =
+        read_json::<Value>(&run_dir.join("verification").join("goal-status.json")).ok();
+    let goal_verdict = goal_status
+        .as_ref()
+        .and_then(|value| value.get("goal_verdict"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let rerun_recommended = goal_status
+        .as_ref()
+        .and_then(|value| value.get("rerun_recommended"))
+        .and_then(Value::as_bool)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let recommended_next_action = goal_status
+        .as_ref()
+        .and_then(|value| value.get("recommended_next_action"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let missing_checks = goal_status
+        .as_ref()
+        .and_then(|value| value.get("missing_checks"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|item| format!("- `{item}`"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "- none reported".to_string());
+    let verification_summary = non_placeholder_artifact_text(
+        run_dir,
+        "verification/user-summary.md",
+        "verification-user-summary",
+    )
+    .unwrap_or_else(|| {
+        if language_is_russian(summary_language) {
+            "# Итог проверки\n\nНедоступно.\n".to_string()
+        } else {
+            "# Verification Summary\n\nUnavailable.\n".to_string()
+        }
+    });
+    let verification_findings =
+        non_placeholder_artifact_text(run_dir, "verification/findings.md", "verification-findings")
+            .unwrap_or_else(|| {
+                if language_is_russian(summary_language) {
+                    "# Находки\n\nНедоступно.\n".to_string()
+                } else {
+                    "# Findings\n\nUnavailable.\n".to_string()
+                }
+            });
+    let current_facts = non_placeholder_artifact_text(
+        run_dir,
+        "verification/current-facts.md",
+        "verification-current-facts",
+    )
+    .unwrap_or_else(|| {
+        if language_is_russian(summary_language) {
+            "# Актуальные факты\n\nНедоступно.\n".to_string()
+        } else {
+            "# Current Facts\n\nUnavailable.\n".to_string()
+        }
+    });
+    let operator_note = operator_note
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let operator_note_section = if let Some(note) = operator_note {
+        if language_is_russian(summary_language) {
+            format!(
+                "\n## Дополнительные указания пользователя\n\nЭто новые комментарии пользователя именно для текущего повторного прогона.\nЕсли они конфликтуют с уже проверенными фактами, не игнорируй конфликт молча: явно опиши расхождение и выбери безопасный вариант.\n\n{}\n",
+                note
+            )
+        } else {
+            format!(
+                "\n## Additional User Guidance\n\nThis is fresh user input for the current rerun.\nIf it conflicts with already-verified facts, do not ignore the conflict silently: call it out and choose the safer interpretation.\n\n{}\n",
+                note
+            )
+        }
+    } else {
+        String::new()
+    };
+    if language_is_russian(summary_language) {
+        format!(
+            "# Верифицированная задача для повторного прогона\n\nИспользуй только контекст из проверки ниже как авторитетную основу для этого повторного прогона.\nНе пересобирай задачу по старым `request.md`, `brief.md` или `review/*` из предыдущего прогона, если этот документ не повторяет их явно.\n\n## Исходный прогон\n\n- run: `{}`\n- источник запроса: `{}`\n- исходный файл: `{}`\n\n## Статус цели\n\n- вердикт: `{}`\n- нужен повторный прогон: `{}`\n- рекомендуемое следующее действие: `{}`\n- незакрытые критические проверки:\n{}\n\n## Актуальные факты\n\n{}\n\n## Правила повторного прогона\n\n- Рассматривай абсолютные пути под `{}` только как ссылки на артефакты исходного прогона, а не как основное место записи этого повторного прогона.\n- Если текущему повторному прогону нужен обновлённый run-local narrative, пиши его в собственные `review/`, `execution/` или `verification/` артефакты этого прогона, а не переписывай предыдущие run-local файлы.\n- Workspace и пользовательские deliverables вне `agent-runs` по-прежнему можно обновлять на месте, но только если follow-up явно требует mirror.\n- Предпочитай заново изложить и согласовать текущие доказательства в артефактах этого прогона, а не чинить исторические логи исходного прогона.\n\n## Цель текущего повторного прогона\n\n- Закрой только незакрытые критические проверки, перечисленные выше.\n- Используй файлы исходного прогона только как ссылки на доказательства и пересобери актуальный narrative в артефактах текущего прогона.\n- Обновляй workspace mirrors на месте только там, где это действительно требуется пользовательским deliverable.\n- Не редактируй напрямую предыдущие run-local файлы под `{}` без явного запроса пользователя на восстановление архива.\n{}\n## Итог проверки\n\n{}\n\n## Находки проверки\n\n{}\n\n## Исторические указания из исходного прогона\n\n{}\n",
+            run_name,
+            prompt_label,
+            prompt_file.display(),
+            goal_verdict,
+            rerun_recommended,
+            recommended_next_action,
+            missing_checks,
+            current_facts.trim(),
+            run_dir.display(),
+            run_dir.display(),
+            operator_note_section,
+            verification_summary.trim(),
+            verification_findings.trim(),
+            prompt_text.trim()
+        )
+    } else {
+        format!(
+            "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\nDo not rescope the task from stale `request.md`, `brief.md`, or `review/*` artifacts from the previous run unless this document repeats them explicitly.\n\n## Source Run\n\n- run: `{}`\n- prompt source: `{}`\n- source file: `{}`\n\n## Goal Status\n\n- verdict: `{}`\n- rerun recommended: `{}`\n- recommended next action: `{}`\n- missing critical checks:\n{}\n\n## Current Facts\n\n{}\n\n## Rerun Contract\n\n- Treat absolute paths under `{}` as source-run evidence references, not the primary write target for this rerun.\n- If this rerun needs refreshed run-local narrative, write it under the current rerun's own `review/`, `execution/`, or `verification/` artifacts instead of rewriting previous run-local files.\n- Workspace or user-facing deliverables outside `agent-runs` may still be updated in place when the follow-up explicitly requires a mirror.\n- Prefer restating and reconciling the current evidence in this rerun's own artifacts over repairing historical logs from the source run.\n\n## Current Rerun Objective\n\n- Close only the missing critical checks listed above.\n- Use source-run files as evidence references and refresh the story in this rerun's own artifacts.\n- Update workspace mirrors in place only when the user-facing deliverable actually requires them.\n- Do not directly edit previous run-local files under `{}` unless the user explicitly asks for archival repair.\n{}\n## Verification Summary\n\n{}\n\n## Verification Findings\n\n{}\n\n## Historical Guidance From Source Run\n\n{}\n",
+            run_name,
+            prompt_label,
+            prompt_file.display(),
+            goal_verdict,
+            rerun_recommended,
+            recommended_next_action,
+            missing_checks,
+            current_facts.trim(),
+            run_dir.display(),
+            run_dir.display(),
+            operator_note_section,
+            verification_summary.trim(),
+            verification_findings.trim(),
+            prompt_text.trim()
+        )
     }
 }
 
@@ -10136,11 +14700,20 @@ fn create_follow_up_run(
             run_dir.file_name().unwrap_or_default().to_string_lossy()
         )
     });
+    write_verification_current_facts(run_dir, &plan)?;
+    let follow_up_prompt = build_follow_up_prompt(
+        run_dir,
+        &prompt_file,
+        prompt_label,
+        &prompt_text,
+        &plan.summary_language,
+        args.note.as_deref(),
+    );
     if args.dry_run {
         return Ok(CommandResult {
             code: 0,
             stdout: format!(
-                "Would create follow-up run from `{}`\nworkspace: {}\noutput-dir: {}\ntitle: {}\nprompt-format: {}\nsummary-language: {}\nintake-research: {}\nstage-research: {}\nexecution-network: {}\ncache-root: {}\ncache-policy: {}\n",
+                "Would create follow-up run from `{}`\nworkspace: {}\noutput-dir: {}\ntitle: {}\nprompt-format: {}\nsummary-language: {}\nintake-research: {}\nstage-research: {}\nexecution-network: {}\ncache-root: {}\ncache-policy: {}\nuser-note: {}\n",
                 prompt_file.display(),
                 plan.workspace,
                 output_dir.display(),
@@ -10152,13 +14725,14 @@ fn create_follow_up_run(
                 plan.execution_network_mode,
                 cache_config_from_plan(&plan).root,
                 cache_config_from_plan(&plan).policy,
+                args.note.as_deref().map(str::trim).filter(|value| !value.is_empty()).unwrap_or("none"),
             ),
             stderr: String::new(),
         });
     }
     let new_run = create_run(
         ctx,
-        &prompt_text,
+        &follow_up_prompt,
         &plan_workspace(&plan),
         &output_dir,
         Some(&title),
@@ -10384,6 +14958,15 @@ fn parse_rerun_args(extra: &[&str]) -> Result<RerunArgs, String> {
                     extra
                         .get(index)
                         .ok_or("--prompt-source requires a value")?
+                        .to_string(),
+                );
+            }
+            "--note" => {
+                index += 1;
+                args.note = Some(
+                    extra
+                        .get(index)
+                        .ok_or("--note requires a value")?
                         .to_string(),
                 );
             }
@@ -10860,7 +15443,122 @@ fn task_looks_execution_ready(raw_task: &str) -> bool {
     ]
     .iter()
     .any(|marker| lowered.contains(marker));
-    collapsed.chars().count() >= 240 || (has_structure && has_acceptance_markers)
+    let has_named_artifacts = [
+        "readme",
+        "main.py",
+        ".py",
+        ".rs",
+        ".ts",
+        ".js",
+        ".md",
+        "dockerfile",
+        "package.json",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker));
+    let has_output_or_run_contract = [
+        "stdout",
+        "print",
+        "prints",
+        "exactly",
+        "run command",
+        "command to run",
+        "entrypoint",
+        "entry point",
+        "вывод",
+        "печата",
+        "ровно",
+        "команда запуска",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker));
+    collapsed.chars().count() >= 240
+        || (has_structure && has_acceptance_markers)
+        || (has_named_artifacts && has_output_or_run_contract)
+}
+
+fn task_explicitly_requests_clarification(raw_task: &str) -> bool {
+    let lowered = collapse_whitespace(raw_task).to_ascii_lowercase();
+    [
+        "сначала уточни",
+        "сначала уточните",
+        "уточни у меня",
+        "уточните у меня",
+        "задай мне",
+        "спроси меня",
+        "нужно уточнить",
+        "нужно сначала уточнить",
+        "before you start ask",
+        "ask me first",
+        "ask me about",
+        "clarify with me",
+        "clarify first",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn task_has_open_uncertainty(raw_task: &str) -> bool {
+    let lowered = collapse_whitespace(raw_task).to_ascii_lowercase();
+    [
+        "не решил",
+        "пока не решил",
+        "ещё не решил",
+        "не уверен",
+        "не знаю",
+        "не определился",
+        "не определился",
+        "какой-нибудь",
+        "что он должен делать",
+        "не решил точный формат",
+        "не решил формат вывода",
+        "не решил аргументы",
+        "haven't decided",
+        "have not decided",
+        "not sure",
+        "i'm not sure",
+        "i am not sure",
+        "i don't know yet",
+        "i do not know yet",
+        "something useful",
+        "what it should do",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+}
+
+fn interview_requires_questions(raw_task: &str) -> bool {
+    task_explicitly_requests_clarification(raw_task) || task_has_open_uncertainty(raw_task)
+}
+
+fn interview_can_skip_questions(raw_task: &str) -> bool {
+    if interview_requires_questions(raw_task) {
+        return false;
+    }
+    if task_requests_code_review(raw_task) {
+        return true;
+    }
+    if task_looks_execution_ready(raw_task) {
+        return true;
+    }
+    let lowered = collapse_whitespace(raw_task).to_ascii_lowercase();
+    let has_named_deliverables = ["readme", "main.py", ".py", ".md", "cli"]
+        .iter()
+        .any(|marker| lowered.contains(marker));
+    let has_explicit_contract = [
+        "exactly",
+        "stdout",
+        "prints",
+        "print",
+        "run command",
+        "command to run",
+        "команда запуска",
+        "ровно",
+        "вывод",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker));
+    has_named_deliverables && has_explicit_contract
 }
 
 fn build_local_interview_questions_payload(
@@ -10869,7 +15567,7 @@ fn build_local_interview_questions_payload(
     max_questions: usize,
 ) -> Value {
     let mut questions = Vec::new();
-    if max_questions > 0 && !task_looks_execution_ready(raw_task) {
+    if max_questions > 0 && !interview_can_skip_questions(raw_task) {
         let question = if language_is_russian(language) {
             InterviewQuestion {
                 id: "scope_constraints".to_string(),
@@ -11641,12 +16339,25 @@ fn run_codex_last_message(
         last_message_path.display().to_string(),
         "-".to_string(),
     ];
+    let mut command = command;
+    if env_flag("AGPIPE_CODEX_EPHEMERAL").unwrap_or(false) {
+        command.insert(2, "--ephemeral".to_string());
+    }
+    if let Some(agency_root) = discover_agency_agents_dir(ctx) {
+        if agency_root != ctx.repo_root && agency_root != workdir {
+            let insert_at = command.len().saturating_sub(3);
+            command.insert(insert_at, "--add-dir".to_string());
+            command.insert(insert_at + 1, agency_root.display().to_string());
+        }
+    }
     let code = run_prompted_command_capture(
         &command,
         prompt,
         &stdout_path,
         &stderr_path,
         interrupt_run_dir,
+        None,
+        None,
         true,
     )?;
     if code != 0 {
@@ -11743,11 +16454,17 @@ fn build_interview_questions_prompt(
     language: &str,
     max_questions: usize,
 ) -> String {
+    let execution_ready = interview_can_skip_questions(raw_task);
+    let explicit_clarification_request = task_explicitly_requests_clarification(raw_task);
+    let open_uncertainty = task_has_open_uncertainty(raw_task);
     format!(
-        "You are the stage0 interview agent for multi-agent-pipeline.\n\nYour job is to read the raw request, inspect the workspace when useful, and ask the domain-specific clarification questions that are actually needed before building an execution-ready task prompt.\n\nRaw task:\n{}\n\nWorkspace:\n- path: `{}`\n- exists: `{}`\n\nUse the configured structured output schema for the final answer.\n\nRules:\n- preserve the original goal exactly; do not shrink it\n- ask all important domain questions that materially affect decomposition, implementation, or goal verification\n- ask no more than {} questions\n- avoid questions already answered by the raw task\n- prefer concrete engineering questions over generic project-management questions\n- write user-facing questions and reasons in {}\n- if the task is already clear enough, return an empty `questions` list\n",
+        "You are the stage0 interview agent for multi-agent-pipeline.\n\nYour job is to read the raw request, inspect the workspace only when it changes a concrete clarification question, and ask the domain-specific questions that are actually needed before building a downstream-ready task prompt.\n\nRaw task:\n{}\n\nWorkspace:\n- path: `{}`\n- exists: `{}`\n\nLauncher readiness hints:\n- task_looks_execution_ready: `{}`\n- explicit_clarification_request: `{}`\n- task_has_open_uncertainty: `{}`\n\nUse the configured structured output schema for the final answer.\n\nRules:\n- preserve the original goal exactly; do not shrink it\n- if `explicit_clarification_request=true` or `task_has_open_uncertainty=true`, ask at least one concrete clarification question unless `max_questions=0`\n- only return an empty `questions` list when the task is already downstream-ready and no explicit clarification is requested\n- ask all important domain questions that materially affect decomposition, implementation, review scope, or goal verification\n- ask no more than {} questions\n- avoid questions already answered by the raw task\n- prefer concrete engineering questions over generic project-management questions\n- do not inspect multi-agent-pipeline source files, test files, or tool internals just to infer the response shape; use the provided structured output schema directly\n- do not assume the workspace is a git repository; missing `.git` is not a blocker for asking good questions\n- inspect the workspace only when it can reveal a missing constraint or compatibility risk that would change the questions\n- write user-facing questions and reasons in {}\n",
         raw_task.trim(),
         workspace.display(),
         workspace.exists(),
+        execution_ready,
+        explicit_clarification_request,
+        open_uncertainty,
         max_questions,
         language
     )
@@ -11756,7 +16473,7 @@ fn build_interview_questions_prompt(
 fn build_interview_finalize_prompt(raw_task: &str, qa_pairs: &[Value], language: &str) -> String {
     let qa_json = serde_json::to_string_pretty(qa_pairs).unwrap_or_else(|_| "[]".to_string());
     format!(
-        "You are the stage0 prompt builder for multi-agent-pipeline.\n\nYour job is to turn the raw request plus clarification answers into the final task prompt that will be passed into the Rust agpipe intake and create-run flow.\n\nRaw task:\n{}\n\nClarifications:\n{}\n\nWrite the final task in {}. Return markdown only, with no code fences.\n\nRules:\n- preserve the original goal exactly; do not downgrade it to scaffold-only or architecture-only\n- incorporate the answered constraints and preferences directly\n- carry forward unresolved uncertainties as explicit blockers or open assumptions\n- make the task execution-ready for downstream agents\n- include what counts as done\n- include do-not-regress constraints when the answers imply them\n",
+        "You are the stage0 prompt builder for multi-agent-pipeline.\n\nYour job is to turn the raw request plus clarification answers into the final task prompt that will be passed into the Rust agpipe intake and create-run flow.\n\nRaw task:\n{}\n\nClarifications:\n{}\n\nWrite the final task in {}. Return markdown only, with no code fences.\n\nRules:\n- preserve the original goal exactly; do not downgrade it to scaffold-only or architecture-only\n- incorporate the answered constraints and preferences directly\n- carry forward unresolved uncertainties as explicit blockers or open assumptions\n- make the task ready for downstream agents; if the user asked for review-only work, keep it review-only instead of silently converting it into implementation work\n- include what counts as done\n- include do-not-regress constraints when the answers imply them\n",
         raw_task.trim(),
         qa_json,
         language
@@ -11784,6 +16501,26 @@ fn generate_interview_questions(
         &stage0_prompt_path(&artifact_dir, "interview-questions"),
         &prompt,
     )?;
+    if interview_can_skip_questions(raw_task) {
+        let payload = build_local_interview_questions_payload(raw_task, language, 0);
+        let rendered = serde_json::to_string_pretty(&payload).map_err(|err| {
+            format!("Could not serialize execution-ready stage0 questions: {err}")
+        })?;
+        write_text(
+            &stage0_last_message_path(&artifact_dir, "interview-questions"),
+            &rendered,
+        )?;
+        write_stage0_fallback_metadata(
+            &artifact_dir,
+            "interview-questions",
+            stage0_backend_name(stage0_backend_mode(ctx)),
+            "execution-ready-fast-path",
+            "The raw task already includes concrete deliverables, success criteria, and validation expectations, so stage0 skipped model-driven interview questions.",
+            &[session_dir.join("raw-task.md")],
+        )?;
+        write_json(&session_dir.join("questions.json"), &payload)?;
+        return Ok((session_dir, payload));
+    }
     let cwd =
         env::current_dir().map_err(|err| format!("Could not read current directory: {err}"))?;
     let workdir = if workspace.exists() {
@@ -11792,7 +16529,7 @@ fn generate_interview_questions(
         cwd
     };
     let requested_backend = stage0_backend_name(stage0_backend_mode(ctx));
-    let payload = match stage0_backend_mode(ctx) {
+    let mut payload = match stage0_backend_mode(ctx) {
         Stage0BackendMode::Local => {
             let payload =
                 build_local_interview_questions_payload(raw_task, language, max_questions);
@@ -11854,6 +16591,31 @@ fn generate_interview_questions(
             extract_json_object(&raw_questions)?
         }
     };
+    let empty_questions = payload
+        .get("questions")
+        .and_then(|value| value.as_array())
+        .map(|items| items.is_empty())
+        .unwrap_or(true);
+    if empty_questions
+        && interview_requires_questions(raw_task)
+        && !interview_can_skip_questions(raw_task)
+    {
+        payload = build_local_interview_questions_payload(raw_task, language, max_questions);
+        let rendered = serde_json::to_string_pretty(&payload)
+            .map_err(|err| format!("Could not serialize guarded local stage0 questions: {err}"))?;
+        write_text(
+            &stage0_last_message_path(&artifact_dir, "interview-questions"),
+            &rendered,
+        )?;
+        write_stage0_fallback_metadata(
+            &artifact_dir,
+            "interview-questions",
+            requested_backend,
+            "empty-questions-guardrail",
+            "Stage0 returned an empty questions list even though the raw task explicitly requested clarification or left critical uncertainty unresolved.",
+            &[session_dir.join("raw-task.md")],
+        )?;
+    }
     write_json(&session_dir.join("questions.json"), &payload)?;
     Ok((session_dir, payload))
 }
@@ -12128,6 +16890,61 @@ pub fn execute_safe_next_action(ctx: &Context, run_dir: &Path) -> Result<Command
     execute_named_action(ctx, run_dir, &report.safe_next_action)
 }
 
+pub fn execute_doctor_fix(ctx: &Context, run_dir: &Path) -> Result<CommandResult, String> {
+    let report = doctor_report(ctx, run_dir)?;
+    if report.fix_actions.is_empty() {
+        return Ok(CommandResult::ok(
+            "Doctor found no machine-actionable fix.\n",
+        ));
+    }
+    let mut stdout = format!(
+        "Doctor auto-fix plan:\n- {}\n",
+        report.fix_actions.join("\n- ")
+    );
+    let mut requested_interrupt = false;
+    for action in &report.fix_actions {
+        let result = execute_named_action(ctx, run_dir, action)?;
+        if action.trim() == "interrupt" {
+            requested_interrupt = true;
+        }
+        stdout.push_str(&format!("\n=== action: {action} ===\n"));
+        if !result.stdout.trim().is_empty() {
+            stdout.push_str(result.stdout.trim_end());
+            stdout.push('\n');
+        }
+        if !result.stderr.trim().is_empty() {
+            stdout.push_str(result.stderr.trim_end());
+            stdout.push('\n');
+        }
+        if result.code != 0 {
+            return Ok(CommandResult {
+                code: result.code,
+                stdout,
+                stderr: String::new(),
+            });
+        }
+    }
+    if requested_interrupt {
+        stdout.push_str(
+            "\nInterrupt was requested. Refresh doctor/status after the current stage acknowledges cancellation.\n",
+        );
+        return Ok(CommandResult {
+            code: 0,
+            stdout,
+            stderr: String::new(),
+        });
+    }
+    let refreshed = doctor_report(ctx, run_dir)?;
+    stdout.push_str("\nDoctor after fix:\n\n");
+    stdout.push_str(&doctor_compact_text(&refreshed));
+    stdout.push('\n');
+    Ok(CommandResult {
+        code: 0,
+        stdout,
+        stderr: String::new(),
+    })
+}
+
 pub fn execute_named_action(
     ctx: &Context,
     run_dir: &Path,
@@ -12142,6 +16959,13 @@ pub fn execute_named_action(
     }
     if trimmed == "rerun" {
         return run_stage_capture(ctx, run_dir, "rerun", &[]);
+    }
+    if trimmed == "host-probe --refresh" {
+        return run_stage_capture(ctx, run_dir, "host-probe", &["--refresh"]);
+    }
+    if trimmed == "interrupt" {
+        crate::runtime::request_interrupt(run_dir)?;
+        return Ok(CommandResult::ok("Interrupt requested for the current stage."));
     }
     if let Some(stage) = trimmed.strip_prefix("start ") {
         return run_stage_capture(ctx, run_dir, "start", &[stage.trim()]);
@@ -12270,11 +17094,20 @@ pub fn append_amendment(run_dir: &Path, note: &str) -> Result<PathBuf, String> {
 }
 
 pub fn preview_text(run_dir: &Path, max_chars: usize) -> (String, String) {
-    if let Some((_path, text)) = effective_user_summary(run_dir) {
+    if let Some((path, text)) = effective_user_summary(run_dir) {
         let trimmed = text.trim();
         if !trimmed.is_empty() {
+            let label = match path
+                .parent()
+                .and_then(|value| value.file_name())
+                .and_then(|value| value.to_str())
+            {
+                Some("verification") => "Verification Summary",
+                Some("review") => "Review Summary",
+                _ => "Summary",
+            };
             return (
-                "Summary".to_string(),
+                label.to_string(),
                 trimmed.chars().take(max_chars).collect(),
             );
         }
@@ -12355,10 +17188,11 @@ fn latest_log_file(logs_dir: &Path) -> Option<PathBuf> {
     if logs.is_empty() {
         return None;
     }
-    logs.sort_by_key(|path| {
+    logs.sort_by_cached_key(|path| {
         (
             log_path_has_visible_content(path),
             path.metadata().and_then(|meta| meta.modified()).ok(),
+            path.clone(),
         )
     });
     logs.pop()
@@ -12483,9 +17317,9 @@ fn dispatch_run_stage(
             run_dir.display()
         ));
     }
-    if !run_dir.join("plan.json").exists() {
+    if !run_has_plan_artifact(run_dir) {
         return Err(format!(
-            "Missing plan.json in run directory: {}",
+            "Missing plan artifact in run directory: {}",
             run_dir.display()
         ));
     }
@@ -12508,6 +17342,13 @@ fn dispatch_run_stage(
         }
         "doctor" => {
             let as_json = extra.contains(&"--json");
+            let fix = extra.contains(&"--fix");
+            if as_json && fix {
+                return Err("doctor does not support combining --json with --fix".to_string());
+            }
+            if fix {
+                return execute_doctor_fix(ctx, run_dir);
+            }
             let report = doctor_report(ctx, run_dir)?;
             let stdout = if as_json {
                 serde_json::to_string_pretty(&report)
@@ -12543,11 +17384,11 @@ fn dispatch_run_stage(
         "refresh-prompt" => {
             let args = parse_stage_only_args(extra)?;
             let stage = resolve_stage(run_dir, &args.stage)?;
-            refresh_stage_prompt(run_dir, &stage, args.dry_run)
+            refresh_stage_prompt(ctx, run_dir, &stage, args.dry_run)
         }
         "refresh-prompts" => {
             let dry_run = extra.contains(&"--dry-run");
-            refresh_all_stage_prompts(run_dir, dry_run)
+            refresh_all_stage_prompts(ctx, run_dir, dry_run)
         }
         "cache-status" => print_cache_status(run_dir, &parse_cache_status_args(extra)?),
         "cache-prune" => run_cache_prune(run_dir, &parse_cache_prune_args(extra)?),
@@ -12871,27 +17712,45 @@ pub fn task_flow_stream(ctx: &Context, subcommand: &str, extra: &[String]) -> Re
 #[cfg(test)]
 mod tests {
     use super::{
-        amend_run, automate_run, available_stages, build_cache_config,
+        amend_run, automate_run, available_stages, build_cache_config, build_codex_command,
         build_responses_stage_prompt, cache_lock, cache_lock_owner_path, capture_host_probe,
-        choose_roles, contextual_log_excerpt, create_follow_up_run, create_run, current_unix_secs,
-        detect_host_facts, detect_local_template, doctor_report, ensure_cache_layout,
-        finalize_interview_prompt, generate_interview_questions, host_probe_path, host_probe_state,
-        load_plan, load_service_check_spec, materialize_embedded_repo_root,
-        maybe_copy_interview_artifacts, next_stage_for_run, output_looks_placeholder, preview_text,
-        read_file_digest, read_json, read_text, record_token_usage_with_replacement,
-        render_verification_prompt, require_valid_order, restore_stage_cache, reviewer_stack_for,
-        run_prompted_command_capture, run_stage0_last_message, run_stage_capture,
-        runtime_check_required, runtime_check_run, safe_next_action_for_run, save_plan,
-        solver_count_for, stage_cache_key, stage_prompt_path, stage_rank, status_report,
+        choose_roles, compile_prompt, contextual_log_excerpt, create_follow_up_run, create_run,
+        choose_roles_with_workstreams,
+        current_unix_secs, default_pipeline_includes_execution, default_pipeline_stage_specs,
+        detect_host_facts, detect_local_template,
+        doctor_report, ensure_cache_layout, execute_doctor_fix, finalize_interview_prompt,
+        first_stage_id_for_kind, generate_interview_questions, host_probe_path, host_probe_state,
+        infer_execution_mode, infer_task_kind, is_stage_complete, latest_log_file, load_plan,
+        load_service_check_spec, materialize_embedded_repo_root,
+        maybe_copy_interview_artifacts, next_stage_for_run, output_looks_placeholder,
+        recover_review_artifacts_from_stdout_transcript,
+        recover_solver_artifact_from_stdout_transcript,
+        recover_verification_artifacts_from_stdout_transcript,
+        persist_stage_mcp_note, preview_text, prompt_prefers_lightweight_validation,
+        provision_selected_mcp_servers, read_file_digest, read_json, read_text,
+        read_mcp_usage_records, record_stage_mcp_usage, record_token_usage_with_replacement,
+        render_mcp_accountability_rules, render_review_prompt, render_solver_prompt, render_stage_prompt,
+        render_verification_prompt, require_valid_order,
+        restore_stage_cache, reviewer_stack_for, reviewer_stack_for_task, run_codex_last_message,
+        run_has_plan_artifact, run_prompted_command_capture, run_reference_asset_path,
+        run_stage0_last_message, run_stage_capture, runtime_check_required, runtime_check_run,
+        safe_next_action_for_run, save_plan, solver_count_for, solver_memory_namespace,
+        stage_cache_key, stage_memory_namespace, stage_prompt_path, stage_rank, status_report,
         status_text, store_stage_cache, summarize_token_ledger, sync_run_artifacts,
-        task_flow_capture, with_engine_observer, write_json, write_text, CacheLockOwner, Context,
-        EngineObserver, InterviewFinalizePayload, InterviewQuestionsPayload, LocalTemplateKind,
-        Plan, PromptCacheHashes, RerunArgs, RunTokenLedger, RunTokenLedgerEntry, StageBackendKind,
-        TokenBudget, TokenUsage, WorkstreamHint, DECOMPOSITION_RULES_REF, REVIEW_RUBRIC_REF,
-        ROLE_MAP_REF, STAGE_RESULTS_AREA, VERIFICATION_RUBRIC_REF,
+        task_flow_capture, task_forbids_workspace_changes, task_is_analysis_only,
+        task_requests_workspace_changes, verification_workspace_documents, with_engine_observer,
+        workstream_hints_for, write_json, write_responses_stage_outputs, write_text,
+        CacheLockOwner, Context, EngineObserver, InterviewFinalizePayload,
+        InterviewQuestionsPayload, LocalTemplateKind, McpProvisionRecord, McpSelection,
+        McpServerPlan, McpUsageRecord, PipelineConfig, PipelineStageKind, Plan,
+        PromptCacheHashes, RerunArgs, RunTokenLedger, RunTokenLedgerEntry, SolverRole,
+        StageBackendKind, StartArgs, TokenBudget, TokenUsage, WorkstreamHint,
+        DECOMPOSITION_RULES_REF, MCP_USAGE_LOG_REF, REVIEW_RUBRIC_REF, ROLE_MAP_REF,
+        STAGE_RESULTS_AREA, VERIFICATION_RUBRIC_REF,
     };
     use crate::runtime;
     use serde_json::{json, Value};
+    use std::env;
     use std::fs;
     use std::io::{BufRead, BufReader, Read as _, Write as _};
     use std::net::TcpListener;
@@ -12945,6 +17804,32 @@ mod tests {
         entries.remove(0)
     }
 
+    struct ScopedEnvVar {
+        key: String,
+        previous: Option<String>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &str, value: &str) -> Self {
+            let previous = env::var(key).ok();
+            env::set_var(key, value);
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                env::set_var(&self.key, value);
+            } else {
+                env::remove_var(&self.key);
+            }
+        }
+    }
+
     fn test_context() -> Context {
         Context {
             repo_root: std::env::current_dir().expect("current dir"),
@@ -12959,6 +17844,35 @@ mod tests {
             openai_store: false,
             openai_background: true,
         }
+    }
+
+    fn test_context_with_sibling_agency(name: &str) -> (Context, PathBuf, PathBuf, PathBuf) {
+        let root = temp_dir(&format!("agency-catalog-{name}"));
+        let repo_root = root.join("workspace").join("multi-agent-pipeline");
+        let agency_root = root.join("agency-agents");
+        let workspace = root.join("workspace-root");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        fs::create_dir_all(&agency_root).expect("create agency root");
+        fs::create_dir_all(&workspace).expect("create workspace root");
+        let mut ctx = test_context();
+        ctx.repo_root = repo_root;
+        (ctx, root, agency_root, workspace)
+    }
+
+    fn write_agency_role(
+        agency_root: &Path,
+        relative: &str,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> PathBuf {
+        let path = agency_root.join(relative);
+        write_text(
+            &path,
+            &format!("---\nname: {name}\ndescription: {description}\ncolor: cyan\n---\n\n{body}"),
+        )
+        .expect("write agency role");
+        path
     }
 
     fn mock_codex_context(name: &str) -> (Context, PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -13403,7 +18317,7 @@ print "mock $label complete"
                                 r##"{
   "id":"resp_intake",
   "status":"completed",
-  "output_text":"{\n  \"brief_md\": \"# Brief\\n\\nUse the Responses backend for non-execution stages and keep execution on Codex until local tools are ported.\\n\",\n  \"plan_json\": {\n    \"created_at\": \"mock\",\n    \"workspace\": \"/tmp/mock-workspace\",\n    \"workspace_exists\": true,\n    \"original_task\": \"Mock Responses migration\",\n    \"task_kind\": \"migration\",\n    \"complexity\": \"complex\",\n    \"execution_mode\": \"full\",\n    \"prompt_format\": \"compact\",\n    \"summary_language\": \"ru\",\n    \"intake_research_mode\": \"research-first\",\n    \"stage_research_mode\": \"local-first\",\n    \"execution_network_mode\": \"fetch-if-needed\",\n    \"cache\": {\n      \"enabled\": true,\n      \"root\": \"/tmp/mock-cache\",\n      \"policy\": \"reuse\"\n    },\n    \"token_budget\": {\n      \"total_tokens\": 50000,\n      \"warning_threshold_tokens\": 40000,\n      \"source\": \"mock\"\n    },\n    \"host_facts\": {\n      \"source\": \"mock\",\n      \"preferred_torch_device\": \"cpu\"\n    },\n    \"solver_count\": 1,\n    \"solver_roles\": [\n      {\n        \"solver_id\": \"solver-a\",\n        \"role\": \"implementation-engineer\",\n        \"angle\": \"implementation-first\"\n      }\n    ],\n    \"workstream_hints\": [\n      {\n        \"goal\": \"native-runtime-parity\",\n        \"name\": \"native-runtime-parity\",\n        \"suggested_role\": \"implementation-engineer\"\n      }\n    ],\n    \"goal_gate_enabled\": true,\n    \"augmented_follow_up_enabled\": true,\n    \"goal_checks\": [\n      {\n        \"id\": \"responses-non-execution\",\n        \"requirement\": \"Run non-execution stages through Responses backend\",\n        \"critical\": true\n      }\n    ],\n    \"reviewer_stack\": [\n      \"testing/testing-reality-checker.md\"\n    ],\n    \"validation_commands\": [\n      \"cargo test\"\n    ],\n    \"references\": {}\n  }\n}",
+  "output_text":"{\n  \"brief_md\": \"# Brief\\n\\nUse the Responses backend for non-execution stages and keep execution on Codex until local tools are ported.\\n\",\n  \"plan_json\": {\n    \"created_at\": \"mock\",\n    \"workspace\": \"/tmp/mock-workspace\",\n    \"workspace_exists\": true,\n    \"original_task\": \"Mock Responses migration\",\n    \"task_kind\": \"migration\",\n    \"complexity\": \"complex\",\n    \"execution_mode\": \"full\",\n    \"prompt_format\": \"compact\",\n    \"summary_language\": \"ru\",\n    \"intake_research_mode\": \"research-first\",\n    \"stage_research_mode\": \"local-first\",\n    \"execution_network_mode\": \"fetch-if-needed\",\n    \"cache\": {\n      \"enabled\": true,\n      \"root\": \"/tmp/mock-cache\",\n      \"policy\": \"reuse\"\n    },\n    \"token_budget\": {\n      \"total_tokens\": 50000,\n      \"warning_threshold_tokens\": 40000,\n      \"source\": \"mock\"\n    },\n    \"host_facts\": {\n      \"source\": \"mock\",\n      \"preferred_torch_device\": \"cpu\"\n    },\n    \"solver_count\": 1,\n    \"solver_roles\": [\n      {\n        \"solver_id\": \"solver-a\",\n        \"role\": \"implementation-engineer\",\n        \"angle\": \"implementation-first\"\n      }\n    ],\n    \"workstream_hints\": [\n      {\n        \"goal\": \"native-runtime-parity\",\n        \"name\": \"native-runtime-parity\",\n        \"suggested_role\": \"implementation-engineer\"\n      }\n    ],\n    \"goal_gate_enabled\": true,\n    \"augmented_follow_up_enabled\": true,\n    \"goal_checks\": [\n      {\n        \"id\": \"responses-non-execution\",\n        \"requirement\": \"Run non-execution stages through Responses backend\",\n        \"critical\": true\n      }\n    ],\n    \"reviewer_stack\": [\n      \"testing/testing-reality-checker.md\"\n    ],\n    \"validation_commands\": [\n      \"cargo test\"\n    ],\n    \"references\": {}\n  },\n  \"mcp_usage_md\": \"- fetch: not used; local context was sufficient.\\n- memory: not used; no cross-stage handoff was needed.\"\n}",
   "usage": {
     "input_tokens": 1400,
     "output_tokens": 260,
@@ -13419,7 +18333,7 @@ print "mock $label complete"
                             r##"{
   "id":"resp_solver_a",
   "status":"completed",
-  "output_text":"{\n  \"result_md\": \"# Result\\n\\nMock solver output produced through Responses backend.\\n\"\n}",
+  "output_text":"{\n  \"result_md\": \"# Result\\n\\nMock solver output produced through Responses backend.\\n\",\n  \"mcp_usage_md\": \"- fetch: used to verify one official URL.\\n- memory: not used; no durable handoff was required.\"\n}",
   "usage": {
     "input_tokens": 900,
     "output_tokens": 150,
@@ -13434,7 +18348,7 @@ print "mock $label complete"
                             r##"{
   "id":"resp_review",
   "status":"completed",
-  "output_text":"{\n  \"report_md\": \"# Review Report\\n\\nMock review selected solver-a.\\n\",\n  \"scorecard_json\": {\n    \"winner\": \"solver-a\",\n    \"selected\": \"solver-a\",\n    \"why\": \"Mock best result\"\n  },\n  \"user_summary_md\": \"# User Summary\\n\\nMock localized review summary.\\n\"\n}",
+  "output_text":"{\n  \"report_md\": \"# Review Report\\n\\nMock review selected solver-a.\\n\",\n  \"scorecard_json\": {\n    \"winner\": \"solver-a\",\n    \"selected\": \"solver-a\",\n    \"why\": \"Mock best result\"\n  },\n  \"user_summary_md\": \"# User Summary\\n\\nMock localized review summary.\\n\",\n  \"mcp_usage_md\": \"- fetch: not used during comparison.\\n- memory: used for the review handoff namespace.\"\n}",
   "usage": {
     "input_tokens": 1250,
     "output_tokens": 220,
@@ -13449,7 +18363,7 @@ print "mock $label complete"
                             r##"{
   "id":"resp_verification",
   "status":"completed",
-  "output_text":"{\n  \"findings_md\": \"# Findings\\n\\nNo critical findings in mock verification.\\n\",\n  \"user_summary_md\": \"# Verification Summary\\n\\nMock verification summary.\\n\",\n  \"improvement_request_md\": \"# Improvement Request\\n\\nNo rerun required.\\n\",\n  \"augmented_task_md\": \"# Augmented Task\\n\\nKeep the current verified state.\\n\",\n  \"goal_status_json\": {\n    \"goal_complete\": true,\n    \"goal_verdict\": \"complete\",\n    \"rerun_recommended\": false,\n    \"recommended_next_action\": \"none\"\n  }\n}",
+  "output_text":"{\n  \"findings_md\": \"# Findings\\n\\nNo critical findings in mock verification.\\n\",\n  \"user_summary_md\": \"# Verification Summary\\n\\nMock verification summary.\\n\",\n  \"improvement_request_md\": \"# Improvement Request\\n\\nNo rerun required.\\n\",\n  \"augmented_task_md\": \"# Augmented Task\\n\\nKeep the current verified state.\\n\",\n  \"goal_status_json\": {\n    \"goal_complete\": true,\n    \"goal_verdict\": \"complete\",\n    \"rerun_recommended\": false,\n    \"recommended_next_action\": \"none\"\n  },\n  \"mcp_usage_md\": \"- fetch: not used; verification stayed local.\\n- memory: used to read the review-stage handoff.\"\n}",
   "usage": {
     "input_tokens": 1500,
     "output_tokens": 280,
@@ -13786,6 +18700,458 @@ print "mock $label complete"
     }
 
     #[test]
+    fn runtime_check_requirement_ignores_analysis_only_research_tasks_that_mention_workers() {
+        let ctx = test_context();
+        let workspace = temp_dir("runtime-check-research-workers-workspace");
+        let output_root = temp_dir("runtime-check-research-workers-output");
+        let cache_root = temp_dir("runtime-check-research-workers-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи анализ AI coding-агентов в контексте CI/CD на примере Codex. Это исследование, а не реализация классического CI runner/worker или сервиса. Не внедряй сервис и не меняй код.",
+            &workspace,
+            &output_root,
+            Some("runtime-check-research-workers"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create research runtime-check run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        assert!(!plan.task_kind.is_empty());
+        assert!(!runtime_check_required(&run_dir, "verification")
+            .expect("check runtime-check requirement"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn runtime_check_requirement_ignores_audit_improve_verification_without_execution_stage() {
+        let ctx = test_context();
+        let workspace = temp_dir("runtime-check-audit-improve-workspace");
+        let output_root = temp_dir("runtime-check-audit-improve-output");
+        let cache_root = temp_dir("runtime-check-audit-improve-cache");
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\n\n## Follow-Up Task\n\nПроведи docs-only audit-improve для сервиса `~/sample-service`: обнови narrative artifacts и не переходи к реализации, runtime harness или изменению кода.\n";
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("runtime-check-audit-improve"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create audit-improve runtime-check run");
+
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        assert_eq!(plan.task_kind, "audit-improve");
+        plan.pipeline.stages.retain(|stage| stage.id != "execution");
+        save_plan(&run_dir, &plan).expect("save plan without execution");
+        assert!(!available_stages(&run_dir)
+            .expect("available stages")
+            .iter()
+            .any(|stage| stage == "execution"));
+        assert!(!runtime_check_required(&run_dir, "verification")
+            .expect("check audit-improve verification runtime requirement"));
+
+        let prompt = compile_prompt(&ctx, &run_dir, "verification").expect("compile verification");
+        assert!(!prompt.contains("Runtime harness:"));
+        assert!(!prompt.contains("runner_command"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn service_check_validation_command_uses_current_agpipe_path() {
+        let run_dir = temp_run_dir("runtime-check-command-path");
+        let command = super::service_check_validation_command(&run_dir, "verification");
+        let current_exe = env::current_exe()
+            .expect("current exe")
+            .display()
+            .to_string();
+
+        assert!(command.contains("internal runtime-check"));
+        assert!(command.contains(&current_exe));
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn recover_review_artifacts_from_stdout_transcript_materializes_review_files() {
+        let run_dir = temp_run_dir("review-stdout-recovery");
+        let review_dir = run_dir.join("review");
+        fs::create_dir_all(&review_dir).expect("create review dir");
+        write_text(&review_dir.join("report.md"), "# Review Report\n\nPending review stage.\n")
+            .expect("write placeholder report");
+        write_text(
+            &review_dir.join("user-summary.md"),
+            "# User Summary\n\nPending localized review summary.\n",
+        )
+        .expect("write placeholder summary");
+        write_text(&review_dir.join("scorecard.json"), "{}\n").expect("write placeholder scorecard");
+        let stdout_path = run_dir.join("logs").join("review.stdout.log");
+        fs::create_dir_all(stdout_path.parent().expect("stdout parent"))
+            .expect("create stdout parent");
+        write_text(
+            &stdout_path,
+            "codex\n<<<AGPIPE_REVIEW_REPORT>>>\n# Review Report\n\nRecovered review.\n<<<AGPIPE_REVIEW_SCORECARD_JSON>>>\n{\"winner\":\"solver-b\",\"backup\":\"solver-a\",\"why\":\"best\",\"validation_evidence\":[\"local diff\"],\"critical_gaps\":[\"none\"],\"execution_notes\":[\"keep scope\"]}\n<<<AGPIPE_REVIEW_USER_SUMMARY>>>\n# User Summary\n\nRecovered summary.\n",
+        )
+        .expect("write stdout transcript");
+        let last_message_path = run_dir.join("logs").join("review.last.md");
+
+        let recovered = recover_review_artifacts_from_stdout_transcript(
+            &run_dir,
+            &stdout_path,
+            &last_message_path,
+        )
+        .expect("recover review artifacts");
+
+        assert!(recovered);
+        assert!(read_text(&review_dir.join("report.md"))
+            .expect("read report")
+            .contains("Recovered review."));
+        assert!(read_text(&review_dir.join("user-summary.md"))
+            .expect("read summary")
+            .contains("Recovered summary."));
+        let scorecard = read_json::<Value>(&review_dir.join("scorecard.json"))
+            .expect("read scorecard json");
+        assert_eq!(scorecard["winner"], "solver-b");
+        assert!(last_message_path.exists());
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn recover_verification_artifacts_from_stdout_transcript_materializes_verification_files() {
+        let run_dir = temp_run_dir("verification-stdout-recovery");
+        let verification_dir = run_dir.join("verification");
+        fs::create_dir_all(&verification_dir).expect("create verification dir");
+        write_text(&verification_dir.join("findings.md"), "# Findings\n\nPending verification stage.\n")
+            .expect("write placeholder findings");
+        write_text(
+            &verification_dir.join("user-summary.md"),
+            "# Verification Summary\n\nPending localized verification summary.\n",
+        )
+        .expect("write placeholder verification summary");
+        write_text(
+            &verification_dir.join("improvement-request.md"),
+            "# Improvement Request\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder improvement request");
+        write_text(
+            &verification_dir.join("augmented-task.md"),
+            "# Augmented Task\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder augmented task");
+        write_text(&verification_dir.join("goal-status.json"), "{}\n")
+            .expect("write placeholder goal status");
+        let mut plan = Plan::default();
+        plan.goal_gate_enabled = true;
+        plan.augmented_follow_up_enabled = true;
+        save_plan(&run_dir, &plan).expect("save plan");
+        let stdout_path = run_dir.join("logs").join("verification.stdout.log");
+        fs::create_dir_all(stdout_path.parent().expect("stdout parent"))
+            .expect("create stdout parent");
+        write_text(
+            &stdout_path,
+            "codex\n<<<AGPIPE_VERIFICATION_FINDINGS>>>\n# Findings\n\nRecovered findings.\n<<<AGPIPE_VERIFICATION_GOAL_STATUS_JSON>>>\n{\"goal_complete\":false,\"goal_verdict\":\"partial\",\"rerun_recommended\":true,\"recommended_next_action\":\"rerun\"}\n<<<AGPIPE_VERIFICATION_USER_SUMMARY>>>\n# Verification Summary\n\nRecovered verification summary.\n<<<AGPIPE_VERIFICATION_IMPROVEMENT_REQUEST>>>\n# Improvement Request\n\nRecovered improvement request.\n<<<AGPIPE_VERIFICATION_AUGMENTED_TASK>>>\n# Augmented Task\n\nRecovered augmented task.\n",
+        )
+        .expect("write verification stdout transcript");
+        let last_message_path = run_dir.join("logs").join("verification.last.md");
+
+        let recovered = recover_verification_artifacts_from_stdout_transcript(
+            &run_dir,
+            &stdout_path,
+            &last_message_path,
+        )
+        .expect("recover verification artifacts");
+
+        assert!(recovered);
+        assert!(read_text(&verification_dir.join("findings.md"))
+            .expect("read findings")
+            .contains("Recovered findings."));
+        assert!(read_text(&verification_dir.join("user-summary.md"))
+            .expect("read verification summary")
+            .contains("Recovered verification summary."));
+        assert!(read_text(&verification_dir.join("improvement-request.md"))
+            .expect("read improvement request")
+            .contains("Recovered improvement request."));
+        assert!(read_text(&verification_dir.join("augmented-task.md"))
+            .expect("read augmented task")
+            .contains("Recovered augmented task."));
+        let goal_status = read_json::<Value>(&verification_dir.join("goal-status.json"))
+            .expect("read recovered goal status");
+        assert_eq!(goal_status["goal_verdict"], "partial");
+        assert!(last_message_path.exists());
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn recover_verification_artifacts_handles_reordered_bundle_and_repeated_goal_status_tag() {
+        let run_dir = temp_run_dir("verification-stdout-recovery-reordered");
+        let verification_dir = run_dir.join("verification");
+        fs::create_dir_all(&verification_dir).expect("create verification dir");
+        write_text(&verification_dir.join("findings.md"), "# Findings\n\nPending verification stage.\n")
+            .expect("write placeholder findings");
+        write_text(
+            &verification_dir.join("user-summary.md"),
+            "# Verification Summary\n\nPending localized verification summary.\n",
+        )
+        .expect("write placeholder verification summary");
+        write_text(
+            &verification_dir.join("improvement-request.md"),
+            "# Improvement Request\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder improvement request");
+        write_text(
+            &verification_dir.join("augmented-task.md"),
+            "# Augmented Task\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder augmented task");
+        write_text(&verification_dir.join("goal-status.json"), "{}\n")
+            .expect("write placeholder goal status");
+        let mut plan = Plan::default();
+        plan.goal_gate_enabled = true;
+        plan.augmented_follow_up_enabled = true;
+        save_plan(&run_dir, &plan).expect("save plan");
+        let stdout_path = run_dir.join("logs").join("verification.stdout.log");
+        fs::create_dir_all(stdout_path.parent().expect("stdout parent"))
+            .expect("create stdout parent");
+        write_text(
+            &stdout_path,
+            "codex\n<<<AGPIPE_VERIFICATION_AUGMENTED_TASK>>>\n# Augmented Task\n\nRecovered augmented task.\ntokens used\n75 148\n<<<AGPIPE_VERIFICATION_FINDINGS>>>\n# Findings\n\nRecovered findings.\n<<<AGPIPE_VERIFICATION_FINDINGS>>>\n<<<AGPIPE_VERIFICATION_GOAL_STATUS_JSON>>>\n{\"goal_complete\":false,\"goal_verdict\":\"partial\",\"rerun_recommended\":true,\"recommended_next_action\":\"rerun\"}\n<<<AGPIPE_VERIFICATION_GOAL_STATUS_JSON>>>\n<<<AGPIPE_VERIFICATION_USER_SUMMARY>>>\n# Verification Summary\n\nRecovered verification summary.\n<<<AGPIPE_VERIFICATION_USER_SUMMARY>>>\n<<<AGPIPE_VERIFICATION_IMPROVEMENT_REQUEST>>>\n# Improvement Request\n\nRecovered improvement request.\n<<<AGPIPE_VERIFICATION_IMPROVEMENT_REQUEST>>>\n",
+        )
+        .expect("write verification stdout transcript");
+        let last_message_path = run_dir.join("logs").join("verification.last.md");
+
+        let recovered = recover_verification_artifacts_from_stdout_transcript(
+            &run_dir,
+            &stdout_path,
+            &last_message_path,
+        )
+        .expect("recover verification artifacts");
+
+        assert!(recovered);
+        assert!(read_text(&verification_dir.join("findings.md"))
+            .expect("read findings")
+            .contains("Recovered findings."));
+        assert!(read_text(&verification_dir.join("augmented-task.md"))
+            .expect("read augmented task")
+            .contains("Recovered augmented task."));
+        let goal_status = read_json::<Value>(&verification_dir.join("goal-status.json"))
+            .expect("read recovered goal status");
+        assert_eq!(goal_status["goal_verdict"], "partial");
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn prompted_command_capture_completes_verification_from_last_message_bundle() {
+        let root = temp_dir("prompted-command-last-message-verification");
+        let run_dir = temp_run_dir("prompted-command-last-message-verification-run");
+        let verification_dir = run_dir.join("verification");
+        fs::create_dir_all(&verification_dir).expect("create verification dir");
+        write_text(
+            &verification_dir.join("findings.md"),
+            "# Findings\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder findings");
+        write_text(
+            &verification_dir.join("user-summary.md"),
+            "# Verification Summary\n\nPending localized verification summary.\n",
+        )
+        .expect("write placeholder verification summary");
+        write_text(
+            &verification_dir.join("improvement-request.md"),
+            "# Improvement Request\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder improvement request");
+        write_text(
+            &verification_dir.join("augmented-task.md"),
+            "# Augmented Task\n\nPending verification stage.\n",
+        )
+        .expect("write placeholder augmented task");
+        write_text(&verification_dir.join("goal-status.json"), "{}\n")
+            .expect("write placeholder goal status");
+        let mut plan = Plan::default();
+        plan.goal_gate_enabled = true;
+        plan.augmented_follow_up_enabled = true;
+        save_plan(&run_dir, &plan).expect("save plan");
+
+        let script = root.join("mock-capture-verification-last-message.zsh");
+        write_text(
+            &script,
+            "#!/bin/zsh\nset -euo pipefail\ncat >/dev/null\nsleep 1\ncat > \"$1\" <<'EOF'\n<<<AGPIPE_VERIFICATION_FINDINGS>>>\n# Findings\n\nRecovered from last message.\n<<<AGPIPE_VERIFICATION_GOAL_STATUS_JSON>>>\n{\"goal_complete\":false,\"goal_verdict\":\"partial\",\"rerun_recommended\":true,\"recommended_next_action\":\"rerun\"}\n<<<AGPIPE_VERIFICATION_USER_SUMMARY>>>\n# Verification Summary\n\nRecovered summary from last message.\n<<<AGPIPE_VERIFICATION_IMPROVEMENT_REQUEST>>>\n# Improvement Request\n\nRecovered improvement request.\n<<<AGPIPE_VERIFICATION_AUGMENTED_TASK>>>\n# Augmented Task\n\nRecovered augmented task.\nEOF\nsleep 30\n",
+        )
+        .expect("write mock verification script");
+        let mut permissions = fs::metadata(&script)
+            .expect("stat mock verification script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).expect("chmod mock verification script");
+
+        let stdout_path = root.join("stdout.log");
+        let stderr_path = root.join("stderr.log");
+        let last_message_path = run_dir.join("logs").join("verification.last.md");
+        fs::create_dir_all(last_message_path.parent().expect("last-message parent"))
+            .expect("create last-message parent");
+
+        let started = Instant::now();
+        let code = run_prompted_command_capture(
+            &[
+                script.display().to_string(),
+                last_message_path.display().to_string(),
+            ],
+            "prompt",
+            &stdout_path,
+            &stderr_path,
+            Some(&run_dir),
+            Some("verification"),
+            Some(&last_message_path),
+            true,
+        )
+        .expect("run prompted command");
+
+        assert_eq!(code, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "verification capture should complete from last-message recovery before the child sleep finishes"
+        );
+        assert!(read_text(&verification_dir.join("findings.md"))
+            .expect("read findings")
+            .contains("Recovered from last message."));
+        assert!(read_text(&verification_dir.join("user-summary.md"))
+            .expect("read verification summary")
+            .contains("Recovered summary from last message."));
+        let goal_status = read_json::<Value>(&verification_dir.join("goal-status.json"))
+            .expect("read recovered goal status");
+        assert_eq!(goal_status["goal_verdict"], "partial");
+        assert!(is_stage_complete(&run_dir, "verification").expect("verification should be complete"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn doctor_fix_can_resume_research_run_to_verification_without_runtime_gate() {
+        let workspace = temp_dir("doctor-fix-research-workspace");
+        let output_root = temp_dir("doctor-fix-research-output");
+        let cache_root = temp_dir("doctor-fix-research-cache");
+        let (ctx, mock_root, _bin, _invocations_path, _tokens_path) =
+            mock_codex_context("doctor-fix-research");
+
+        let run_dir = create_run(
+            &ctx,
+            "Проведи анализ AI coding-агентов в контексте CI/CD на примере Codex. Это research-only задача, а не реализация классического CI runner/worker. Не внедряй сервис и не меняй код.",
+            &workspace,
+            &output_root,
+            Some("doctor-fix-research"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create doctor-fix research run");
+        let plan = load_plan(&run_dir).expect("load plan");
+        seed_preverification_outputs(&run_dir, &plan);
+
+        assert!(!plan.task_kind.is_empty());
+        assert!(!runtime_check_required(&run_dir, "verification")
+            .expect("check verification runtime requirement"));
+
+        let report = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert!(report
+            .fix_actions
+            .contains(&"start verification".to_string()));
+
+        let result = execute_doctor_fix(&ctx, &run_dir).expect("doctor fix");
+        assert_eq!(result.code, 0);
+        assert!(result.stdout.contains("Doctor auto-fix plan:"));
+
+        let goal_status: Value =
+            read_json(&run_dir.join("verification").join("goal-status.json")).expect("goal status");
+        assert_eq!(goal_status["goal_complete"], true);
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn completed_doctor_fix_does_not_count_as_incomplete_verification_attempt() {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-fix-complete-workspace");
+        let output_root = temp_dir("doctor-fix-complete-output");
+        let run_dir = create_run(
+            &ctx,
+            "Review the repository without changing code.",
+            &workspace,
+            &output_root,
+            Some("doctor-fix-complete"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        seed_preverification_outputs(&run_dir, &plan);
+
+        runtime::start_job(
+            &run_dir,
+            "doctor fix",
+            Some("verification"),
+            "doctor --fix",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start doctor-fix job");
+        runtime::finish_job(&run_dir, "completed", Some(0), None).expect("finish doctor-fix job");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "healthy");
+        assert_eq!(doctor.next, "verification");
+        assert!(doctor.last_attempt.is_none());
+
+        let status = status_report(&ctx, &run_dir).expect("status report");
+        assert_eq!(status.next, "solver-a");
+        assert!(status.last_attempt.is_none());
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
     fn verification_stage_stops_before_backend_when_runtime_check_fails() {
         let workspace = temp_dir("runtime-check-verification-gate-workspace");
         let output_root = temp_dir("runtime-check-verification-gate-output");
@@ -13829,6 +19195,18 @@ print "mock $label complete"
             .expect("serialize failing verification spec"),
         )
         .expect("write failing verification spec");
+        write_text(
+            &run_dir
+                .join("runtime")
+                .join("runtime-check")
+                .join("execution")
+                .join("summary.json"),
+            &serde_json::to_string_pretty(&json!({
+                "status": "passed"
+            }))
+            .expect("serialize passing execution summary"),
+        )
+        .expect("write passing execution runtime-check summary");
 
         let result = run_stage_capture(&ctx, &run_dir, "start", &["verification"])
             .expect("run verification with failing runtime-check");
@@ -13885,20 +19263,114 @@ print "mock $label complete"
         let result =
             run_stage_capture(&ctx, &run_dir, "start", &["execution"]).expect("run execution");
         assert_eq!(result.code, 1);
-        assert!(result.stdout.contains(
-            "Runtime check failed for phase `execution` because no workspace spec was found."
-        ));
-        assert!(result
-            .stdout
-            .contains("Runtime-facing tasks must create `.agpipe/runtime-check.json` before `execution` can complete."));
         assert_eq!(line_count(&invocations_path), 1);
         assert!(run_dir.join("execution").join("report.md").exists());
+        assert!(
+            !is_stage_complete(&run_dir, "execution").expect("execution should stay pending"),
+            "runtime-facing execution must not complete without a passing runtime-check summary"
+        );
 
         let _ = fs::remove_dir_all(run_dir);
         let _ = fs::remove_dir_all(output_root);
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(cache_root);
         let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn execution_stage_is_not_complete_when_runtime_check_is_missing() {
+        let ctx = test_context();
+        let workspace = temp_dir("runtime-check-complete-gate-workspace");
+        let output_root = temp_dir("runtime-check-complete-gate-output");
+        let cache_root = temp_dir("runtime-check-complete-gate-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Поднять HTTP сервис и подготовить runtime verification.",
+            &workspace,
+            &output_root,
+            Some("runtime-check-complete-gate"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create execution runtime-gated run");
+        let plan = load_plan(&run_dir).expect("load plan");
+        seed_preexecution_outputs(&run_dir, &plan);
+        write_text(
+            &run_dir.join("execution").join("report.md"),
+            "# Execution Report\n\nSeeded execution artifact without runtime check.\n",
+        )
+        .expect("seed execution report");
+
+        assert!(runtime_check_required(&run_dir, "execution").expect("runtime-check required"));
+        assert!(!is_stage_complete(&run_dir, "execution").expect("execution should stay pending"));
+        assert_eq!(
+            next_stage_for_run(&run_dir).expect("next stage"),
+            Some("execution".to_string())
+        );
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn resume_failure_reports_execution_when_runtime_gate_blocks_before_verification() {
+        let ctx = test_context();
+        let workspace = temp_dir("resume-runtime-gate-workspace");
+        let output_root = temp_dir("resume-runtime-gate-output");
+        let cache_root = temp_dir("resume-runtime-gate-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Поднять HTTP сервис и прогнать его через runtime gate.",
+            &workspace,
+            &output_root,
+            Some("resume-runtime-gate"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create resume runtime-gated run");
+        let plan = load_plan(&run_dir).expect("load plan");
+        seed_preexecution_outputs(&run_dir, &plan);
+        write_text(
+            &run_dir.join("execution").join("report.md"),
+            "# Execution Report\n\nExecution wrote an artifact but runtime check did not pass.\n",
+        )
+        .expect("seed execution report");
+
+        runtime::start_job(
+            &run_dir,
+            "resume",
+            Some("verification"),
+            "resume until verification",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start resume job");
+        runtime::finish_job(&run_dir, "failed", Some(1), None).expect("finish failed resume job");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        let attempt = doctor.last_attempt.expect("last attempt");
+        assert_eq!(attempt.stage, "execution");
+        assert_eq!(doctor.next, "execution");
+        assert_eq!(doctor.safe_next_action, "start execution");
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(cache_root);
     }
 
     #[test]
@@ -13964,6 +19436,8 @@ print "mock $label complete"
             &stdout_path,
             &stderr_path,
             None,
+            None,
+            None,
             true,
         )
         .expect("run prompted command");
@@ -14007,6 +19481,8 @@ print "mock $label complete"
             &stdout_path,
             &stderr_path,
             Some(&run_dir),
+            None,
+            None,
             true,
         )
         .expect("run prompted command");
@@ -14262,6 +19738,42 @@ print "mock $label complete"
     }
 
     #[test]
+    fn recover_solver_artifact_from_stdout_transcript_materializes_result_and_last_message() {
+        let run_dir = temp_run_dir("solver-stdout-recovery");
+        let stage = "solver-a";
+        let result_path = run_dir.join("solutions").join(stage).join("RESULT.md");
+        fs::create_dir_all(result_path.parent().expect("result parent"))
+            .expect("create result parent");
+        write_text(&result_path, "# Result\n\nFill this file with the solver output.\n")
+            .expect("write placeholder result");
+        let stdout_path = run_dir.join("logs").join("solver-a.stdout.log");
+        fs::create_dir_all(stdout_path.parent().expect("stdout parent"))
+            .expect("create stdout parent");
+        write_text(
+            &stdout_path,
+            "user\nprompt\ncodex\n# Result\n\nRecovered solver artifact.\n\n## MCP Usage\n- None.\n",
+        )
+        .expect("write stdout transcript");
+        let last_message_path = run_dir.join("logs").join("solver-a.last.md");
+
+        let recovered = recover_solver_artifact_from_stdout_transcript(
+            &run_dir,
+            stage,
+            &stdout_path,
+            &last_message_path,
+        )
+        .expect("recover solver artifact");
+
+        assert!(recovered);
+        let result = read_text(&result_path).expect("read recovered result");
+        let last_message = read_text(&last_message_path).expect("read recovered last message");
+        assert!(result.contains("Recovered solver artifact."));
+        assert_eq!(result, last_message);
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
     fn host_facts_detection_sets_a_device_string() {
         let facts = detect_host_facts("test");
         assert!(!facts.platform.is_empty());
@@ -14366,6 +19878,192 @@ print "mock $label complete"
 
         let _ = fs::remove_dir_all(output_root);
         let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn generate_interview_questions_short_circuits_execution_ready_tasks() {
+        let output_root = temp_dir("interview-questions-fast-path-output");
+        let workspace = temp_dir("interview-questions-fast-path-workspace");
+        let (ctx, mock_root, _bin, invocations_path, _tokens_path) =
+            mock_codex_context("interview-fast-path");
+
+        let (session_dir, payload) = generate_interview_questions(
+            &ctx,
+            "Create a minimal Python CLI in main.py that prints exactly agpipe_live_full_tui_ok and add a README with the run command.",
+            &workspace,
+            &output_root,
+            Some("fast-path"),
+            "ru",
+            6,
+        )
+        .expect("execution-ready stage0 fast path");
+
+        assert_eq!(line_count(&invocations_path), 0);
+        assert_eq!(
+            payload
+                .get("questions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(session_dir.join("questions.json").exists());
+        assert!(session_dir
+            .join("logs")
+            .join("interview-questions.fallback.json")
+            .exists());
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn generate_interview_questions_short_circuits_code_review_requests() {
+        let output_root = temp_dir("interview-questions-review-fast-path-output");
+        let workspace = temp_dir("interview-questions-review-fast-path-workspace");
+        let (ctx, mock_root, _bin, invocations_path, _tokens_path) =
+            mock_codex_context("interview-review-fast-path");
+
+        let (session_dir, payload) = generate_interview_questions(
+            &ctx,
+            "Проведи ревью кода ~/repo-under-review.",
+            &workspace,
+            &output_root,
+            Some("review-fast-path"),
+            "ru",
+            6,
+        )
+        .expect("code-review stage0 fast path");
+
+        assert_eq!(line_count(&invocations_path), 0);
+        assert_eq!(
+            payload
+                .get("questions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(0)
+        );
+        assert!(session_dir.join("questions.json").exists());
+        assert!(session_dir
+            .join("logs")
+            .join("interview-questions.fallback.json")
+            .exists());
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn generate_interview_questions_does_not_fast_path_when_task_explicitly_requests_clarification()
+    {
+        let output_root = temp_dir("interview-questions-clarify-output");
+        let workspace = temp_dir("interview-questions-clarify-workspace");
+        let (ctx, mock_root, _bin, invocations_path, _tokens_path) =
+            mock_codex_context("interview-clarify");
+
+        let (session_dir, payload) = generate_interview_questions(
+            &ctx,
+            "Сделай CLI на Python для обработки текстовых файлов, но сначала уточни у меня сценарий использования, аргументы и ожидаемый вывод.",
+            &workspace,
+            &output_root,
+            Some("clarify-first"),
+            "ru",
+            6,
+        )
+        .expect("clarification request should not skip interview");
+
+        assert_eq!(line_count(&invocations_path), 1);
+        assert_eq!(
+            payload
+                .get("questions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        assert!(session_dir.join("questions.json").exists());
+        assert!(!session_dir
+            .join("logs")
+            .join("interview-questions.fallback.json")
+            .exists());
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn generate_interview_questions_guards_empty_backend_output_for_uncertain_tasks() {
+        let output_root = temp_dir("interview-questions-guardrail-output");
+        let workspace = temp_dir("interview-questions-guardrail-workspace");
+        let (ctx, root) = mock_script_context(
+            "stage0-empty-questions",
+            r##"#!/bin/zsh
+set -euo pipefail
+
+last_message=""
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+cat > "$last_message" <<'JSON'
+{
+  "goal_summary": "Подобрать полезный локальный CLI на Python",
+  "questions": []
+}
+JSON
+print "mock empty interview questions"
+"##,
+        );
+
+        let (session_dir, payload) = generate_interview_questions(
+            &ctx,
+            "Нужен какой-нибудь полезный локальный CLI на Python для моей работы. Я пока не решил, что он должен делать.",
+            &workspace,
+            &output_root,
+            Some("guardrail"),
+            "ru",
+            6,
+        )
+        .expect("empty backend response should trigger local guardrail");
+
+        assert_eq!(
+            payload
+                .get("questions")
+                .and_then(|value| value.as_array())
+                .map(Vec::len),
+            Some(1)
+        );
+        let fallback: Value = read_json(
+            &session_dir
+                .join("logs")
+                .join("interview-questions.fallback.json"),
+        )
+        .expect("read guardrail metadata");
+        assert_eq!(
+            fallback
+                .get("reason_kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+            "empty-questions-guardrail"
+        );
+        assert!(
+            read_text(&session_dir.join("logs").join("interview-questions.last.md"))
+                .expect("read guarded last message")
+                .contains("\"scope_constraints\"")
+        );
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -14941,7 +20639,7 @@ exit 1
 
         let (label, preview) = preview_text(&run_dir, 2400);
 
-        assert_eq!(label, "Summary");
+        assert_eq!(label, "Verification Summary");
         assert!(preview.contains("Verification summary."));
 
         let _ = fs::remove_dir_all(run_dir);
@@ -14967,6 +20665,46 @@ exit 1
         assert!(preview.contains("Repair the preserved-path smoke blocker."));
 
         let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn latest_log_file_prefers_visible_content_over_newer_empty_log() {
+        let logs_dir = temp_dir("latest-log-file");
+        let visible = logs_dir.join("solver.stdout.log");
+        let empty = logs_dir.join("solver.last.md");
+        write_text(&visible, "visible content").expect("write visible log");
+        thread::sleep(Duration::from_millis(20));
+        write_text(&empty, "").expect("write empty newer log");
+
+        let latest = latest_log_file(&logs_dir).expect("latest log");
+        assert_eq!(latest, visible);
+
+        let _ = fs::remove_dir_all(logs_dir);
+    }
+
+    #[test]
+    fn verification_workspace_documents_order_recent_files_stably() {
+        let workspace = temp_dir("verification-workspace-order");
+        let older = workspace.join("older.txt");
+        let newer = workspace.join("newer.txt");
+        write_text(&older, "older").expect("write older");
+        thread::sleep(Duration::from_millis(20));
+        write_text(&newer, "newer").expect("write newer");
+
+        let docs = verification_workspace_documents(&workspace).expect("workspace docs");
+        let summary = docs
+            .iter()
+            .find(|(name, _)| name == "workspace/RECENT_FILES.md")
+            .map(|(_, content)| content)
+            .expect("summary doc");
+        let older_pos = summary.find("older.txt").expect("older in summary");
+        let newer_pos = summary.find("newer.txt").expect("newer in summary");
+        assert!(
+            newer_pos < older_pos,
+            "summary order was not recent-first:\n{summary}"
+        );
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -15335,6 +21073,264 @@ exit 1
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(output_root);
         let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn solver_prompt_lists_resolved_agency_role_docs() {
+        let (ctx, root, agency_root, workspace) = test_context_with_sibling_agency("solver-prompt");
+        let output_root = temp_dir("solver-prompt-output");
+        let cache_root = temp_dir("solver-prompt-cache");
+        let role_path = write_agency_role(
+            &agency_root,
+            "engineering/engineering-frontend-developer.md",
+            "Frontend Developer",
+            "Frontend execution specialist",
+            "# Frontend Developer Agent\n\nUse the agency role guidance for pixel-perfect UI work.",
+        );
+        let run_dir = create_run(
+            &ctx,
+            "Build a React UI entrypoint with responsive layout.",
+            &workspace,
+            &output_root,
+            Some("solver-role-docs"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        write_text(
+            &run_dir.join("brief.md"),
+            "# Brief\n\nImplement the assigned frontend slice.\n",
+        )
+        .expect("brief");
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        plan.solver_roles = vec![SolverRole {
+            solver_id: "solver-a".to_string(),
+            role: "engineering/engineering-frontend-developer.md".to_string(),
+            angle: "implementation-first".to_string(),
+            mcp_servers: Vec::new(),
+        }];
+        save_plan(&run_dir, &plan).expect("save plan");
+        sync_run_artifacts(&ctx, &run_dir).expect("sync prompts");
+
+        let prompt = render_stage_prompt(&ctx, &run_dir, "solver-a").expect("solver prompt");
+        assert!(prompt.contains(&role_path.display().to_string()));
+        assert!(prompt.contains("resolved_role_docs"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn intake_prompt_uses_absolute_reference_paths() {
+        let ctx = test_context();
+        let workspace = temp_dir("intake-absolute-refs-workspace");
+        let output_root = temp_dir("intake-absolute-refs-output");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI and document the run command.",
+            &workspace,
+            &output_root,
+            Some("intake-absolute-refs"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let prompt = render_stage_prompt(&ctx, &run_dir, "intake").expect("intake prompt");
+        assert!(prompt.contains(
+            &run_reference_asset_path(&run_dir, DECOMPOSITION_RULES_REF)
+                .display()
+                .to_string()
+        ));
+        assert!(prompt.contains(
+            &run_reference_asset_path(&run_dir, ROLE_MAP_REF)
+                .display()
+                .to_string()
+        ));
+        assert!(prompt.contains(
+            "prefer the provided role map and catalog summary before recursively scanning the local role catalog"
+        ));
+        assert!(prompt.contains(
+            "do not inspect multi-agent-pipeline source files, tests, or SKILL documents"
+        ));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn compile_prompt_refreshes_stale_stage_prompt_file() {
+        let ctx = test_context();
+        let workspace = temp_dir("compile-prompt-refresh-workspace");
+        let output_root = temp_dir("compile-prompt-refresh-output");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI and document the run command.",
+            &workspace,
+            &output_root,
+            Some("compile-prompt-refresh"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let prompt_path = stage_prompt_path(&run_dir, "solver-a").expect("prompt path");
+        write_text(&prompt_path, "STALE PROMPT").expect("seed stale prompt");
+
+        let compiled = compile_prompt(&ctx, &run_dir, "solver-a").expect("compile prompt");
+        let refreshed = read_text(&prompt_path).expect("read refreshed prompt");
+
+        assert!(!compiled.contains("STALE PROMPT"));
+        assert!(!refreshed.contains("STALE PROMPT"));
+        assert!(refreshed.contains("\"stage\": \"solver-a\""));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn responses_review_prompt_embeds_agency_reviewer_docs() {
+        let (ctx, root, agency_root, workspace) = test_context_with_sibling_agency("review-prompt");
+        let output_root = temp_dir("review-prompt-output");
+        let cache_root = temp_dir("review-prompt-cache");
+        write_agency_role(
+            &agency_root,
+            "testing/testing-reality-checker.md",
+            "Reality Checker",
+            "Evidence-focused reviewer",
+            "# Reality Checker\n\nDemand explicit evidence before approving results.",
+        );
+        let run_dir = create_run(
+            &Context {
+                stage_backend: "responses-readonly".to_string(),
+                ..ctx.clone()
+            },
+            "Compare implementation options and pick the safest result.",
+            &workspace,
+            &output_root,
+            Some("review-role-docs"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        write_text(
+            &run_dir.join("brief.md"),
+            "# Brief\n\nCompare solver results.\n",
+        )
+        .expect("brief");
+        write_text(
+            &run_dir.join("solutions").join("solver-a").join("RESULT.md"),
+            "# Result\n\nCandidate A.\n",
+        )
+        .expect("solver result");
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        plan.reviewer_stack = vec!["testing/testing-reality-checker.md".to_string()];
+        save_plan(&run_dir, &plan).expect("save plan");
+        sync_run_artifacts(
+            &Context {
+                stage_backend: "responses-readonly".to_string(),
+                ..ctx.clone()
+            },
+            &run_dir,
+        )
+        .expect("sync prompts");
+
+        let prompt = build_responses_stage_prompt(
+            &Context {
+                stage_backend: "responses-readonly".to_string(),
+                ..ctx.clone()
+            },
+            &run_dir,
+            "review",
+        )
+        .expect("review prompt");
+        assert!(prompt.contains("agency-role/testing/testing-reality-checker.md"));
+        assert!(prompt.contains("Demand explicit evidence before approving results."));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_codex_last_message_adds_agency_catalog_dir() {
+        let root = temp_dir("codex-add-dir-agency");
+        let repo_root = root.join("workspace").join("multi-agent-pipeline");
+        let agency_root = root.join("agency-agents");
+        let workdir = root.join("workdir");
+        let artifact_dir = root.join("artifacts");
+        fs::create_dir_all(&repo_root).expect("create repo root");
+        fs::create_dir_all(&agency_root).expect("create agency root");
+        fs::create_dir_all(&workdir).expect("create workdir");
+        let script = r##"#!/bin/zsh
+set -euo pipefail
+script_dir="${0:A:h}"
+last_message=""
+print -rl -- "$@" > "$script_dir/args.log"
+while (( $# > 0 )); do
+  case "$1" in
+    --output-last-message)
+      last_message="$2"
+      shift 2
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+cat >/dev/null
+mkdir -p "${last_message:h}"
+print "ok" > "$last_message"
+"##;
+        let (mut ctx, script_root) = mock_script_context("agency-add-dir", script);
+        ctx.repo_root = repo_root.clone();
+
+        let message = run_codex_last_message(
+            &ctx,
+            "test prompt",
+            &workdir,
+            &artifact_dir,
+            "solver-a",
+            None,
+        )
+        .expect("run codex");
+        assert_eq!(message.trim(), "ok");
+
+        let args = read_text(&script_root.join("args.log")).expect("args log");
+        assert!(args.contains("--add-dir"));
+        assert!(args.contains(&repo_root.display().to_string()));
+        assert!(args.contains(&agency_root.display().to_string()));
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(script_root);
     }
 
     #[test]
@@ -15811,8 +21807,11 @@ exit 1
         .expect("create run");
 
         let mut plan = load_plan(&run_dir).expect("load plan");
-        let initial_expected =
-            choose_roles(&plan.task_kind, std::cmp::max(1, plan.solver_roles.len()));
+        let initial_expected = choose_roles(
+            &plan.task_kind,
+            &plan.original_task,
+            std::cmp::max(1, plan.solver_roles.len()),
+        );
         assert_eq!(
             plan.solver_roles.first().map(|role| role.role.as_str()),
             initial_expected.first().map(|role| role.role.as_str())
@@ -15831,9 +21830,11 @@ exit 1
         sync_run_artifacts(&ctx, &run_dir).expect("sync run");
 
         let updated = load_plan(&run_dir).expect("reload plan");
-        let updated_expected = choose_roles(
+        let updated_expected = choose_roles_with_workstreams(
             &updated.task_kind,
+            &updated.original_task,
             std::cmp::max(1, updated.solver_roles.len()),
+            &updated.workstream_hints,
         );
         assert_eq!(
             updated.solver_roles.first().map(|role| role.role.as_str()),
@@ -15847,8 +21848,26 @@ exit 1
 
     #[test]
     fn solver_count_defaults_raise_research_floor_and_follow_workstreams() {
-        assert_eq!(solver_count_for("backend", "low", "alternatives", &[]), 1);
-        assert_eq!(solver_count_for("research", "low", "alternatives", &[]), 2);
+        assert_eq!(
+            solver_count_for(
+                "backend",
+                "low",
+                "alternatives",
+                &[],
+                "Build a backend service."
+            ),
+            1
+        );
+        assert_eq!(
+            solver_count_for(
+                "research",
+                "low",
+                "alternatives",
+                &[],
+                "Compare two options."
+            ),
+            2
+        );
         assert_eq!(
             solver_count_for(
                 "ai",
@@ -15870,10 +21889,1389 @@ exit 1
                         goal: "execution".to_string(),
                         suggested_role: String::new(),
                     },
-                ]
+                ],
+                "Build a multi-stage AI workflow.",
             ),
             3
         );
+    }
+
+    #[test]
+    fn backend_role_defaults_align_with_implementation_first_angle() {
+        let roles = choose_roles("backend", "Build a backend service.", 3);
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles[0].role, "engineering/engineering-senior-developer.md");
+        assert_eq!(
+            roles[1].role,
+            "engineering/engineering-backend-architect.md"
+        );
+        assert_eq!(roles[2].role, "engineering/engineering-devops-automator.md");
+    }
+
+    #[test]
+    fn infer_task_kind_does_not_treat_tui_as_frontend_ui() {
+        assert_eq!(
+            infer_task_kind("Audit the TUI runtime flow and improve stage reconciliation."),
+            "fullstack"
+        );
+    }
+
+    #[test]
+    fn infer_task_kind_prefers_review_for_code_review_requests_with_ai_signals() {
+        assert_eq!(
+            infer_task_kind(
+                "Проведи ревью кода ~/repo-under-review: нужны баги, риски, регрессии и пробелы в тестах."
+            ),
+            "review"
+        );
+    }
+
+    #[test]
+    fn infer_task_kind_prefers_research_over_infra_for_analysis_only_ci_cd_landscape() {
+        assert_eq!(
+            infer_task_kind(
+                "Проведи анализ технологий AI coding-агентов в CI/CD на примере Codex и предложи улучшения качества решений."
+            ),
+            "research"
+        );
+    }
+
+    #[test]
+    fn infer_task_kind_treats_russian_report_only_research_as_research() {
+        assert_eq!(
+            infer_task_kind(
+                "Проведи исследование моделей онлайн-дохода и подготовь один читабельный русскоязычный итоговый отчёт без лишних англоязычных терминов."
+            ),
+            "research"
+        );
+    }
+
+    #[test]
+    fn infer_task_kind_prefers_docs_for_official_docs_planning_requests() {
+        assert_eq!(
+            infer_task_kind(
+                "Upgrade the FastAPI integration to the latest documented version, verify API changes against official docs, and update the implementation plan."
+            ),
+            "docs"
+        );
+    }
+
+    #[test]
+    fn infer_task_kind_detects_verification_seed_follow_up_as_audit_improve() {
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\n\n## Goal Status\n\n- rerun recommended: `true`\n- missing critical checks:\n- `device_story_reconciled`\n\n## Verified Progress That Must Not Regress\n\n- keep the already-verified fixes\n\n## Follow-Up Task\n\nПроведи audit и analysis, refresh stale artifacts и закрой remaining critical check без реализации новых фич.\n";
+        assert_eq!(infer_task_kind(task), "audit-improve");
+        assert_eq!(infer_execution_mode("audit-improve", "high", task), "alternatives");
+    }
+
+    #[test]
+    fn backend_reviewer_stack_uses_code_review_instead_of_exec_summary() {
+        let stack = reviewer_stack_for("backend");
+        assert!(stack
+            .iter()
+            .any(|item| item == "engineering/engineering-code-reviewer.md"));
+        assert!(!stack
+            .iter()
+            .any(|item| item == "support/support-executive-summary-generator.md"));
+    }
+
+    #[test]
+    fn create_run_auto_selects_exa_and_memory_for_research_tasks() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-research-workspace");
+        let output_root = temp_dir("mcp-research-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи анализ технологий AI coding-агентов в CI/CD на примере Codex и предложи улучшения качества решений.",
+            &workspace,
+            &output_root,
+            Some("mcp-research"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let server_names: Vec<&str> = plan
+            .mcp
+            .servers
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(server_names.contains(&"exa"));
+        assert!(server_names.contains(&"fetch"));
+        assert!(server_names.contains(&"memory"));
+        assert!(!server_names.contains(&"context7"));
+        assert!(plan
+            .solver_roles
+            .iter()
+            .all(|solver| solver.mcp_servers.iter().any(|item| item == "exa")));
+        assert!(plan
+            .solver_roles
+            .iter()
+            .all(|solver| solver.mcp_servers.iter().any(|item| item == "fetch")));
+        assert!(plan
+            .solver_roles
+            .iter()
+            .all(|solver| !solver.mcp_servers.iter().any(|item| item == "memory")));
+        assert_eq!(
+            plan.solver_roles
+                .iter()
+                .map(|solver| solver.role.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "product/product-trend-researcher.md",
+                "testing/testing-evidence-collector.md",
+                "testing/testing-tool-evaluator.md",
+            ]
+        );
+        assert!(run_dir.join("references").join("mcp-plan.md").exists());
+    }
+
+    #[test]
+    fn create_run_uses_audit_improve_routing_and_local_mcp_for_verified_follow_up() {
+        let ctx = test_context();
+        let workspace = temp_dir("audit-improve-workspace");
+        let output_root = temp_dir("audit-improve-output");
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\nDo not rescope from stale review artifacts.\n\n## Goal Status\n\n- rerun recommended: `true`\n- missing critical checks:\n- `device_story_reconciled`\n\n## Verification Summary\n\nНужен узкий audit rerun без reopening уже подтверждённых фиксов.\n\n## Follow-Up Task\n\nПроведи audit и analysis, refresh stale artifacts, reconcile device story, preserve verified progress, без реализации новых фич.\n";
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("audit-improve"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create audit-improve run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        assert_eq!(plan.task_kind, "audit-improve");
+        assert_eq!(plan.execution_mode, "alternatives");
+        assert!(first_stage_id_for_kind(&plan, &run_dir, PipelineStageKind::Execution)
+            .expect("execution stage lookup")
+            .is_none());
+
+        let server_names: Vec<&str> = plan
+            .mcp
+            .servers
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(server_names.contains(&"memory"));
+        assert!(!server_names.contains(&"fetch"));
+        assert_eq!(
+            plan.solver_roles
+                .iter()
+                .map(|solver| solver.role.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "engineering/engineering-backend-architect.md",
+                "engineering/engineering-technical-writer.md",
+                "testing/testing-tool-evaluator.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_run_auto_selects_fetch_and_memory_for_docs_tasks_without_context7_key() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-context7-workspace");
+        let output_root = temp_dir("mcp-context7-output");
+        env::remove_var("CONTEXT7_API_KEY");
+        let run_dir = create_run(
+            &ctx,
+            "Upgrade the FastAPI integration to the latest documented version, verify API changes against official docs, and update the implementation plan.",
+            &workspace,
+            &output_root,
+            Some("mcp-context7"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let server_names: Vec<&str> = plan
+            .mcp
+            .servers
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(server_names.contains(&"fetch"));
+        assert!(server_names.contains(&"memory"));
+        assert!(!server_names.contains(&"exa"));
+        assert!(!server_names.contains(&"context7"));
+        let fetch = plan
+            .mcp
+            .servers
+            .iter()
+            .find(|server| server.name == "fetch")
+            .expect("fetch server");
+        assert!(fetch.stages.iter().any(|stage| stage == "verification"));
+        assert_eq!(
+            plan.solver_roles
+                .iter()
+                .map(|solver| solver.role.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "engineering/engineering-technical-writer.md",
+                "testing/testing-evidence-collector.md",
+                "support/support-executive-summary-generator.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_run_auto_selects_context7_when_key_is_available() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-context7-key-workspace");
+        let output_root = temp_dir("mcp-context7-key-output");
+        env::set_var("CONTEXT7_API_KEY", "test-key");
+        let run_dir = create_run(
+            &ctx,
+            "Upgrade the FastAPI integration to the latest documented version, verify API changes against official docs, and update the implementation plan.",
+            &workspace,
+            &output_root,
+            Some("mcp-context7-key"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let server_names: Vec<&str> = plan
+            .mcp
+            .servers
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(server_names.contains(&"context7"));
+        assert!(server_names.contains(&"fetch"));
+        assert!(server_names.contains(&"memory"));
+        assert!(!server_names.contains(&"exa"));
+        env::remove_var("CONTEXT7_API_KEY");
+    }
+
+    #[test]
+    fn create_run_auto_selects_git_for_review_tasks_on_git_workspaces() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-review-git-workspace");
+        let output_root = temp_dir("mcp-review-git-output");
+        fs::create_dir_all(workspace.join(".git")).expect("create fake git dir");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи ревью кода репозитория и выдай findings по severity с file refs. Без изменений в коде.",
+            &workspace,
+            &output_root,
+            Some("mcp-review-git"),
+            "compact",
+            "ru",
+            "local-first",
+            "local-first",
+            "none",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let server_names: Vec<&str> = plan
+            .mcp
+            .servers
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(server_names.contains(&"git"));
+        assert!(server_names.contains(&"memory"));
+        assert!(!server_names.contains(&"exa"));
+        assert!(plan
+            .solver_roles
+            .iter()
+            .all(|solver| solver.mcp_servers.iter().any(|item| item == "git")));
+    }
+
+    #[test]
+    fn create_run_auto_selects_git_for_audit_improve_tasks_on_git_workspaces() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-audit-git-workspace");
+        let output_root = temp_dir("mcp-audit-git-output");
+        fs::create_dir_all(workspace.join(".git")).expect("create fake git dir");
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\n\n## Goal Status\n\n- rerun recommended: `true`\n- missing critical checks:\n- `probe_basis_reconciled`\n\n## Follow-Up Task\n\nПроведи audit-improve rerun, refresh stale narrative, preserve green slices и не переходи к новым фичам.\n";
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("mcp-audit-git"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let server_names: Vec<&str> = plan
+            .mcp
+            .servers
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect();
+        assert!(server_names.contains(&"git"));
+        assert!(server_names.contains(&"memory"));
+        assert!(plan
+            .solver_roles
+            .iter()
+            .all(|solver| solver.mcp_servers.iter().any(|item| item == "git")));
+    }
+
+    #[test]
+    fn solver_prompt_contains_mcp_guidance_without_solver_memory_by_default() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-solver-prompt-workspace");
+        let output_root = temp_dir("mcp-solver-prompt-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи исследование по выбору стеков для AI coding pipeline и предложи рекомендации.",
+            &workspace,
+            &output_root,
+            Some("mcp-solver-prompt"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+        assert!(prompt.contains("\"mcp_servers\""));
+        assert!(prompt.contains("references/mcp-plan.md"));
+        assert!(!prompt.contains("sibling solver namespaces"));
+        assert!(!prompt.contains(&solver_memory_namespace(
+            &run_dir,
+            &plan.solver_roles[0].solver_id
+        )));
+    }
+
+    #[test]
+    fn solver_prompt_for_russian_mentions_plain_russian_style_and_localized_mcp_heading() {
+        let ctx = test_context();
+        let workspace = temp_dir("solver-ru-style-workspace");
+        let output_root = temp_dir("solver-ru-style-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи исследование и подготовь итоговый русскоязычный отчёт без лишнего англоязычного жаргона.",
+            &workspace,
+            &output_root,
+            Some("solver-ru-style"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+        assert!(prompt.contains("avoid unnecessary English jargon"));
+        assert!(prompt.contains("Использование MCP"));
+    }
+
+    #[test]
+    fn record_stage_mcp_usage_extracts_markdown_section_and_persists_jsonl() {
+        let run_dir = temp_run_dir("mcp-usage-log");
+        let workspace = temp_dir("mcp-usage-workspace");
+        let mut plan = Plan {
+            workspace: workspace.display().to_string(),
+            workspace_exists: true,
+            original_task: "Проведи ревью кода без изменений.".to_string(),
+            task_kind: "review".to_string(),
+            prompt_format: "compact".to_string(),
+            summary_language: "ru".to_string(),
+            intake_research_mode: "local-first".to_string(),
+            stage_research_mode: "local-first".to_string(),
+            execution_network_mode: "none".to_string(),
+            solver_count: 1,
+            solver_roles: vec![SolverRole {
+                solver_id: "solver-a".to_string(),
+                role: "engineering/engineering-code-reviewer.md".to_string(),
+                angle: "risk-first".to_string(),
+                mcp_servers: vec!["git".to_string(), "memory".to_string()],
+            }],
+            reviewer_stack: vec!["engineering/engineering-code-reviewer.md".to_string()],
+            mcp: McpSelection {
+                auto_select: true,
+                rationale: vec!["test".to_string()],
+                servers: vec![
+                    McpServerPlan {
+                        name: "git".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["solver".to_string(), "review".to_string()],
+                        purposes: vec!["repo inspection".to_string()],
+                        usage_hint: "Prefer git for local history.".to_string(),
+                    },
+                    McpServerPlan {
+                        name: "memory".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["solver".to_string(), "review".to_string()],
+                        purposes: vec!["handoff".to_string()],
+                        usage_hint: "Use stage memory namespace.".to_string(),
+                    },
+                ],
+            },
+            ..Plan::default()
+        };
+        plan.pipeline = PipelineConfig {
+            source: "test".to_string(),
+            stages: default_pipeline_stage_specs(&plan, Some(&run_dir)),
+        };
+        save_plan(&run_dir, &plan).expect("save plan");
+        write_json(
+            &run_dir.join("runtime").join("mcp-provision.json"),
+            &McpProvisionRecord {
+                enabled: true,
+                configured: vec!["git".to_string(), "memory".to_string()],
+                ..McpProvisionRecord::default()
+            },
+        )
+        .expect("write mcp provision");
+        write_text(
+            &run_dir.join("review").join("report.md"),
+            "# Review Report\n\n## MCP Usage\n\n- git: used to inspect status and diff.\n- memory: not used; review stayed self-contained.\n",
+        )
+        .expect("write review report");
+
+        record_stage_mcp_usage(&plan, &run_dir, "review", "codex", "executed")
+            .expect("record mcp usage");
+
+        let usage_lines = read_text(&run_dir.join(MCP_USAGE_LOG_REF)).expect("read jsonl");
+        let first_line = usage_lines.lines().next().expect("first jsonl line");
+        let record: McpUsageRecord =
+            serde_json::from_str(first_line).expect("parse mcp usage record");
+        assert_eq!(record.stage, "review");
+        assert_eq!(record.stage_kind, "review");
+        assert_eq!(record.backend, "codex");
+        assert!(record.selected.iter().any(|item| item == "git"));
+        assert!(record.selected.iter().any(|item| item == "memory"));
+        assert!(record.available.iter().any(|item| item == "git"));
+        assert!(record.declared_used.iter().any(|item| item == "git"));
+        assert!(record.declared_not_used.iter().any(|item| item == "memory"));
+        assert!(record.note_present);
+        assert!(
+            run_dir
+                .join("runtime")
+                .join("mcp")
+                .join("review.md")
+                .exists(),
+            "expected persisted MCP note"
+        );
+    }
+
+    #[test]
+    fn record_stage_mcp_usage_extracts_localized_russian_heading() {
+        let run_dir = temp_run_dir("mcp-usage-log-ru-heading");
+        let workspace = temp_dir("mcp-usage-workspace-ru-heading");
+        let mut plan = Plan {
+            workspace: workspace.display().to_string(),
+            workspace_exists: true,
+            original_task: "Проведи ревью кода без изменений.".to_string(),
+            task_kind: "review".to_string(),
+            prompt_format: "compact".to_string(),
+            summary_language: "ru".to_string(),
+            intake_research_mode: "local-first".to_string(),
+            stage_research_mode: "local-first".to_string(),
+            execution_network_mode: "none".to_string(),
+            solver_count: 1,
+            solver_roles: vec![SolverRole {
+                solver_id: "solver-a".to_string(),
+                role: "engineering/engineering-code-reviewer.md".to_string(),
+                angle: "risk-first".to_string(),
+                mcp_servers: vec!["git".to_string()],
+            }],
+            reviewer_stack: vec!["engineering/engineering-code-reviewer.md".to_string()],
+            mcp: McpSelection {
+                auto_select: true,
+                rationale: vec!["test".to_string()],
+                servers: vec![McpServerPlan {
+                    name: "git".to_string(),
+                    mode: "readonly".to_string(),
+                    stages: vec!["solver".to_string(), "review".to_string()],
+                    purposes: vec!["repo inspection".to_string()],
+                    usage_hint: "Prefer git for local history.".to_string(),
+                }],
+            },
+            ..Plan::default()
+        };
+        plan.pipeline = PipelineConfig {
+            source: "test".to_string(),
+            stages: default_pipeline_stage_specs(&plan, Some(&run_dir)),
+        };
+        save_plan(&run_dir, &plan).expect("save plan");
+        write_json(
+            &run_dir.join("runtime").join("mcp-provision.json"),
+            &McpProvisionRecord {
+                enabled: true,
+                configured: vec!["git".to_string()],
+                ..McpProvisionRecord::default()
+            },
+        )
+        .expect("write mcp provision");
+        write_text(
+            &run_dir.join("review").join("report.md"),
+            "# Отчёт review\n\n## Использование MCP\n\n- git: used to inspect status and diff.\n",
+        )
+        .expect("write localized review report");
+
+        record_stage_mcp_usage(&plan, &run_dir, "review", "codex", "executed")
+            .expect("record mcp usage");
+
+        let note = read_text(&run_dir.join("runtime").join("mcp").join("review.md"))
+            .expect("read persisted note");
+        assert!(note.contains("git"));
+    }
+
+    #[test]
+    fn write_responses_stage_outputs_persists_solver_mcp_note() {
+        let run_dir = temp_run_dir("responses-mcp-note");
+        let workspace = temp_dir("responses-mcp-workspace");
+        let mut plan = Plan {
+            workspace: workspace.display().to_string(),
+            workspace_exists: true,
+            original_task: "Проведи анализ и предложи варианты.".to_string(),
+            task_kind: "research".to_string(),
+            prompt_format: "compact".to_string(),
+            summary_language: "ru".to_string(),
+            intake_research_mode: "research-first".to_string(),
+            stage_research_mode: "local-first".to_string(),
+            execution_network_mode: "fetch-if-needed".to_string(),
+            solver_count: 1,
+            solver_roles: vec![SolverRole {
+                solver_id: "solver-a".to_string(),
+                role: "testing/testing-tool-evaluator.md".to_string(),
+                angle: "evidence-first".to_string(),
+                mcp_servers: vec!["fetch".to_string(), "memory".to_string()],
+            }],
+            mcp: McpSelection {
+                auto_select: true,
+                rationale: vec!["test".to_string()],
+                servers: vec![
+                    McpServerPlan {
+                        name: "fetch".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["solver".to_string()],
+                        purposes: vec!["retrieval".to_string()],
+                        usage_hint: "Use fetch after identifying URLs.".to_string(),
+                    },
+                    McpServerPlan {
+                        name: "memory".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["solver".to_string()],
+                        purposes: vec!["handoff".to_string()],
+                        usage_hint: "Use memory for handoff.".to_string(),
+                    },
+                ],
+            },
+            ..Plan::default()
+        };
+        plan.pipeline = PipelineConfig {
+            source: "test".to_string(),
+            stages: default_pipeline_stage_specs(&plan, Some(&run_dir)),
+        };
+
+        write_responses_stage_outputs(
+            &plan,
+            &run_dir,
+            "solver-a",
+            r##"{
+  "result_md": "# Result\n\nResponses solver artifact.\n",
+  "mcp_usage_md": "- fetch: used for one official page.\n- memory: not used; no handoff yet."
+}"##,
+        )
+        .expect("write responses outputs");
+
+        assert!(
+            run_dir
+                .join("solutions")
+                .join("solver-a")
+                .join("RESULT.md")
+                .exists(),
+            "expected solver artifact"
+        );
+        let note = read_text(&run_dir.join("runtime").join("mcp").join("solver-a.md"))
+            .expect("read solver mcp note");
+        assert!(note.contains("fetch"));
+        assert!(note.contains("memory"));
+    }
+
+    #[test]
+    fn responses_intake_save_plan_rehydrates_solver_mcp_assignments() {
+        let ctx = test_context();
+        let workspace = temp_dir("responses-intake-mcp-workspace");
+        let output_root = temp_dir("responses-intake-mcp-output");
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("responses-intake-mcp"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let current_plan = load_plan(&run_dir).expect("load plan");
+        let mut plan_json = serde_json::to_value(&current_plan).expect("serialize plan");
+        for solver in plan_json["solver_roles"]
+            .as_array_mut()
+            .expect("solver role array")
+        {
+            solver
+                .as_object_mut()
+                .expect("solver object")
+                .remove("mcp_servers");
+        }
+        let payload = json!({
+            "brief_md": "# Brief\n\nUpdated by intake.\n",
+            "plan_json": plan_json,
+            "mcp_usage_md": "- fetch: not used; local context was sufficient.\n- memory: not used; no durable handoff was needed."
+        });
+
+        write_responses_stage_outputs(
+            &current_plan,
+            &run_dir,
+            "intake",
+            &serde_json::to_string(&payload).expect("payload"),
+        )
+        .expect("write intake outputs");
+
+        let persisted = load_plan(&run_dir).expect("reload plan");
+        assert!(persisted
+            .solver_roles
+            .iter()
+            .all(|solver| solver.mcp_servers.iter().any(|item| item == "fetch")));
+        assert!(persisted
+            .solver_roles
+            .iter()
+            .all(|solver| !solver.mcp_servers.iter().any(|item| item == "memory")));
+
+        let prompt = render_solver_prompt(&ctx, &run_dir, &persisted, &persisted.solver_roles[0]);
+        assert!(prompt.contains("\"mcp_servers\": ["));
+        assert!(prompt.contains("\"fetch\""));
+        assert!(!prompt.contains("\"memory\""));
+    }
+
+    #[test]
+    fn solver_prompt_falls_back_to_plan_mcp_when_solver_assignment_is_missing() {
+        let ctx = test_context();
+        let workspace = temp_dir("solver-mcp-fallback-workspace");
+        let output_root = temp_dir("solver-mcp-fallback-output");
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("solver-mcp-fallback"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        plan.solver_roles[0].mcp_servers.clear();
+
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+
+        assert!(prompt.contains("\"mcp_servers\": ["));
+        assert!(prompt.contains("\"fetch\""));
+        assert!(!prompt.contains("\"memory\""));
+        assert!(prompt.contains("references/mcp-plan.md"));
+    }
+
+    #[test]
+    fn provision_selected_mcp_servers_writes_remote_codex_blocks() {
+        let run_dir = temp_dir("mcp-provision-run");
+        let codex_home = temp_dir("mcp-provision-codex-home");
+        env::set_var("AGPIPE_TEST_ALLOW_MCP_PROVISION", "1");
+        let plan = Plan {
+            mcp: McpSelection {
+                auto_select: true,
+                rationale: vec!["test".to_string()],
+                servers: vec![
+                    McpServerPlan {
+                        name: "context7".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["intake".to_string()],
+                        purposes: vec!["docs".to_string()],
+                        usage_hint: "Prefer official docs.".to_string(),
+                    },
+                    McpServerPlan {
+                        name: "exa".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["solver".to_string()],
+                        purposes: vec!["research".to_string()],
+                        usage_hint: "Prefer source discovery.".to_string(),
+                    },
+                ],
+            },
+            ..Plan::default()
+        };
+
+        let record = provision_selected_mcp_servers(&run_dir, &plan, Some(&codex_home));
+        let config_text = read_text(&codex_home.join("config.toml")).expect("read codex config");
+
+        assert!(record.configured.iter().any(|item| item == "context7"));
+        assert!(record.configured.iter().any(|item| item == "exa"));
+        assert!(config_text.contains("[mcp_servers.context7]"));
+        assert!(config_text.contains("url = \"https://mcp.context7.com/mcp\""));
+        assert!(config_text
+            .contains("env_http_headers = { \"CONTEXT7_API_KEY\" = \"CONTEXT7_API_KEY\" }"));
+        assert!(config_text.contains("[mcp_servers.exa]"));
+        assert!(config_text.contains("url = \"https://mcp.exa.ai/mcp\""));
+        env::remove_var("AGPIPE_TEST_ALLOW_MCP_PROVISION");
+    }
+
+    #[test]
+    fn provision_selected_mcp_servers_is_idempotent_for_existing_blocks() {
+        let run_dir = temp_dir("mcp-provision-idempotent-run");
+        let codex_home = temp_dir("mcp-provision-idempotent-home");
+        env::set_var("AGPIPE_TEST_ALLOW_MCP_PROVISION", "1");
+        let plan = Plan {
+            mcp: McpSelection {
+                auto_select: true,
+                rationale: vec!["test".to_string()],
+                servers: vec![McpServerPlan {
+                    name: "exa".to_string(),
+                    mode: "readonly".to_string(),
+                    stages: vec!["solver".to_string()],
+                    purposes: vec!["research".to_string()],
+                    usage_hint: "Prefer source discovery.".to_string(),
+                }],
+            },
+            ..Plan::default()
+        };
+
+        let first = provision_selected_mcp_servers(&run_dir, &plan, Some(&codex_home));
+        let second = provision_selected_mcp_servers(&run_dir, &plan, Some(&codex_home));
+        let config_text = read_text(&codex_home.join("config.toml")).expect("read codex config");
+
+        assert!(first.configured.iter().any(|item| item == "exa"));
+        assert!(second.already_present.iter().any(|item| item == "exa"));
+        assert_eq!(config_text.matches("[mcp_servers.exa]").count(), 1);
+        env::remove_var("AGPIPE_TEST_ALLOW_MCP_PROVISION");
+    }
+
+    #[test]
+    fn provision_selected_mcp_servers_writes_official_fetch_and_git_blocks() {
+        let run_dir = temp_dir("mcp-provision-official-run");
+        let codex_home = temp_dir("mcp-provision-official-home");
+        env::set_var("AGPIPE_TEST_ALLOW_MCP_PROVISION", "1");
+        let workspace = temp_dir("mcp-provision-official-workspace");
+        fs::create_dir_all(workspace.join(".git")).expect("create fake git dir");
+        let plan = Plan {
+            workspace: workspace.display().to_string(),
+            task_kind: "review".to_string(),
+            original_task: "Проведи ревью кода репозитория без изменений".to_string(),
+            mcp: McpSelection {
+                auto_select: true,
+                rationale: vec!["test".to_string()],
+                servers: vec![
+                    McpServerPlan {
+                        name: "fetch".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["solver".to_string()],
+                        purposes: vec!["page retrieval".to_string()],
+                        usage_hint: "Prefer Fetch.".to_string(),
+                    },
+                    McpServerPlan {
+                        name: "git".to_string(),
+                        mode: "readonly".to_string(),
+                        stages: vec!["review".to_string()],
+                        purposes: vec!["history".to_string()],
+                        usage_hint: "Prefer Git.".to_string(),
+                    },
+                ],
+            },
+            ..Plan::default()
+        };
+
+        let record = provision_selected_mcp_servers(&run_dir, &plan, Some(&codex_home));
+        let config_text = read_text(&codex_home.join("config.toml")).expect("read codex config");
+
+        assert!(record.configured.iter().any(|item| item == "fetch"));
+        assert!(record.configured.iter().any(|item| item == "git"));
+        assert!(config_text.contains("[mcp_servers.fetch]"));
+        assert!(config_text.contains("mcp/fetch"));
+        assert!(config_text.contains("[mcp_servers.git]"));
+        assert!(config_text.contains("mcp/git"));
+        assert!(config_text.contains("enabled_tools = [\"git_status\", \"git_diff_unstaged\", \"git_diff_staged\", \"git_diff\", \"git_log\", \"git_show\", \"git_branch\"]"));
+        env::remove_var("AGPIPE_TEST_ALLOW_MCP_PROVISION");
+    }
+
+    #[test]
+    fn cli_backend_tasks_use_lightweight_reviewer_stack() {
+        let stack = reviewer_stack_for_task(
+            "backend",
+            "low",
+            "Create a minimal Python CLI in main.py, print exact stdout, and document the run command in README.md.",
+        );
+        assert_eq!(
+            stack,
+            vec![
+                "testing/testing-reality-checker.md".to_string(),
+                "engineering/engineering-code-reviewer.md".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn create_run_uses_cli_focused_backend_roles_for_local_entrypoint_tasks() {
+        let ctx = test_context();
+        let workspace = temp_dir("backend-cli-role-workspace");
+        let output_root = temp_dir("backend-cli-role-output");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI in main.py, print exact stdout, and document the run command in README.md.",
+            &workspace,
+            &output_root,
+            Some("backend-cli-role-test"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        assert_eq!(plan.task_kind, "backend");
+        assert_eq!(plan.solver_count, 1);
+        assert_eq!(plan.workstream_hints.len(), 2);
+        assert_eq!(plan.workstream_hints[0].name, "local-entrypoint");
+        assert_eq!(
+            plan.workstream_hints[0].suggested_role,
+            "engineering/engineering-rapid-prototyper.md"
+        );
+        assert_eq!(plan.workstream_hints[1].name, "run-contract");
+        assert_eq!(
+            plan.workstream_hints[1].suggested_role,
+            "engineering/engineering-technical-writer.md"
+        );
+        assert_eq!(
+            plan.solver_roles
+                .iter()
+                .map(|role| role.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["engineering/engineering-rapid-prototyper.md"]
+        );
+        assert!(plan
+            .mcp
+            .servers
+            .iter()
+            .all(|server| server.name != "fetch" && server.name != "context7"));
+        assert_eq!(
+            plan.reviewer_stack,
+            vec![
+                "testing/testing-reality-checker.md".to_string(),
+                "engineering/engineering-code-reviewer.md".to_string(),
+            ]
+        );
+        assert!(plan
+            .validation_commands
+            .iter()
+            .any(|item| item == "python3 main.py"));
+        let goal_ids: Vec<&str> = plan
+            .goal_checks
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert!(goal_ids.iter().any(|item| *item == "main_py_entrypoint"));
+        assert!(goal_ids.iter().any(|item| *item == "exact_stdout_contract"));
+        assert!(goal_ids.iter().any(|item| *item == "readme_run_command"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn intake_stage_uses_local_template_for_execution_ready_cli_tasks() {
+        let (ctx, mock_root, _bin_path, invocations_path, _tokens_path) =
+            mock_codex_context("local-cli-intake");
+        let workspace = temp_dir("local-cli-intake-workspace");
+        let output_root = temp_dir("local-cli-intake-output");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI in main.py, print exact stdout, and document the run command in README.md.",
+            &workspace,
+            &output_root,
+            Some("local-cli-intake"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let intake = run_stage_capture(&ctx, &run_dir, "start", &["intake"]).expect("intake");
+
+        assert_eq!(intake.code, 0, "{}", intake.stdout);
+        assert_eq!(line_count(&invocations_path), 0);
+        let brief = read_text(&run_dir.join("brief.md")).expect("read brief");
+        assert!(brief.contains("## Goal coverage matrix"));
+        assert!(brief.contains("`main.py` as the primary runnable entrypoint"));
+        assert!(brief.contains("`README.md` with the exact local run command"));
+        let last_message =
+            read_text(&run_dir.join("logs").join("intake.last.md")).expect("read intake summary");
+        assert!(last_message.contains("Local intake fast-path synthesized a backend CLI brief"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
+
+    #[test]
+    fn solver_prompt_for_cli_run_forbids_workspace_edits_and_assigns_focus() {
+        let ctx = test_context();
+        let workspace = temp_dir("solver-prompt-quality-workspace");
+        let output_root = temp_dir("solver-prompt-quality-output");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI in main.py, print exact stdout, and document the run command in README.md.",
+            &workspace,
+            &output_root,
+            Some("solver-prompt-quality"),
+            "markdown",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+
+        assert!(prompt.contains("do not modify the primary workspace during solver stage"));
+        assert!(prompt.contains(
+            "do not edit `agent-runs/.../solutions/<solver>/RESULT.md` directly"
+        ));
+        assert!(prompt.contains(
+            "pipeline will materialize the file"
+        ));
+        assert!(prompt.contains("stay centered on the assigned workstreams and angle"));
+        assert!(prompt.contains("treat the resolved role docs listed above as authoritative"));
+        assert!(prompt
+            .contains("`local-entrypoint`: build the requested local CLI or script entrypoint"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn solver_prompt_filters_heavy_validation_hints_for_analysis_runs() {
+        let ctx = test_context();
+        let workspace = temp_dir("solver-prompt-analysis-workspace");
+        let output_root = temp_dir("solver-prompt-analysis-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи аудит сервиса без изменений кода и собери evidence-driven analysis.",
+            &workspace,
+            &output_root,
+            Some("solver-prompt-analysis"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        plan.validation_commands = vec![
+            "pytest".to_string(),
+            "PYTHONPATH=src python -m llm_freecad.main --chat-id smoke --photo-path data/seed_examples/rectangular_prism.pgm --result-json-path /tmp/out.json".to_string(),
+            "python run_service.py --help".to_string(),
+        ];
+
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+
+        assert!(prompt.contains("\"validation_hints\": ["));
+        assert!(prompt.contains("\"pytest\""));
+        assert!(prompt.contains("run_service.py --help"));
+        assert!(!prompt.contains("--photo-path"));
+        assert!(prompt.contains("prefer quick, bounded validation first"));
+        assert!(prompt.contains("leave the expensive probe for verification"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn review_prompt_requires_structured_scorecard_and_duplicate_detection() {
+        let ctx = test_context();
+        let workspace = temp_dir("review-prompt-quality-workspace");
+        let output_root = temp_dir("review-prompt-quality-output");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI in main.py, print exact stdout, and document the run command in README.md.",
+            &workspace,
+            &output_root,
+            Some("review-prompt-quality"),
+            "markdown",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        let prompt = render_review_prompt(&ctx, &run_dir, &plan);
+
+        assert!(prompt.contains("materially identical"));
+        assert!(prompt.contains(
+            "treat the resolved reviewer docs and review rubric as the primary review guidance"
+        ));
+        assert!(prompt.contains("`validation_evidence`"));
+        assert!(prompt.contains("`execution_notes`"));
+        assert!(prompt.contains("`winner`: selected solver id or `hybrid`"));
+        assert!(prompt.contains(
+            "do not edit `review/report.md`, `review/scorecard.json`, or `review/user-summary.md` directly"
+        ));
+        assert!(prompt.contains(
+            "pipeline can materialize the files"
+        ));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn review_prompt_filters_heavy_validation_hints_for_analysis_runs() {
+        let ctx = test_context();
+        let workspace = temp_dir("review-prompt-analysis-workspace");
+        let output_root = temp_dir("review-prompt-analysis-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи аудит сервиса без изменений кода и собери evidence-driven analysis.",
+            &workspace,
+            &output_root,
+            Some("review-prompt-analysis"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        plan.validation_commands = vec![
+            "pytest".to_string(),
+            "PYTHONPATH=src python -m llm_freecad.main --chat-id smoke --photo-path data/seed_examples/rectangular_prism.pgm --result-json-path /tmp/out.json".to_string(),
+        ];
+
+        let prompt = render_review_prompt(&ctx, &run_dir, &plan);
+
+        assert!(prompt.contains("\"validation_hints\": ["));
+        assert!(prompt.contains("\"pytest\""));
+        assert!(!prompt.contains("--photo-path"));
+        assert!(prompt.contains("prefer quick, bounded validation first"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn audit_improve_review_prompt_uses_light_stack_and_skips_runtime_harness() {
+        let ctx = test_context();
+        let workspace = temp_dir("audit-improve-review-workspace");
+        let output_root = temp_dir("audit-improve-review-output");
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\nDo not rescope from stale review artifacts.\n\n## Goal Status\n\n- rerun recommended: `true`\n- missing critical checks:\n- `device_story_reconciled`\n\n## Verification Summary\n\nНужен узкий audit rerun без reopening уже подтверждённых фиксов.\n\n## Follow-Up Task\n\nПроведи audit и analysis, refresh stale artifacts, reconcile device story, preserve verified progress, без реализации новых фич.\n";
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("audit-improve-review"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create audit-improve run");
+        let prompt = compile_prompt(&ctx, &run_dir, "review").expect("compile review prompt");
+
+        assert!(prompt.contains("Audit-improve focus for this stage:"));
+        assert!(prompt.contains("verification-seeded request"));
+        assert!(!prompt.contains("Runtime harness:"));
+        assert!(prompt.contains("engineering/engineering-code-reviewer.md"));
+        assert!(!prompt.contains("testing/testing-tool-evaluator.md"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn russian_audit_task_forbids_workspace_changes_and_prefers_lightweight_validation() {
+        let task = "Проведи комплексный анализ сервиса `./repo-under-review`.\n\nЭто именно задача на аудит и исследование, а не на реализацию исправлений. Не переходи к изменению кода, рефакторингу или внедрению фиксов, если это не будет отдельно запрошено.";
+        assert!(task_forbids_workspace_changes(task));
+        assert!(!task_requests_workspace_changes(task));
+        assert!(task_is_analysis_only(task));
+
+        let plan = Plan {
+            original_task: task.to_string(),
+            task_kind: "ai".to_string(),
+            ..Plan::default()
+        };
+        assert!(prompt_prefers_lightweight_validation(&plan));
+    }
+
+    #[test]
+    fn analytical_document_request_is_treated_as_analysis_only() {
+        let task = "Проведи комплексный анализ сервиса `/srv/sample-service` и предложи варианты его переноса на `Docker Swarm` и `Docker Compose` с правильной логикой деплоя и отката.\n\nИтоговый результат нужен в виде аналитического документа. Не превращай задачу в реализацию: рабочие артефакты в репозитории (`Dockerfile`, `docker-compose.yml`, swarm-манифесты, правки `.gitlab-ci.yml`, deploy/rollback-скрипты) не являются обязательной частью результата, если без них можно обойтись.";
+        assert!(task_forbids_workspace_changes(task));
+        assert!(!task_requests_workspace_changes(task));
+        assert!(task_is_analysis_only(task));
+        assert!(!default_pipeline_includes_execution("research", task));
+
+        let ctx = test_context();
+        let workspace = temp_dir("analytical-document-analysis-workspace");
+        let output_root = temp_dir("analytical-document-analysis-output");
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("analytical-document-analysis"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create analysis-only document run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        assert!(!available_stages(&run_dir)
+            .expect("available stages")
+            .iter()
+            .any(|stage| stage == "execution"));
+        assert!(task_is_analysis_only(&plan.original_task));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn russian_report_only_research_request_is_analysis_only() {
+        let task = "Проведи исследование моделей онлайн-дохода и подготовь один читабельный русскоязычный итоговый отчёт без лишних англоязычных терминов.";
+        assert!(task_is_analysis_only(task));
+        assert!(!task_requests_workspace_changes(task));
+    }
+
+    #[test]
+    fn analysis_only_run_omits_implementation_goal_checks_and_solver_plan_language() {
+        let ctx = test_context();
+        let workspace = temp_dir("analysis-only-goals-workspace");
+        let output_root = temp_dir("analysis-only-goals-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи комплексный анализ сервиса `./repo-under-review`. Это именно задача на аудит и исследование, а не на реализацию исправлений. Не переходи к изменению кода, рефакторингу или внедрению фиксов.",
+            &workspace,
+            &output_root,
+            Some("analysis-only-goals"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create analysis run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let goal_ids: Vec<&str> = plan
+            .goal_checks
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+        assert!(!goal_ids.iter().any(|item| *item == "analysis_adapter"));
+        assert!(!goal_ids.iter().any(|item| *item == "freecad_output"));
+        assert!(!goal_ids.iter().any(|item| *item == "runnable_entrypoint"));
+        assert!(goal_ids
+            .iter()
+            .any(|item| *item == "reproducible_audit_report"));
+        assert!(goal_ids
+            .iter()
+            .any(|item| *item == "residual_gaps_documented"));
+
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+        assert!(prompt.contains("analysis-only stage"));
+        assert!(!prompt.contains("implementation summary or exact file plan"));
+    }
+
+    #[test]
+    fn build_codex_command_inherits_ephemeral_flag_and_agency_catalog_dir() {
+        let (ctx, root, agency_root, workspace) =
+            test_context_with_sibling_agency("build-codex-command");
+        let output_root = temp_dir("build-codex-command-output");
+        let cache_root = temp_dir("build-codex-command-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Create a minimal Python CLI and document the run command.",
+            &workspace,
+            &output_root,
+            Some("build-codex-command"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let _env = ScopedEnvVar::set("AGPIPE_CODEX_EPHEMERAL", "1");
+
+        let (command, _prompt) =
+            build_codex_command(&ctx, &run_dir, "intake", &StartArgs::default())
+                .expect("build codex command");
+
+        assert!(command.iter().any(|item| item == "--ephemeral"));
+        assert!(command
+            .windows(2)
+            .any(|pair| pair == ["--config", "model_reasoning_effort=\"low\""]));
+        assert!(command.iter().any(|item| item == "--add-dir"));
+        assert!(command
+            .iter()
+            .any(|item| item == &agency_root.display().to_string()));
+        assert!(!command
+            .iter()
+            .any(|item| item == &ctx.repo_root.display().to_string()));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_codex_command_uses_medium_reasoning_for_low_complexity_non_trivial_stage() {
+        let ctx = test_context();
+        let workspace = temp_dir("build-codex-medium-workspace");
+        let output_root = temp_dir("build-codex-medium-output");
+        let cache_root = temp_dir("build-codex-medium-cache");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи короткое ревью кода и дай список замечаний без реализации.",
+            &workspace,
+            &output_root,
+            Some("build-codex-medium"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            &cache_root.display().to_string(),
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        let (command, _prompt) =
+            build_codex_command(&ctx, &run_dir, "solver-a", &StartArgs::default())
+                .expect("build codex command");
+
+        assert!(command
+            .windows(2)
+            .any(|pair| pair == ["--config", "model_reasoning_effort=\"medium\""]));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -15908,20 +23306,34 @@ exit 1
             .collect();
         assert_eq!(
             stage_ids,
-            vec!["intake", "solver-a", "solver-b", "review", "verification"]
+            vec![
+                "intake",
+                "solver-a",
+                "solver-b",
+                "solver-c",
+                "review",
+                "verification"
+            ]
         );
-        assert_eq!(plan.solver_count, 2);
+        assert_eq!(plan.solver_count, 3);
         assert_eq!(
             plan.solver_roles
                 .iter()
                 .map(|role| role.angle.as_str())
                 .collect::<Vec<_>>(),
-            vec!["breadth-first", "evidence-first"]
+            vec!["breadth-first", "evidence-first", "risk-first"]
         );
         assert_eq!(plan.reviewer_stack, reviewer_stack_for("research"));
         assert_eq!(
             available_stages(&run_dir).expect("available stages"),
-            vec!["intake", "solver-a", "solver-b", "review", "verification"]
+            vec![
+                "intake",
+                "solver-a",
+                "solver-b",
+                "solver-c",
+                "review",
+                "verification"
+            ]
         );
 
         write_text(&run_dir.join("brief.md"), "# Brief\n\nResearch brief.\n").expect("brief");
@@ -15935,6 +23347,11 @@ exit 1
             "# Result\n\nOption B.\n",
         )
         .expect("solver-b");
+        write_text(
+            &run_dir.join("solutions").join("solver-c").join("RESULT.md"),
+            "# Result\n\nOption C.\n",
+        )
+        .expect("solver-c");
         write_text(
             &run_dir.join("review").join("report.md"),
             "# Review Report\n\nSelected solver-a.\n",
@@ -15955,6 +23372,134 @@ exit 1
             next_stage_for_run(&run_dir).expect("next after review"),
             Some("verification".to_string())
         );
+    }
+
+    #[test]
+    fn create_run_builds_review_only_pipeline_for_code_review_requests() {
+        let ctx = test_context();
+        let workspace = temp_dir("review-only-workspace");
+        let output_root = temp_dir("review-only-output");
+        fs::create_dir_all(workspace.join("src")).expect("create src");
+        fs::create_dir_all(workspace.join("tests")).expect("create tests");
+        write_text(&workspace.join("pytest.ini"), "[pytest]\n").expect("write pytest.ini");
+        write_text(
+            &workspace.join("src").join("main.py"),
+            "def answer():\n    return 42\n",
+        )
+        .expect("write main.py");
+        write_text(
+            &workspace.join("tests").join("test_main.py"),
+            "from src.main import answer\n\n\ndef test_answer():\n    assert answer() == 42\n",
+        )
+        .expect("write test_main.py");
+
+        let run_dir = create_run(
+            &ctx,
+            "Проведи ревью кода ~/repo-under-review. Без изменений в коде: нужны баги, риски, регрессии и пробелы в тестах с приоритетом по severity и ссылками на файлы.",
+            &workspace,
+            &output_root,
+            Some("review-only"),
+            "markdown",
+            "ru",
+            "local-first",
+            "local-first",
+            "none",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create review run");
+
+        let plan = load_plan(&run_dir).expect("load plan");
+        let stage_ids: Vec<String> = plan
+            .pipeline
+            .stages
+            .iter()
+            .map(|stage| stage.id.clone())
+            .collect();
+        let goal_ids: Vec<&str> = plan
+            .goal_checks
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect();
+
+        assert_eq!(plan.task_kind, "review");
+        assert_eq!(plan.execution_mode, "alternatives");
+        assert_eq!(plan.solver_count, 2);
+        assert_eq!(
+            stage_ids,
+            vec!["intake", "solver-a", "solver-b", "review", "verification"]
+        );
+        assert_eq!(
+            plan.workstream_hints
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "correctness-and-bugs",
+                "regression-and-risk",
+                "tests-and-evidence",
+            ]
+        );
+        assert_eq!(
+            plan.solver_roles
+                .iter()
+                .map(|role| role.role.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "engineering/engineering-code-reviewer.md",
+                "testing/testing-reality-checker.md",
+            ]
+        );
+        assert_eq!(plan.reviewer_stack, reviewer_stack_for("review"));
+        assert!(goal_ids.iter().any(|item| *item == "review_findings"));
+        assert!(goal_ids
+            .iter()
+            .any(|item| *item == "evidence_with_file_refs"));
+        assert!(goal_ids.iter().any(|item| *item == "review_only_scope"));
+        assert!(!goal_ids.iter().any(|item| *item == "analysis_adapter"));
+        assert!(!goal_ids.iter().any(|item| *item == "freecad_output"));
+        assert!(!goal_ids.iter().any(|item| *item == "runnable_entrypoint"));
+        assert!(plan.validation_commands.iter().any(|item| item == "pytest"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn review_solver_prompt_uses_review_deliverables_instead_of_implementation_plan() {
+        let ctx = test_context();
+        let workspace = temp_dir("review-solver-prompt-workspace");
+        let output_root = temp_dir("review-solver-prompt-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Проведи ревью кода проекта и выдай findings по severity с file refs. Без изменений в коде.",
+            &workspace,
+            &output_root,
+            Some("review-solver-prompt"),
+            "markdown",
+            "ru",
+            "local-first",
+            "local-first",
+            "none",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create review run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        let prompt = render_solver_prompt(&ctx, &run_dir, &plan, &plan.solver_roles[0]);
+
+        assert!(prompt.contains("findings with severity and evidence"));
+        assert!(prompt.contains("review-only stage"));
+        assert!(!prompt.contains("implementation summary or exact file plan"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -16095,11 +23640,143 @@ exit 1
         .expect("create research run");
         let plan = load_plan(&run_dir).expect("load plan");
 
-        let prompt = render_verification_prompt(&run_dir, &plan);
+        let prompt = render_verification_prompt(&ctx, &run_dir, &plan);
 
-        assert!(!prompt.contains("execution/report.md"));
+        assert!(!prompt.contains(
+            &run_dir
+                .join("execution")
+                .join("report.md")
+                .display()
+                .to_string()
+        ));
         assert!(prompt.contains("research or documentation artifacts"));
         assert!(prompt.contains("review verdict and solver evidence"));
+        assert!(prompt.contains(
+            "do not edit `verification/findings.md`, `verification/user-summary.md`, `verification/goal-status.json`, `verification/improvement-request.md`, or `verification/augmented-task.md` directly"
+        ));
+        assert!(prompt.contains(
+            "pipeline can materialize the files"
+        ));
+        assert!(prompt.contains(
+            "do not report a missing `execution/report.md` as a defect when this run has no execution stage"
+        ));
+        assert!(prompt.contains(
+            "not as a request to mutate previous run-local files under `agent-runs`"
+        ));
+        assert!(prompt.contains(
+            "the rerun should write it under its own run directory"
+        ));
+        assert!(prompt.contains(
+            &run_reference_asset_path(&run_dir, VERIFICATION_RUBRIC_REF)
+                .display()
+                .to_string()
+        ));
+        assert!(prompt.contains(&stage_memory_namespace(&run_dir, "verification")));
+    }
+
+    #[test]
+    fn compiled_verification_stage_prompt_avoids_direct_run_artifact_edits() {
+        let ctx = test_context();
+        let workspace = temp_dir("verification-stage-wrapper-workspace");
+        let output_root = temp_dir("verification-stage-wrapper-output");
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("verification-stage-wrapper"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create research run");
+
+        let prompt = compile_prompt(&ctx, &run_dir, "verification").expect("compile verification");
+
+        assert!(prompt.contains(
+            "Do not edit run-local stage output files directly unless the stage prompt explicitly asks for it"
+        ));
+        assert!(!prompt.contains("Update the requested artifacts directly on disk."));
+        assert!(prompt.contains("do not open generic workflow `SKILL.md` files"));
+        assert!(prompt.contains("workflow stage `verification` for a file-based run"));
+        assert!(!prompt.contains("stage `verification` of a multi-agent pipeline"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn execution_prompt_treats_host_probe_as_stage_local_not_run_global() {
+        let ctx = test_context();
+        let workspace = temp_dir("execution-stage-probe-workspace");
+        let output_root = temp_dir("execution-stage-probe-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Исправить баг в сервисе и подтвердить результат локальной валидацией.",
+            &workspace,
+            &output_root,
+            Some("execution-stage-probe"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create execution run");
+
+        let prompt = compile_prompt(&ctx, &run_dir, "execution").expect("compile execution");
+
+        assert!(prompt.contains("execution-stage launcher probe"));
+        assert!(prompt.contains(
+            "do not describe it as the authoritative probe for the whole run"
+        ));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn verification_prompt_does_not_fail_timestamp_drift_alone_when_facts_match() {
+        let ctx = test_context();
+        let workspace = temp_dir("verification-probe-drift-workspace");
+        let output_root = temp_dir("verification-probe-drift-output");
+
+        let run_dir = create_run(
+            &ctx,
+            "Исправить баг в сервисе и подтвердить результат локальной валидацией.",
+            &workspace,
+            &output_root,
+            Some("verification-probe-drift"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create verification run");
+
+        let prompt = compile_prompt(&ctx, &run_dir, "verification").expect("compile verification");
+
+        assert!(prompt.contains("do not fail the run for timestamp drift alone"));
+        assert!(prompt.contains("facts materially differ"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -16198,6 +23875,492 @@ exit 1
     }
 
     #[test]
+    fn doctor_report_normalizes_dead_running_job_state() {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-normalize-dead-workspace");
+        let output_root = temp_dir("doctor-normalize-dead-output");
+        let run_dir = create_run(
+            &ctx,
+            "Review the repository without changing code.",
+            &workspace,
+            &output_root,
+            Some("doctor-normalize-dead"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nReady.\n").expect("brief");
+
+        runtime::start_job(
+            &run_dir,
+            "resume",
+            Some("solver-a"),
+            "resume until verification",
+            999_999,
+            999_999,
+        )
+        .expect("start stale job");
+
+        let mut state = runtime::load_job_state(&run_dir).expect("load running state");
+        state.updated_at_unix = state.updated_at_unix.saturating_sub(60);
+        fs::write(
+            runtime::job_state_path(&run_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize job state"),
+        )
+        .expect("persist aged job state");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "broken");
+        let attempt = doctor.last_attempt.as_ref().expect("last attempt");
+        assert_eq!(attempt.stage, "solver-a");
+        assert_eq!(attempt.status, "exited");
+        assert!(
+            attempt
+                .message
+                .contains("Tracked process is no longer alive"),
+            "unexpected message: {}",
+            attempt.message
+        );
+
+        let status = status_report(&ctx, &run_dir).expect("status report");
+        let attempt = status.last_attempt.as_ref().expect("status last attempt");
+        assert_eq!(attempt.stage, "solver-a");
+        assert_eq!(attempt.status, "exited");
+
+        let normalized = runtime::load_job_state(&run_dir).expect("normalized job state");
+        assert_eq!(normalized.status, "exited");
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn doctor_flags_active_stage_that_has_stopped_emitting_progress() {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-stalled-stage-workspace");
+        let output_root = temp_dir("doctor-stalled-stage-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи повторную проверку артефактов без изменения кода.",
+            &workspace,
+            &output_root,
+            Some("doctor-stalled-stage"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nReady.\n").expect("brief");
+        runtime::start_job(
+            &run_dir,
+            "resume",
+            Some("verification"),
+            "resume until verification",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start active verification job");
+
+        let mut state = runtime::load_job_state(&run_dir).expect("load active state");
+        state.started_at_unix = state.started_at_unix.saturating_sub(400);
+        state.updated_at_unix = state.updated_at_unix.saturating_sub(400);
+        fs::write(
+            runtime::job_state_path(&run_dir),
+            serde_json::to_vec_pretty(&state).expect("serialize active state"),
+        )
+        .expect("persist aged active state");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "broken");
+        assert_eq!(doctor.safe_next_action, "interrupt");
+        assert!(doctor.issues.iter().any(|issue| {
+            issue.message.contains("appears stuck")
+        }));
+
+        let status = status_report(&ctx, &run_dir).expect("status report");
+        assert_eq!(status.next, "solver-a");
+        assert!(status.last_attempt.is_none());
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn doctor_ignores_completed_single_step_attempt_when_process_log_shows_previous_stage_finished()
+    {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-ignore-stale-start-next-workspace");
+        let output_root = temp_dir("doctor-ignore-stale-start-next-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи аудит репозитория без изменения кода.",
+            &workspace,
+            &output_root,
+            Some("doctor-ignore-stale-start-next"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nReady.\n").expect("brief");
+        runtime::start_job(
+            &run_dir,
+            "start-next",
+            Some("solver-a"),
+            "start-next",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start stale start-next job");
+        runtime::append_process_line(&run_dir, "Completed intake with exit code 0.")
+            .expect("append completion line");
+        runtime::finish_job(&run_dir, "completed", Some(0), None)
+            .expect("finish stale start-next job");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "healthy");
+        assert_eq!(doctor.next, "solver-a");
+        assert!(doctor.last_attempt.is_none());
+
+        let status = status_report(&ctx, &run_dir).expect("status report");
+        assert_eq!(status.next, "solver-a");
+        assert!(status.last_attempt.is_none());
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn doctor_warns_when_solver_mcp_assignment_did_not_reach_stage_artifacts() {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-mcp-mismatch-workspace");
+        let output_root = temp_dir("doctor-mcp-mismatch-output");
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("doctor-mcp-mismatch"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        write_text(&run_dir.join("brief.md"), "# Brief\n\nReady.\n").expect("brief");
+        write_text(
+            &run_dir.join("solutions").join("solver-a").join("RESULT.md"),
+            "# Result\n\nOption A.\n",
+        )
+        .expect("solver result");
+        write_text(
+            &run_dir.join("logs").join("solver-a.prompt.md"),
+            "{\"mcp_servers\": [], \"mcp_usage_hints\": []}\n",
+        )
+        .expect("solver prompt log");
+        write_json(
+            &run_dir.join("runtime").join("mcp-provision.json"),
+            &McpProvisionRecord {
+                enabled: true,
+                configured: vec!["fetch".to_string(), "memory".to_string()],
+                ..McpProvisionRecord::default()
+            },
+        )
+        .expect("mcp provision");
+        persist_stage_mcp_note(
+            &run_dir,
+            "solver-a",
+            "No MCP servers were selected for this stage.\n\nNo MCP tools were used in this stage.",
+        )
+        .expect("persist mcp note");
+        record_stage_mcp_usage(&plan, &run_dir, "solver-a", "codex", "executed")
+            .expect("record mcp usage");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "warning");
+        assert!(doctor.warnings.iter().any(|issue| issue
+            .message
+            .contains("Selected MCP servers did not propagate cleanly into stage artifacts")));
+    }
+
+    #[test]
+    fn doctor_warns_when_verification_mcp_assignment_did_not_reach_stage_artifacts() {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-verification-mcp-mismatch-workspace");
+        let output_root = temp_dir("doctor-verification-mcp-mismatch-output");
+        let run_dir = create_run(
+            &ctx,
+            "Исследовать код проекта, сравнить варианты и дать рекомендацию по изменениям.",
+            &workspace,
+            &output_root,
+            Some("doctor-verification-mcp-mismatch"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        write_text(
+            &run_dir.join("verification").join("findings.md"),
+            "# Findings\n\nNeed more verification.\n",
+        )
+        .expect("verification findings");
+        write_text(
+            &run_dir.join("logs").join("verification.prompt.md"),
+            "{\"mcp_servers\": [], \"mcp_usage_hints\": []}\n",
+        )
+        .expect("verification prompt log");
+        write_json(
+            &run_dir.join("runtime").join("mcp-provision.json"),
+            &McpProvisionRecord {
+                enabled: true,
+                configured: vec!["fetch".to_string(), "memory".to_string()],
+                ..McpProvisionRecord::default()
+            },
+        )
+        .expect("mcp provision");
+        persist_stage_mcp_note(
+            &run_dir,
+            "verification",
+            "No MCP servers were selected for this stage.\n\nNo MCP tools were used in this stage.",
+        )
+        .expect("persist verification mcp note");
+        record_stage_mcp_usage(&plan, &run_dir, "verification", "codex", "executed")
+            .expect("record verification mcp usage");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "warning");
+        assert!(doctor.warnings.iter().any(|issue| {
+            issue
+                .message
+                .contains("Selected MCP servers did not propagate cleanly into stage artifacts")
+                && issue.message.contains("verification")
+        }));
+    }
+
+    #[test]
+    fn doctor_warns_when_stage_artifacts_show_unexpected_solver_mcp_assignment() {
+        let ctx = test_context();
+        let workspace = temp_dir("doctor-unexpected-solver-mcp-workspace");
+        let output_root = temp_dir("doctor-unexpected-solver-mcp-output");
+        let run_dir = create_run(
+            &ctx,
+            "Проведи аудит и подготовь улучшения по деплою сервиса и секретам.",
+            &workspace,
+            &output_root,
+            Some("doctor-unexpected-solver-mcp"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let mut plan = load_plan(&run_dir).expect("load plan");
+        plan.mcp = McpSelection {
+            auto_select: true,
+            rationale: vec!["test".to_string()],
+            servers: vec![McpServerPlan {
+                name: "memory".to_string(),
+                mode: "memory".to_string(),
+                stages: vec![
+                    "intake".to_string(),
+                    "review".to_string(),
+                    "execution".to_string(),
+                    "verification".to_string(),
+                ],
+                purposes: vec!["handoff".to_string()],
+                usage_hint: "Use memory only outside solver stage.".to_string(),
+            }],
+        };
+        for solver in &mut plan.solver_roles {
+            solver.mcp_servers.clear();
+        }
+        save_plan(&run_dir, &plan).expect("save plan");
+
+        write_text(
+            &run_dir.join("solutions").join("solver-a").join("RESULT.md"),
+            "# Result\n\nOption A.\n",
+        )
+        .expect("solver result");
+        write_text(
+            &run_dir.join("logs").join("solver-a.prompt.md"),
+            "{\"mcp_servers\": [\"memory\"], \"mcp_usage_hints\": [\"use `memory`\"]}\n",
+        )
+        .expect("solver prompt log");
+
+        let doctor = doctor_report(&ctx, &run_dir).expect("doctor report");
+        assert_eq!(doctor.health, "warning");
+        assert!(doctor.warnings.iter().any(|issue| issue
+            .message
+            .contains("Stage artifacts show unexpected MCP assignments")));
+    }
+
+    #[test]
+    fn record_stage_mcp_usage_filters_note_entries_for_unselected_servers() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-note-filter-workspace");
+        let output_root = temp_dir("mcp-note-filter-output");
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\n\n## Goal Status\n\n- rerun recommended: `true`\n\n## Follow-Up Task\n\nПроведи audit и analysis, preserve verified progress и refresh stale artifacts без реализации.\n";
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("mcp-note-filter"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        write_text(
+            &run_dir.join("verification").join("findings.md"),
+            "# Findings\n\n## MCP Usage\n\n- `fetch`: not used.\n- `memory`: unavailable.\n",
+        )
+        .expect("write verification findings");
+        write_json(
+            &run_dir.join("runtime").join("mcp-provision.json"),
+            &McpProvisionRecord {
+                enabled: true,
+                configured: vec!["memory".to_string()],
+                ..McpProvisionRecord::default()
+            },
+        )
+        .expect("write mcp provision");
+        persist_stage_mcp_note(
+            &run_dir,
+            "verification",
+            "- `fetch`: not used.\n- `memory`: unavailable.\n",
+        )
+        .expect("write note");
+
+        record_stage_mcp_usage(&plan, &run_dir, "verification", "codex", "executed")
+            .expect("record usage");
+
+        let note = read_text(&run_dir.join("runtime").join("mcp").join("verification.md"))
+            .expect("read normalized note");
+        assert!(!note.contains("`fetch`"));
+        assert!(note.contains("`memory`"));
+
+        let records = read_mcp_usage_records(&run_dir);
+        let verification = records
+            .iter()
+            .find(|item| item.stage == "verification")
+            .expect("verification record");
+        assert_eq!(verification.selected, vec!["memory".to_string()]);
+        assert_eq!(verification.declared_not_used, vec!["memory".to_string()]);
+    }
+
+    #[test]
+    fn record_stage_mcp_usage_filters_table_entries_for_unselected_servers() {
+        let ctx = test_context();
+        let workspace = temp_dir("mcp-table-filter-workspace");
+        let output_root = temp_dir("mcp-table-filter-output");
+        let task = "# Verified Follow-Up Task\n\nUse only the verification-derived context below as the authoritative seed for this rerun.\n\n## Goal Status\n\n- rerun recommended: `true`\n\n## Follow-Up Task\n\nПроведи audit и analysis, preserve verified progress и refresh stale artifacts без реализации.\n";
+        let run_dir = create_run(
+            &ctx,
+            task,
+            &workspace,
+            &output_root,
+            Some("mcp-table-filter"),
+            "compact",
+            "ru",
+            "research-first",
+            "local-first",
+            "fetch-if-needed",
+            "~/.cache/multi-agent-pipeline",
+            "reuse",
+            None,
+        )
+        .expect("create run");
+        let plan = load_plan(&run_dir).expect("load plan");
+
+        let note = "| MCP server | Status | Reason |\n| --- | --- | --- |\n| `exa` | `not used` | left over from older note |\n| `fetch` | `not used` | left over from older note |\n| `memory` | `unavailable` | selected for this stage |\n";
+        write_text(
+            &run_dir.join("verification").join("findings.md"),
+            &format!("# Findings\n\n## MCP Usage\n\n{note}"),
+        )
+        .expect("write findings");
+        write_json(
+            &run_dir.join("runtime").join("mcp-provision.json"),
+            &McpProvisionRecord {
+                enabled: true,
+                configured: vec!["memory".to_string()],
+                ..McpProvisionRecord::default()
+            },
+        )
+        .expect("write mcp provision");
+        persist_stage_mcp_note(&run_dir, "verification", note).expect("write note");
+
+        record_stage_mcp_usage(&plan, &run_dir, "verification", "codex", "executed")
+            .expect("record usage");
+
+        let normalized = read_text(&run_dir.join("runtime").join("mcp").join("verification.md"))
+            .expect("read normalized note");
+        assert!(!normalized.contains("`exa`"));
+        assert!(!normalized.contains("`fetch`"));
+        assert!(normalized.contains("`memory`"));
+        assert!(normalized.contains("| MCP server | Status | Reason |"));
+        assert!(normalized.contains("| --- | --- | --- |"));
+
+        let _ = fs::remove_dir_all(run_dir);
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn empty_mcp_selection_forbids_live_recheck_claims() {
+        let rules = render_mcp_accountability_rules(&[], "ru");
+        assert!(rules
+            .iter()
+            .any(|rule: &String| rule.contains("Использование MCP")));
+        assert!(rules
+            .iter()
+            .any(|rule: &String| rule.contains("do not claim fresh MCP-backed lookups")));
+    }
+
+    #[test]
     fn load_plan_accepts_legacy_string_workstream_hints() {
         let run_dir = temp_run_dir("legacy-workstream-hints");
         write_json(
@@ -16247,6 +24410,95 @@ exit 1
         );
 
         let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn load_plan_falls_back_to_runtime_snapshot_when_plan_json_is_missing() {
+        let run_dir = temp_run_dir("plan-snapshot-fallback");
+        let snapshot_path = crate::runtime::runtime_dir(&run_dir).join("plan.snapshot.json");
+        write_json(
+            &snapshot_path,
+            &json!({
+                "workspace": run_dir.display().to_string(),
+                "workspace_exists": true,
+                "task_kind": "backend",
+                "prompt_format": "compact",
+                "summary_language": "ru",
+                "intake_research_mode": "research-first",
+                "stage_research_mode": "local-first",
+                "execution_network_mode": "fetch-if-needed",
+                "goal_gate_enabled": true,
+                "augmented_follow_up_enabled": true
+            }),
+        )
+        .expect("write snapshot plan");
+
+        assert!(run_has_plan_artifact(&run_dir));
+        let plan = load_plan(&run_dir).expect("load snapshot plan");
+        assert_eq!(plan.task_kind, "backend");
+        assert_eq!(plan.prompt_format, "compact");
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn save_plan_writes_runtime_snapshot_copy() {
+        let run_dir = temp_run_dir("plan-snapshot-save");
+        let plan = Plan {
+            workspace: run_dir.display().to_string(),
+            workspace_exists: true,
+            task_kind: "backend".to_string(),
+            prompt_format: "compact".to_string(),
+            summary_language: "ru".to_string(),
+            intake_research_mode: "research-first".to_string(),
+            stage_research_mode: "local-first".to_string(),
+            execution_network_mode: "fetch-if-needed".to_string(),
+            goal_gate_enabled: true,
+            augmented_follow_up_enabled: true,
+            ..Plan::default()
+        };
+
+        save_plan(&run_dir, &plan).expect("save plan");
+
+        assert!(run_dir.join("plan.json").exists());
+        assert!(crate::runtime::runtime_dir(&run_dir)
+            .join("plan.snapshot.json")
+            .exists());
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn default_pipeline_stage_specs_seed_descriptions() {
+        let plan = Plan {
+            task_kind: "backend".to_string(),
+            original_task:
+                "Create a minimal Python CLI in main.py that prints an exact stdout string and add a README."
+                    .to_string(),
+            solver_count: 2,
+            solver_roles: choose_roles(
+                "backend",
+                "Create a minimal Python CLI in main.py that prints an exact stdout string and add a README.",
+                2,
+            ),
+            workstream_hints: workstream_hints_for(
+                "backend",
+                "Create a minimal Python CLI in main.py that prints an exact stdout string and add a README.",
+            ),
+            ..Plan::default()
+        };
+
+        let specs = default_pipeline_stage_specs(&plan, None);
+
+        assert!(specs
+            .iter()
+            .all(|stage| !stage.description.trim().is_empty()));
+        assert!(specs
+            .iter()
+            .any(|stage| stage.id == "solver-a" && stage.description.contains("local-entrypoint")));
+        assert!(specs
+            .iter()
+            .any(|stage| stage.id == "solver-b" && stage.description.contains("run-contract")));
     }
 
     #[test]
@@ -16318,12 +24570,27 @@ exit 1
             }),
         )
         .expect("write goal status");
+        fs::create_dir_all(run_dir.join("host")).expect("create host dir");
+        write_json(
+            &run_dir.join("host").join("probe.json"),
+            &json!({
+                "captured_at": "2026-03-31T12:27:36",
+                "preferred_torch_device": "mps",
+                "mps_built": true,
+                "mps_available": true
+            }),
+        )
+        .expect("write host probe");
 
         let result = create_follow_up_run(
             &ctx,
             &run_dir,
             &RerunArgs {
                 output_dir: Some(output_root.clone()),
+                note: Some(
+                    "Учти мои мысли: не расширяй scope и отдельно проверь, не осталось ли скрытых противоречий в текущих фактах."
+                        .to_string(),
+                ),
                 ..RerunArgs::default()
             },
         )
@@ -16335,7 +24602,6 @@ exit 1
         assert!(new_run.join("brief.md").exists());
         assert!(new_run.join("prompts").join("level1-intake.md").exists());
         assert!(new_run.join("prompts").join("level3-review.md").exists());
-        assert!(new_run.join("prompts").join("level4-execution.md").exists());
         assert!(new_run
             .join("prompts")
             .join("level5-verification.md")
@@ -16344,6 +24610,28 @@ exit 1
         let plan = load_plan(&new_run).expect("load follow-up plan");
         assert_eq!(plan.prompt_format, "compact");
         assert_eq!(plan.summary_language, "ru");
+        assert!(run_dir
+            .join("verification")
+            .join("current-facts.md")
+            .exists());
+        let request = read_text(&new_run.join("request.md")).expect("read follow-up request");
+        assert!(request.contains(
+            "Используй только контекст из проверки ниже как авторитетную основу для этого повторного прогона."
+        ));
+        assert!(request.contains("## Актуальные факты"));
+        assert!(request.contains("## Правила повторного прогона"));
+        assert!(request.contains("## Цель текущего повторного прогона"));
+        assert!(request.contains("## Дополнительные указания пользователя"));
+        assert!(request.contains("## Исторические указания из исходного прогона"));
+        assert!(request.contains("ссылки на артефакты исходного прогона"));
+        assert!(request.contains("а не переписывай предыдущие run-local файлы"));
+        assert!(request.contains("Учти мои мысли: не расширяй scope"));
+        assert!(request.contains("2026-03-31T12:27:36"));
+        assert!(request.contains("Rerun needs a compatibility follow-up."));
+        assert!(request.contains(
+            "Repair rerun compatibility for legacy workstream hints and validate the follow-up path."
+        ));
+        assert!(request.contains("незакрытые критические проверки:"));
 
         let status = status_report(&ctx, &new_run).expect("status follow-up run");
         assert_eq!(status.next, "intake");
@@ -16472,14 +24760,24 @@ exit 1
         let status = status_report(&ctx, &run_dir).expect("status completed run");
         assert_eq!(status.next, "none");
         assert_eq!(status.goal, "complete");
-        assert!(read_text(&run_dir.join("execution").join("report.md"))
-            .expect("read execution report")
-            .contains("test service successfully"));
+        if first_stage_id_for_kind(&plan, &run_dir, PipelineStageKind::Execution)
+            .expect("execution stage lookup")
+            .is_some()
+        {
+            assert!(read_text(&run_dir.join("execution").join("report.md"))
+                .expect("read execution report")
+                .contains("test service successfully"));
+        } else {
+            assert!(
+                !run_dir.join("execution").join("report.md").exists(),
+                "analysis-only mock run should not materialize an execution report"
+            );
+        }
         assert!(read_text(&run_dir.join("verification").join("findings.md"))
             .expect("read findings")
             .contains("Mock verification complete"));
 
-        let expected_calls = 2usize + 1 + plan.solver_roles.len() + 1 + 1 + 1;
+        let expected_calls = 2usize + plan.pipeline.stages.len();
         assert_eq!(line_count(&invocations_path), expected_calls);
         assert_eq!(token_sum(&tokens_path), expected_calls * 111);
 

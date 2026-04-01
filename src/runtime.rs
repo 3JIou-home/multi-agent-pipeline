@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const JOB_FILE: &str = "job.json";
 const PROCESS_LOG_FILE: &str = "process.log";
 const CANCEL_FILE: &str = "cancel.requested";
+const DEAD_PROCESS_TRANSITION_GRACE_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeJobState {
@@ -58,10 +59,10 @@ pub fn active_job_state(run_dir: &Path) -> Option<RuntimeJobState> {
     if !state.is_active() {
         return None;
     }
-    if state.exit_code.is_some() {
-        return None;
-    }
     if state.pid <= 0 && state.pgid <= 0 {
+        if state.exit_code.is_some() {
+            return None;
+        }
         let age = unix_now().saturating_sub(state.updated_at_unix);
         if age <= 15 {
             return Some(state);
@@ -75,6 +76,21 @@ pub fn active_job_state(run_dir: &Path) -> Option<RuntimeJobState> {
         return None;
     }
     if process_group_alive(state.pgid) || pid_alive(state.pid) {
+        if state.exit_code.is_some() || state.message.is_some() {
+            let mut normalized = state.clone();
+            normalized.exit_code = None;
+            normalized.message = None;
+            normalized.updated_at_unix = unix_now();
+            let _ = write_job_state(run_dir, &normalized);
+            return Some(normalized);
+        }
+        return Some(state);
+    }
+    if state.exit_code.is_some() {
+        return None;
+    }
+    let age = unix_now().saturating_sub(state.updated_at_unix);
+    if age <= DEAD_PROCESS_TRANSITION_GRACE_SECS {
         return Some(state);
     }
     let _ = finish_job(
@@ -86,7 +102,6 @@ pub fn active_job_state(run_dir: &Path) -> Option<RuntimeJobState> {
     None
 }
 
-#[cfg(test)]
 pub fn start_job(
     run_dir: &Path,
     label: &str,
@@ -127,6 +142,7 @@ pub fn start_job(
     Ok(state)
 }
 
+#[allow(dead_code)]
 pub fn start_pending_job(
     run_dir: &Path,
     label: &str,
@@ -165,6 +181,7 @@ pub fn start_pending_job(
     Ok(state)
 }
 
+#[allow(dead_code)]
 pub fn update_job_process(
     run_dir: &Path,
     pid: i32,
@@ -179,6 +196,8 @@ pub fn update_job_process(
     if let Some(status) = status {
         state.status = status.to_string();
     }
+    state.exit_code = None;
+    state.message = None;
     state.updated_at_unix = unix_now();
     write_job_state(run_dir, &state)
 }
@@ -204,6 +223,10 @@ pub fn touch_job(run_dir: &Path, status: &str) -> Result<(), String> {
         return Ok(());
     };
     state.status = status.to_string();
+    if matches!(status, "starting" | "running" | "stalled") {
+        state.exit_code = None;
+        state.message = None;
+    }
     state.updated_at_unix = unix_now();
     write_job_state(run_dir, &state)
 }
@@ -285,21 +308,20 @@ pub fn append_process_line(run_dir: &Path, line: &str) -> Result<(), String> {
 
 pub fn tail_process_log(run_dir: &Path, line_limit: usize) -> Vec<String> {
     let path = process_log_path(run_dir);
-    let Ok(content) = fs::read_to_string(path) else {
+    let Ok(file) = fs::File::open(path) else {
         return Vec::new();
     };
-    let lines: Vec<String> = content.lines().map(|line| line.to_string()).collect();
-    if lines.is_empty() {
-        return Vec::new();
+    let mut tail = std::collections::VecDeque::with_capacity(line_limit.max(1));
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        if tail.len() == line_limit {
+            tail.pop_front();
+        }
+        tail.push_back(line);
     }
-    lines
-        .into_iter()
-        .rev()
-        .take(line_limit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect()
+    tail.into_iter().collect()
 }
 
 pub fn interrupt_process_group(pgid: i32) -> Result<(), String> {
@@ -426,7 +448,8 @@ mod tests {
     use super::{
         active_job_state, cancel_request_path, clear_interrupt_request, finish_job,
         interrupt_requested, load_job_state, process_log_path, request_interrupt, start_job,
-        tail_process_log, touch_job, update_job_stage,
+        tail_process_log, touch_job, update_job_process, update_job_stage, write_job_state,
+        DEAD_PROCESS_TRANSITION_GRACE_SECS,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -440,6 +463,12 @@ mod tests {
         let path = std::env::temp_dir().join(format!("agpipe-runtime-{name}-{unique}"));
         fs::create_dir_all(&path).expect("create temp run dir");
         path
+    }
+
+    fn age_job_state(run_dir: &PathBuf, seconds: u64) {
+        let mut state = load_job_state(run_dir).expect("load job state");
+        state.updated_at_unix = state.updated_at_unix.saturating_sub(seconds);
+        write_job_state(run_dir, &state).expect("write aged job state");
     }
 
     #[test]
@@ -474,10 +503,42 @@ mod tests {
             999_999,
         )
         .expect("start job");
+        age_job_state(&run_dir, DEAD_PROCESS_TRANSITION_GRACE_SECS + 1);
 
         assert!(active_job_state(&run_dir).is_none());
 
         finish_job(&run_dir, "completed", Some(0), Some("done")).expect("finish job");
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn recently_dead_pid_stays_active_during_transition_grace_window() {
+        let run_dir = temp_run_dir("transition-grace");
+        start_job(
+            &run_dir,
+            "resume",
+            Some("review"),
+            "resume until verification",
+            999_999,
+            999_999,
+        )
+        .expect("start job");
+
+        let state = active_job_state(&run_dir).expect("state should stay active during grace");
+        assert_eq!(state.status, "running");
+        assert_eq!(state.stage.as_deref(), Some("review"));
+
+        age_job_state(&run_dir, DEAD_PROCESS_TRANSITION_GRACE_SECS + 1);
+        assert!(active_job_state(&run_dir).is_none());
+
+        let state = load_job_state(&run_dir).expect("load exited state");
+        assert_eq!(state.status, "exited");
+        assert!(state
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Tracked process is no longer alive"));
+
         let _ = fs::remove_dir_all(run_dir);
     }
 
@@ -501,6 +562,7 @@ mod tests {
         finish_job(&run_dir, "completed", Some(0), Some("done")).expect("finish job");
         touch_job(&run_dir, "running").expect("simulate stale heartbeat");
 
+        age_job_state(&run_dir, 16);
         assert!(active_job_state(&run_dir).is_none());
 
         let _ = fs::remove_dir_all(run_dir);
@@ -526,6 +588,72 @@ mod tests {
         assert_eq!(state.command_hint, "resume until verification");
 
         finish_job(&run_dir, "completed", Some(0), Some("done")).expect("finish job");
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn update_job_process_clears_stale_terminal_fields_for_live_job() {
+        let run_dir = temp_run_dir("update-process-clears-terminal-fields");
+        start_job(
+            &run_dir,
+            "resume",
+            Some("execution"),
+            "resume until verification",
+            0,
+            0,
+        )
+        .expect("start job");
+
+        let mut state = load_job_state(&run_dir).expect("load job state");
+        state.exit_code = Some(1);
+        state.message =
+            Some("Tracked process is no longer alive. Inspect run artifacts and logs.".to_string());
+        write_job_state(&run_dir, &state).expect("persist stale state");
+
+        update_job_process(
+            &run_dir,
+            std::process::id() as i32,
+            std::process::id() as i32,
+            Some("running"),
+        )
+        .expect("update job process");
+        let state = load_job_state(&run_dir).expect("reload job state");
+
+        assert_eq!(state.status, "running");
+        assert_eq!(state.exit_code, None);
+        assert_eq!(state.message, None);
+
+        let _ = fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
+    fn active_job_state_normalizes_stale_terminal_message_for_alive_process() {
+        let run_dir = temp_run_dir("active-job-normalizes-terminal-message");
+        start_job(
+            &run_dir,
+            "resume",
+            Some("execution"),
+            "resume until verification",
+            std::process::id() as i32,
+            std::process::id() as i32,
+        )
+        .expect("start job");
+
+        let mut state = load_job_state(&run_dir).expect("load job state");
+        state.exit_code = Some(1);
+        state.message =
+            Some("Tracked process is no longer alive. Inspect run artifacts and logs.".to_string());
+        write_job_state(&run_dir, &state).expect("persist stale state");
+
+        let normalized = active_job_state(&run_dir).expect("state should stay active");
+        assert_eq!(normalized.status, "running");
+        assert_eq!(normalized.exit_code, None);
+        assert_eq!(normalized.message, None);
+
+        let persisted = load_job_state(&run_dir).expect("reload persisted state");
+        assert_eq!(persisted.exit_code, None);
+        assert_eq!(persisted.message, None);
+
         let _ = fs::remove_dir_all(run_dir);
     }
 }

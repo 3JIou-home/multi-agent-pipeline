@@ -113,18 +113,19 @@ fn token_sum(path: &Path) -> usize {
 }
 
 #[test]
-fn agpipe_cli_help_lists_direct_core_commands() {
+fn agpipe_cli_help_is_ui_first_and_points_to_internal_commands() {
     let disabled_codex = PathBuf::from("/usr/bin/false");
 
     let output = run_agpipe(["--help"], &disabled_codex);
     let text = stdout_text(&output);
 
-    assert!(text.contains("interview-questions"));
-    assert!(text.contains("interview-finalize"));
-    assert!(text.contains("create-run"));
-    assert!(text.contains("resume"));
-    assert!(text.contains("runtime-check"));
-    assert!(text.contains("direct CLI path is interview -> create-run -> resume -> execution"));
+    assert!(text.contains("UI-first multi-agent pipeline runtime"));
+    assert!(text.contains("agpipe ui --root ~/agent-runs"));
+    assert!(text.contains("agpipe internal --help"));
+    assert!(!text.contains("agpipe interview-questions"));
+    assert!(!text.contains("agpipe interview-finalize"));
+    assert!(!text.contains("agpipe create-run"));
+    assert!(!text.contains("agpipe runtime-check"));
 }
 
 #[test]
@@ -932,11 +933,6 @@ fn agpipe_cli_stage0_create_run_and_resume_complete_the_mock_pipeline() {
     assert!(status_text.contains("goal: complete"));
     assert!(status_text.contains("next: none"));
     assert!(
-        fs::read_to_string(run_dir.join("execution").join("report.md"))
-            .expect("read execution report")
-            .contains("test service successfully")
-    );
-    assert!(
         fs::read_to_string(run_dir.join("verification").join("findings.md"))
             .expect("read findings")
             .contains("Mock verification complete")
@@ -945,12 +941,28 @@ fn agpipe_cli_stage0_create_run_and_resume_complete_the_mock_pipeline() {
     let plan: Value =
         serde_json::from_str(&fs::read_to_string(run_dir.join("plan.json")).expect("read plan"))
             .expect("parse plan");
-    let solver_count = plan
-        .get("solver_roles")
+    let has_execution_stage = plan
+        .get("pipeline")
+        .and_then(|value| value.get("stages"))
         .and_then(|value| value.as_array())
-        .map(|value| value.len())
-        .unwrap_or(0);
-    let expected_calls = 2usize + 1 + solver_count + 1 + 1 + 1;
+        .map(|stages| {
+            stages.iter().any(|stage| {
+                stage
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .map(|kind| kind == "execution")
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if has_execution_stage {
+        assert!(
+            fs::read_to_string(run_dir.join("execution").join("report.md"))
+                .expect("read execution report")
+                .contains("test service successfully")
+        );
+    }
+    let expected_calls = 2usize + plan["pipeline"]["stages"].as_array().map(|v| v.len()).unwrap_or(0);
     assert_eq!(line_count(&invocations_path), expected_calls);
     assert_eq!(token_sum(&tokens_path), expected_calls * 111);
 
