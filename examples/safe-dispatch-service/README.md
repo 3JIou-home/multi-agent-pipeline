@@ -36,5 +36,5 @@ SAFE_DISPATCH_TRANSPORT=http python3 examples/safe-dispatch-service/app.py --por
 Runtime-check entrypoint for a real run:
 
 ```bash
-./target/release/agpipe runtime-check /Users/admin/agent-runs/<run-id> --phase verification --spec examples/safe-dispatch-service/runtime-check.json
+./target/release/agpipe internal runtime-check ~/agent-runs/<run-id> --phase verification --spec examples/safe-dispatch-service/runtime-check.json
 ```

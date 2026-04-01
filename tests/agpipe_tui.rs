@@ -1,4 +1,5 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -234,6 +235,10 @@ struct PtyApp {
 
 impl PtyApp {
     fn start(root: &Path, codex_bin: &Path) -> Self {
+        Self::start_with_env(root, codex_bin, &[])
+    }
+
+    fn start_with_env(root: &Path, codex_bin: &Path, extra_env: &[(&str, &str)]) -> Self {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -249,6 +254,9 @@ impl PtyApp {
         cmd.arg(root);
         cmd.cwd(repo_root());
         cmd.env("AGPIPE_CODEX_BIN", codex_bin);
+        for (key, value) in extra_env {
+            cmd.env(key, value);
+        }
         let child = pair.slave.spawn_command(cmd).expect("spawn agpipe tui");
         drop(pair.slave);
         let reader = pair.master.try_clone_reader().expect("clone reader");
@@ -329,6 +337,29 @@ impl PtyApp {
         }
     }
 
+    fn wait_for_any(&mut self, needles: &[&str], timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let screen = self.screen();
+            if needles.iter().any(|needle| screen.contains(needle)) {
+                return screen;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "Timed out waiting for one of {:?}.\nCurrent screen:\n{}",
+                    needles, screen
+                );
+            }
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(bytes) => self.parser.process(&bytes),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("PTY disconnected while waiting for one of {:?}", needles);
+                }
+            }
+        }
+    }
+
     fn stop(mut self) {
         let _ = self.writer.write_all(b"q");
         let _ = self.writer.flush();
@@ -364,6 +395,108 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> (Receiver<Vec<u8>>, thread:
         }
     });
     (rx, handle)
+}
+
+fn created_run_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(root)
+        .expect("read output root")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(|name| !name.starts_with('.') && !name.starts_with('_'))
+                .unwrap_or(false)
+        })
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn wait_for_created_run(root: &Path, timeout: Duration) -> PathBuf {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let dirs = created_run_dirs(root);
+        if let Some(run_dir) = dirs.last() {
+            return run_dir.clone();
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "Timed out waiting for a created run under {}",
+                root.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn load_plan(run_dir: &Path) -> Value {
+    let text = fs::read_to_string(run_dir.join("plan.json")).expect("read plan.json");
+    serde_json::from_str(&text).expect("parse plan.json")
+}
+
+fn plan_has_stage(plan: &Value, stage_id: &str) -> bool {
+    if let Some(stages) = plan["pipeline"]["stages"].as_array() {
+        stages
+            .iter()
+            .any(|stage| stage["id"].as_str() == Some(stage_id))
+    } else {
+        false
+    }
+}
+
+fn create_run_via_tui(
+    output_root: &Path,
+    workspace: &Path,
+    task: &str,
+    title: &str,
+    codex_bin: &Path,
+    extra_env: &[(&str, &str)],
+    create_and_run: bool,
+) -> PathBuf {
+    let mut app = PtyApp::start_with_env(output_root, codex_bin, extra_env);
+    app.wait_contains("No runs found.", Duration::from_secs(3));
+    app.send_key(b"c");
+    app.wait_contains("New Pipeline", Duration::from_secs(3));
+    app.send_text(task);
+    thread::sleep(Duration::from_millis(250));
+    app.send_key(b"\t");
+    thread::sleep(Duration::from_millis(100));
+    app.send_text(workspace.to_str().expect("workspace path"));
+    thread::sleep(Duration::from_millis(250));
+    app.send_key(b"\t");
+    thread::sleep(Duration::from_millis(100));
+    app.send_text(title);
+    thread::sleep(Duration::from_millis(250));
+    app.send_key(b"\t");
+    thread::sleep(Duration::from_millis(100));
+    app.send_key(b"\r");
+
+    let screen = app.wait_for_any(&["Interview", "Final Task Prompt"], Duration::from_secs(8));
+    if screen.contains("Interview") {
+        app.wait_contains("Answer", Duration::from_secs(5));
+        app.send_text("Keep the original goal, prefer the first practical pass, and state assumptions clearly.");
+        app.send_key(b"\r");
+        app.wait_contains("Final Task Prompt", Duration::from_secs(8));
+    }
+
+    if create_and_run {
+        app.wait_contains("Create + Run All", Duration::from_secs(5));
+        app.send_key(b"\t");
+    } else {
+        app.wait_contains("Create Run", Duration::from_secs(5));
+    }
+    app.send_key(b"\r");
+
+    let run_dir = wait_for_created_run(output_root, Duration::from_secs(10));
+    if create_and_run {
+        app.wait_until(Duration::from_secs(20), |screen| {
+            screen.contains("goal=complete") || screen.contains("next=none")
+        });
+    }
+    app.stop();
+    run_dir
 }
 
 #[test]
@@ -415,9 +548,12 @@ fn agpipe_tui_running_mode_allows_artifact_navigation_and_next_stage_progress() 
 
     app.send_key(b"n");
     app.send_key(b"1");
-    app.wait_contains("Summary", Duration::from_secs(2));
+    app.wait_for_any(&["Summary", "Итог проверки"], Duration::from_secs(2));
     app.wait_until(Duration::from_secs(2), |screen| {
-        screen.contains("Current pipeline state:") || screen.contains("Smoke test the TUI.")
+        screen.contains("Current pipeline state:")
+            || screen.contains("Smoke test the TUI.")
+            || screen.contains("Локализованный итог проверки пока не подготовлен.")
+            || screen.contains("Pending localized verification summary.")
     });
     app.send_key(&[27]);
     app.wait_contains("next=solver-a", Duration::from_secs(12));
@@ -501,4 +637,123 @@ fn agpipe_tui_wizard_can_create_and_complete_a_pipeline() {
     let _ = fs::remove_dir_all(output_root);
     let _ = fs::remove_dir_all(workspace);
     let _ = fs::remove_dir_all(mock_root);
+}
+
+#[test]
+fn agpipe_tui_wizard_can_create_review_only_pipeline_and_complete_without_execution() {
+    let output_root = temp_dir("wizard-review-output");
+    let workspace = temp_dir("wizard-review-workspace");
+    write_text(
+        &workspace.join("src").join("lib.rs"),
+        "pub fn sum(a: i32, b: i32) -> i32 { a + b }\n",
+    );
+    let (mock_root, codex_bin) = mock_codex_script("wizard-review");
+
+    let run_dir = create_run_via_tui(
+        &output_root,
+        &workspace,
+        "Review the code in this repo. Report bugs, risks, regressions, and test gaps with file refs. No code changes.",
+        "review-only-wizard",
+        &codex_bin,
+        &[("AGPIPE_STAGE0_BACKEND", "local")],
+        true,
+    );
+    let plan = load_plan(&run_dir);
+
+    assert_eq!(plan["task_kind"].as_str(), Some("review"));
+    assert!(!plan_has_stage(&plan, "execution"));
+
+    let _ = fs::remove_dir_all(output_root);
+    let _ = fs::remove_dir_all(workspace);
+    let _ = fs::remove_dir_all(mock_root);
+}
+
+#[test]
+fn agpipe_tui_wizard_creates_expected_pipeline_shapes_for_diverse_task_types() {
+    struct Case {
+        label: &'static str,
+        task: &'static str,
+        expected_task_kind: &'static str,
+        expect_execution: bool,
+    }
+
+    let cases = [
+        Case {
+            label: "review",
+            task: "Review the code in this repo. Report bugs, risks, regressions, and test gaps with file refs. No code changes.",
+            expected_task_kind: "review",
+            expect_execution: false,
+        },
+        Case {
+            label: "backend-service",
+            task: "Create a Python FastAPI backend service with a /health endpoint, a README, and a command to run it locally.",
+            expected_task_kind: "backend",
+            expect_execution: true,
+        },
+        Case {
+            label: "tech-analysis",
+            task: "Compare FastAPI and Django for an internal admin API, evaluate delivery risks and maintenance cost, and recommend one. Report only and leave the workspace unchanged.",
+            expected_task_kind: "research",
+            expect_execution: false,
+        },
+        Case {
+            label: "tool-search",
+            task: "Compare tools for local logging of agent runs, evaluate tradeoffs, and recommend a shortlist. Report only and leave the workspace unchanged.",
+            expected_task_kind: "research",
+            expect_execution: false,
+        },
+        Case {
+            label: "housing-research",
+            task: "Compare rental housing options in Almaty, evaluate neighborhoods and budget tradeoffs, and recommend a search strategy. Report only and leave the workspace unchanged.",
+            expected_task_kind: "research",
+            expect_execution: false,
+        },
+    ];
+
+    for case in cases {
+        let output_root = temp_dir(&format!("wizard-case-output-{}", case.label));
+        let workspace = temp_dir(&format!("wizard-case-workspace-{}", case.label));
+        write_text(
+            &workspace.join("README.md"),
+            &format!("# {}\n\nFixture workspace.\n", case.label),
+        );
+        let (mock_root, codex_bin) = mock_codex_script(case.label);
+
+        let run_dir = create_run_via_tui(
+            &output_root,
+            &workspace,
+            case.task,
+            &format!("wizard-{}", case.label),
+            &codex_bin,
+            &[("AGPIPE_STAGE0_BACKEND", "local")],
+            false,
+        );
+        let plan = load_plan(&run_dir);
+
+        assert_eq!(
+            plan["task_kind"].as_str(),
+            Some(case.expected_task_kind),
+            "unexpected task_kind for case {}",
+            case.label
+        );
+        assert_eq!(
+            plan_has_stage(&plan, "execution"),
+            case.expect_execution,
+            "unexpected execution stage presence for case {}",
+            case.label
+        );
+        if case.expected_task_kind == "review" {
+            let goal_checks = plan["goal_checks"].as_array().expect("goal_checks array");
+            assert!(
+                goal_checks
+                    .iter()
+                    .any(|item| item["id"].as_str() == Some("review_only_scope")),
+                "review case should preserve review-only scope"
+            );
+        }
+
+        let _ = fs::remove_dir_all(output_root);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(mock_root);
+    }
 }
